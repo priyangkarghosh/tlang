@@ -1,5 +1,8 @@
 import re
 from collections import defaultdict
+import logging
+
+logger = logging.getLogger(__name__)
 
 # matches program declaration in the form: [prog(name) : @vert=func_name @frag=func_name]
 PROG_PATTERN = re.compile(
@@ -22,6 +25,7 @@ STAGE_PATTERN = re.compile(
 class ProgramManager:
     @staticmethod
     def find_programs(src: str) -> tuple[str, dict[str, dict]]:
+        logger.debug("Searching for programs")
         programs = defaultdict(dict)
 
         # find all prog matches
@@ -36,6 +40,7 @@ class ProgramManager:
                 stages_dict[stage] = func
 
             programs[name] = stages_dict
+            logger.debug("Found program %s", name)
 
         # remove the program matches and return the stripped src and the program list
         return PROG_PATTERN.sub('', src), programs

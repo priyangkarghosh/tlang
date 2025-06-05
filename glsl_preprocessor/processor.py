@@ -1,6 +1,9 @@
 from glob import glob
 import os
 from pathlib import Path
+import logging
+
+logger = logging.getLogger(__name__)
 
 from moderngl import Context
 
@@ -15,6 +18,7 @@ FILE_EXTENSION = '.tlang'
 
 class Processor():
     def __init__(self, base_dir: str, constants: dict[str, object] | None = None) -> None:
+        logger.info("Initializing processor with %s", base_dir)
         # load sources using the base directory
         self._base_dir = base_dir
         self._constants = constants or {}
@@ -27,10 +31,12 @@ class Processor():
 
         # process raw sources
         self.process_sources()
+        logger.info("Processed %d sources", len(self._sources))
 
     # load sources
     # -> also process any "includes" while reading
     def load_sources(self) -> dict[str, str]:
+        logger.debug("Loading shader sources")
         sources: dict[str, str] = {}
         pattern = os.path.join(self._base_dir, f'**/*{FILE_EXTENSION}')
         for file_path in glob(pattern, recursive=True):
@@ -38,10 +44,12 @@ class Processor():
             raw_src = Path(file_path).read_text()
             refac_src = IncludeManager.refactor(raw_src)
             sources[rel_name] = refac_src
+            logger.debug("Read %s", rel_name)
         return sources
     
     def process_sources(self):
         for src_name, src in self._sources.items():
+            logger.debug("Processing %s", src_name)
             # render shader for "includes" and other constants
             src = TemplateManager(self._sources, self._constants).render(src_name)
 
@@ -57,3 +65,4 @@ class Processor():
             # entry points
             src, self._entries[src_name] = EntryPointManager.extract(src)
             self._processed_sources[src_name] = src
+            logger.debug("Finished %s", src_name)

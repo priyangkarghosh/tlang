@@ -1,4 +1,7 @@
 import re
+import logging
+
+logger = logging.getLogger(__name__)
 
 # matches:
 #   OPTIONAL[coherent] buffer<Type> Name[Size] : @binding(N) ;
@@ -33,6 +36,7 @@ UNIFORM_PATTERN = re.compile(
 class MemoryManager:
     @classmethod
     def refactor(cls, src: str) -> str:
+        logger.debug("Refactoring memory declarations")
         return cls._rewrite_buffers(
             cls._rewrite_uniforms_and_shared(src)
         )
@@ -52,6 +56,7 @@ class MemoryManager:
             if qualifier.strip(): layout_clauses.append(qualifier.strip())
             layout = f"layout({', '.join(layout_clauses)})"
 
+            logger.debug("Rewriting buffer %s", name)
             return f"{layout} buffer {name}Buffer {{ {dtype} {name}[{size}]; }};"
 
         return BUFFER_PATTERN.sub(repl, src)
@@ -71,6 +76,7 @@ class MemoryManager:
                 if offset:
                     layout_parts.append(f"offset = {offset}")
                 layout = f"layout({', '.join(layout_parts)})" if layout_parts else ''
+                logger.debug("Rewriting atomic counter %s", name)
                 return f"{layout} uniform atomic_uint {name};"
 
             # shared<type> or uniform<type>
@@ -81,8 +87,10 @@ class MemoryManager:
             binding = m.group('binding')
 
             if qualifier == 'uniform':
+                logger.debug("Rewriting uniform %s", name)
                 return f"uniform {dtype} {name};"
             elif qualifier == 'shared':
+                logger.debug("Rewriting shared %s", name)
                 if is_array: return f"shared {dtype} {name}[];"
                 else: return f"shared {dtype} {name};"
 

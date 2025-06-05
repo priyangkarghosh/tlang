@@ -1,4 +1,7 @@
 from jinja2 import DictLoader, Environment, TemplateNotFound
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class TemplateManager:
@@ -12,6 +15,7 @@ class TemplateManager:
         self.constants = constants
 
     def render(self, shader_name: str) -> str:
+        logger.debug("Rendering template %s", shader_name)
         try:
             template = self._env.get_template(shader_name)
             return template.render(**self.constants)

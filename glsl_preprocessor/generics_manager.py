@@ -1,4 +1,7 @@
 import re
+import logging
+
+logger = logging.getLogger(__name__)
 
 # i.e. T, V, X, whatever
 GENERIC_TYPE_PATTERN = re.compile(r'^[A-Z]\w*$')
@@ -101,6 +104,7 @@ class GenericsManager:
 
     @classmethod
     def process(cls, src: str) -> str:
+        logger.debug("Processing generics")
         src = cls.inject_wrappers(src)
 
         structs = {m.group('name'): m for m in GENERIC_STRUCT_PATTERN.finditer(src)}
@@ -200,6 +204,7 @@ class GenericsManager:
 
             concrete_name = f"{base}_{'_'.join(GenericsManager.normalize_type_string(t) for t in types)}"
             generated_chunks.append(f"struct {concrete_name} {{ {fields_only} }};")
+            logger.debug("Generated struct %s", concrete_name)
 
             for meth in methods:
                 ret, name, args, body = meth['ret'], meth['name'], meth['args'], meth['body']
@@ -267,6 +272,7 @@ class GenericsManager:
 
             concrete_name = f"{base}_{'_'.join(GenericsManager.normalize_type_string(t) for t in types)}"
             generated_chunks.append(f"{ret} {concrete_name}({args}) {{ {body} }}")
+            logger.debug("Generated function %s", concrete_name)
 
             escaped_types = [re.escape(t) for t in types]
             sep = r'\s*,\s*'.join(escaped_types)

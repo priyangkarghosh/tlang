@@ -1,4 +1,7 @@
 import re
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 ENTRY_HEADER = re.compile(
@@ -34,6 +37,7 @@ class EntryPointManager:
 
     @classmethod
     def extract(cls, src: str) -> tuple[str, list[dict[str, str]]]:
+        logger.debug("Extracting entry points")
         entry_points: list[dict[str, str]] = []
         removals: list[tuple[int, int]] = []
 
@@ -145,6 +149,7 @@ class EntryPointManager:
             info['body'] = raw_body
             info['full_function'] = full_fn
             entry_points.append(info)
+            logger.debug("Found entry point %s", info['name'])
             removals.append((start_idx, i))
 
         # remove all matched entry-point blocks from the source
@@ -152,4 +157,5 @@ class EntryPointManager:
         for start, end in sorted(removals, reverse=True):
             stripped_src = stripped_src[:start] + stripped_src[end:]
 
+        logger.debug("Extracted %d entry points", len(entry_points))
         return stripped_src, entry_points
