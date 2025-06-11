@@ -3,98 +3,121 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# matches:
-#   OPTIONAL[coherent] buffer<Type> Name[Size] : @binding(N) ;
+# ──────────────────────────────────────────────────────────────────────────────
+# 1) BUFFER_PATTERN now matches:
+#      [coherent ] buffer<Type> Name[Size] [: @binding(N)];
+#    and captures qualifier="coherent " (if present), type, name, size, binding.
+# ──────────────────────────────────────────────────────────────────────────────
 BUFFER_PATTERN = re.compile(
-    r'(?P<qualifier>coherent\s*)?buffer<(?P<type>\w+)>\s+'  
-    r'(?P<name>\w+)\[(?P<size>[\w\d_]+)\]\s*'
-    r'(?::\s*@binding\((?P<binding>\d+)\))?;'
-)
-
-# matches either:
-# 1) shared<Type> Name[...] : @binding(N) ;
-# 2) uniform<Type> Name[...] : @binding(N) ;
-# or
-# 3) atomic_uint Name : @binding(N) @offset(M) ;
-UNIFORM_PATTERN = re.compile(
     r'''
-    # shared or uniform declarations
-    (?P<qualifier>shared|uniform)\s*<(?P<type>\w+)>\s+(?P<name>\w+)(\[\])?
-        (?:\s*:\s*@binding\((?P<binding>\d+)\))?
-        \s*;
-    |
-    # atomic_uint declarations with optional @binding and/or @offset
-    (?P<atomic>atomic_uint)\s+(?P<aname>\w+)\s*:?\s*
-    (?:(?=.*@binding\((?P<abinding>\d+)\)))?
-    (?:(?=.*@offset\((?P<aoffset>\d+)\)))?
-    (?:(?:@binding\(\d+\)|@offset\(\d+\))\s*)+
-    ;
+    (?P<qualifier>coherent\s*)?          # optional "coherent " 
+    buffer<(?P<type>\w+)>\s+             #      "buffer<Type>" 
+    (?P<name>\w+)\[(?P<size>[\w\d_]+)\]  #      "Name[Size]"
+    (?:\s*:\s*@binding\((?P<binding>\d+)\))?  # optional ": @binding(N)"
+    \s*;                                  # trailing semicolon
     ''',
     re.VERBOSE
 )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2) SHARED_OR_UNIFORM_PATTERN matches:
+#      shared<Type> Name[ ]?;
+#      or uniform<Type> Name;
+#    capturing qualifier, type, name, and optional array "[]".
+# ──────────────────────────────────────────────────────────────────────────────
+SHARED_OR_UNIFORM_PATTERN = re.compile(
+    r'''
+    (?P<su>(?:shared|uniform))<(?P<type>\w+)>\s+  # "shared<Type>" or "uniform<Type>"
+    (?P<name>\w+)
+    (?P<array>\[\])?                              # optional "[]"
+    \s*;                                          # semicolon
+    ''',
+    re.VERBOSE
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3) ATOMIC_UINT_PATTERN matches:
+#      atomic_uint Name : @binding(N) @offset(M);
+#    capturing name, binding, and offset.
+# ──────────────────────────────────────────────────────────────────────────────
+ATOMIC_UINT_PATTERN = re.compile(
+    r'''
+    atomic_uint\s+                      # "atomic_uint "
+    (?P<name>\w+)\s*                    #    "Name"
+    :\s*@binding\((?P<binding>\d+)\)\s+#    ": @binding(N)"
+    @offset\((?P<offset>\d+)\)\s*;      #   "@offset(M);"
+    ''',
+    re.VERBOSE
+)
+
 
 class MemoryManager:
     @classmethod
     def refactor(cls, src: str) -> str:
         logger.debug("Refactoring memory declarations")
-        return cls._rewrite_buffers(
-            cls._rewrite_uniforms_and_shared(src)
-        )
+        # First rewrite shared/uniform, then atomic, then buffers.
+        out = cls._rewrite_shared_or_uniform(src)
+        out = cls._rewrite_atomic_uint(out)
+        out = cls._rewrite_buffers(out)
+        return out
 
     @staticmethod
     def _rewrite_buffers(src: str) -> str:
         def repl(m: re.Match) -> str:
-            qualifier = m.group('qualifier') or ''
-            dtype = m.group('type')
-            name = m.group('name')
-            size = m.group('size')
-            binding = m.group('binding')
+            qualifier = m.group('qualifier') or ''     # either "coherent " or ""
+            dtype     = m.group('type')                # e.g. "uint"
+            name      = m.group('name')                # e.g. "test123"
+            size      = m.group('size')                # e.g. "NUM_ELEMS"
+            binding   = m.group('binding')             # e.g. "0" or None
 
-            # build the layout
-            layout_clauses = ['std430']
-            if binding: layout_clauses.append(f"binding = {binding}")
-            if qualifier.strip(): layout_clauses.append(qualifier.strip())
-            layout = f"layout({', '.join(layout_clauses)})"
+            # build layout(...) with std430 and optional binding
+            layout_parts = ['std430']
+            if binding:
+                layout_parts.append(f"binding = {binding}")
+            layout = f"layout({', '.join(layout_parts)})"
 
+            # e.g. 
+            #   buffer test123Buffer { uint test123[NUM_ELEMS]; };
+            # with or without "coherent " immediately before "buffer".
             logger.debug("Rewriting buffer %s", name)
-            return f"{layout} buffer {name}Buffer {{ {dtype} {name}[{size}]; }};"
+            return (
+                f"{layout} "
+                f"{qualifier}buffer {name}Buffer {{ {dtype} {name}[{size}]; }};"
+            )
 
         return BUFFER_PATTERN.sub(repl, src)
 
     @staticmethod
-    def _rewrite_uniforms_and_shared(src: str) -> str:
+    def _rewrite_shared_or_uniform(src: str) -> str:
         def repl(m: re.Match) -> str:
-            # atomic_uint
-            if m.group('atomic'):
-                name = m.group('aname')
-                binding = m.group('abinding')
-                offset = m.group('aoffset')
+            su    = m.group('su')      # "shared" or "uniform"
+            dtype = m.group('type')    # e.g. "uint"
+            name  = m.group('name')    # e.g. "test3"
+            array = m.group('array') or ''  # either "[]" or "", for shared arrays
 
-                layout_parts = []
-                if binding:
-                    layout_parts.append(f"binding = {binding}")
-                if offset:
-                    layout_parts.append(f"offset = {offset}")
-                layout = f"layout({', '.join(layout_parts)})" if layout_parts else ''
-                logger.debug("Rewriting atomic counter %s", name)
-                return f"{layout} uniform atomic_uint {name};"
-
-            # shared<type> or uniform<type>
-            qualifier = m.group('qualifier')
-            dtype = m.group('type')
-            name = m.group('name')
-            is_array = m.group(4)   # matches '[]'
-            binding = m.group('binding')
-
-            if qualifier == 'uniform':
-                logger.debug("Rewriting uniform %s", name)
-                return f"uniform {dtype} {name};"
-            elif qualifier == 'shared':
+            if su == 'shared':
                 logger.debug("Rewriting shared %s", name)
-                if is_array: return f"shared {dtype} {name}[];"
-                else: return f"shared {dtype} {name};"
+                # e.g. "shared uint test3;"  or "shared uint test1[];"
+                return f"shared {dtype} {name}{array};"
+            else:
+                logger.debug("Rewriting uniform %s", name)
+                # e.g. "uniform uint test2;"
+                return f"uniform {dtype} {name};"
 
-            # default if no changes needed
-            return m.group(0)
+        return SHARED_OR_UNIFORM_PATTERN.sub(repl, src)
 
-        return UNIFORM_PATTERN.sub(repl, src)
+    @staticmethod
+    def _rewrite_atomic_uint(src: str) -> str:
+        def repl(m: re.Match) -> str:
+            name    = m.group('name')     # e.g. "test2131"
+            binding = m.group('binding')  # e.g. "0"
+            offset  = m.group('offset')   # e.g. "5"
+
+            # produce: layout(binding = 0, offset = 5) uniform atomic_uint test2131;
+            logger.debug("Rewriting atomic counter %s", name)
+            return (
+                f"layout(binding = {binding}, offset = {offset}) "
+                f"uniform atomic_uint {name};"
+            )
+
+        return ATOMIC_UINT_PATTERN.sub(repl, src)

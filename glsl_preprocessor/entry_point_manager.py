@@ -42,90 +42,117 @@ class EntryPointManager:
         removals: list[tuple[int, int]] = []
 
         for m in ENTRY_HEADER.finditer(src):
-            start_idx = m.start()
-            body_start = m.end()
+            info = m.groupdict()
+            stage = info['stage'].lower()
+            raw_body = None
+            start_idx, body_start = m.start(), m.end()
             brace_count = 1
             i = body_start
-
             while i < len(src) and brace_count > 0:
-                if src[i] == '{':
-                    brace_count += 1
-                elif src[i] == '}':
-                    brace_count -= 1
+                if src[i] == '{': brace_count += 1
+                elif src[i] == '}': brace_count -= 1
                 i += 1
-
-            info = m.groupdict()
             raw_body = src[body_start : i - 1].strip()
-            stage = info['stage'].lower()
-            args = info.get('args') or ""
 
             decl_lines: list[str] = []
+            args = info.get('args') or ""
 
-            if stage == 'compute':
-                nt_match = re.match(
-                    r'\s*numthreads\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)\s*',
-                    args
-                )
-                if nt_match:
-                    x, y, z = nt_match.groups()
-                    decl_lines.append(
-                        f"layout (local_size_x = {x}, local_size_y = {y}, local_size_z = {z}) in;"
-                    )
-
-            elif stage in ('vert', 'vertex'):
+            if stage in ('vert', 'vertex'):
                 parts = [p.strip() for p in args.split(';') if p.strip()]
-                inputs_text = ""
-                outputs_text = ""
+                inputs_text = outputs_text = ""
                 for part in parts:
-                    if re.match(r'^\s*inputs\s*=', part, re.IGNORECASE):
-                        inputs_text = re.sub(r'^\s*inputs\s*=\s*', '', part, flags=re.IGNORECASE).strip()
-                    elif re.match(r'^\s*outputs\s*=', part, re.IGNORECASE):
-                        outputs_text = re.sub(r'^\s*outputs\s*=\s*', '', part, flags=re.IGNORECASE).strip()
+                    if re.match(r'^inputs\s*=', part, re.IGNORECASE):
+                        inputs_text = re.sub(r'^inputs\s*=\s*', '', part, flags=re.IGNORECASE)
+                    elif re.match(r'^outputs\s*=', part, re.IGNORECASE):
+                        outputs_text = re.sub(r'^outputs\s*=\s*', '', part, flags=re.IGNORECASE)
 
                 inputs = cls._parse_io_pairs(inputs_text)
                 outputs = cls._parse_io_pairs(outputs_text)
-                for iname, itype in inputs:
-                    decl_lines.append(f"in {itype} {iname};")
-                for oname, otype in outputs:
-                    decl_lines.append(f"out {otype} {oname};")
+
+                for name, typ in inputs:
+                    base, *ann = typ.split('@')
+                    if ann and ann[0].startswith('location'):
+                        loc = ann[0].split('=', 1)[1]
+                        decl_lines.append(f"layout(location = {loc}) in {base} {name};")
+                    else:
+                        decl_lines.append(f"in {base} {name};")
+
+                for name, typ in outputs:
+                    base, *ann = typ.split('@')
+                    if ann and ann[0].startswith('location'):
+                        loc = ann[0].split('=', 1)[1]
+                        decl_lines.append(f"layout(location = {loc}) out {base} {name};")
+                    else:
+                        decl_lines.append(f"out {base} {name};")
 
             elif stage in ('frag', 'fragment'):
                 parts = [p.strip() for p in args.split(';') if p.strip()]
-                inputs_text = ""
-                outputs_text = ""
+                inputs_text = outputs_text = ""
                 for part in parts:
-                    if re.match(r'^\s*inputs\s*=', part, re.IGNORECASE):
-                        inputs_text = re.sub(r'^\s*inputs\s*=\s*', '', part, flags=re.IGNORECASE).strip()
-                    elif re.match(r'^\s*outputs\s*=', part, re.IGNORECASE):
-                        outputs_text = re.sub(r'^\s*outputs\s*=\s*', '', part, flags=re.IGNORECASE).strip()
+                    if re.match(r'^inputs\s*=', part, re.IGNORECASE):
+                        inputs_text = re.sub(r'^inputs\s*=\s*', '', part, flags=re.IGNORECASE)
+                    elif re.match(r'^outputs\s*=', part, re.IGNORECASE):
+                        outputs_text = re.sub(r'^outputs\s*=\s*', '', part, flags=re.IGNORECASE)
 
                 inputs = cls._parse_io_pairs(inputs_text)
                 outputs = cls._parse_io_pairs(outputs_text)
-                for iname, itype in inputs:
-                    decl_lines.append(f"in {itype} {iname};")
-                for oname, otype in outputs:
-                    decl_lines.append(f"out {otype} {oname};")
+
+                for name, typ in inputs:
+                    base, *ann = typ.split('@')
+                    decl_lines.append(f"in {base} {name};")
+                for name, typ in outputs:
+                    base, *ann = typ.split('@')
+                    decl_lines.append(f"out {base} {name};")
 
             elif stage in ('geom', 'geometry'):
-                parts = [token.strip() for token in args.split(',') if token.strip()]
-                layout_in = ""
-                layout_out = ""
-                maxverts = ""
-                for token in parts:
-                    kv = token.split('=')
-                    if len(kv) != 2:
-                        continue
-                    key = kv[0].strip().lower()
-                    val = kv[1].strip()
-                    if key == 'in':
-                        layout_in = f"layout({val}) in;"
-                    elif key == 'out':
-                        layout_out = f"layout({val}) out;"
-                    elif key in ('maxverts', 'max_vertices'):
-                        maxverts = f"layout(max_vertices = {val}) out;"
-                for line in (layout_in, layout_out, maxverts):
-                    if line:
-                        decl_lines.append(line)
+                # split on semicolons
+                parts = [p.strip() for p in args.split(';') if p.strip()]
+
+                # collect three buckets
+                inputs_text = ""
+                in_prim    = None
+                out_prim   = None
+                maxverts   = None
+
+                for part in parts:
+                    low = part.lower()
+                    if low.startswith('inputs='):
+                        # grab everything after the '='
+                        inputs_text = part.split('=',1)[1].strip()
+                    elif low.startswith('in='):
+                        in_prim = part.split('=',1)[1].strip()
+                    elif low.startswith('out='):
+                        # out might carry the @maxverts suffix
+                        val = part.split('=',1)[1].strip()
+                        if ':' in val:
+                            prim, attr = val.split(':',1)
+                            out_prim = prim.strip()
+                            if '@maxverts' in attr:
+                                maxverts = attr.split('=',1)[1].strip()
+                        else:
+                            out_prim = val
+                    elif low.startswith('@maxverts'):
+                        maxverts = part.split('=',1)[1].strip()
+
+                # now emit declarations:
+                # 1) per-vertex inputs become arrays
+                if inputs_text:
+                    for name, typ in cls._parse_io_pairs(inputs_text):
+                        # e.g. "in vec3@binding=0 vert[];"
+                        decl_lines.append(f"in {typ} {name}[];")
+
+                # 2) input primitive
+                if in_prim:
+                    decl_lines.append(f"layout({in_prim}) in;")
+
+                # 3) single output + max_vertices
+                if out_prim:
+                    if maxverts:
+                        decl_lines.append(
+                            f"layout({out_prim}, max_vertices = {maxverts}) out;"
+                        )
+                    else:
+                        decl_lines.append(f"layout({out_prim}) out;")
 
             elif stage in ('tesc', 'tesscontrol', 'tesscontrolshader'):
                 verts_match = re.search(r'vertices\s*=\s*(\d+)', args, re.IGNORECASE)
@@ -144,18 +171,18 @@ class EntryPointManager:
 
             # wrap everything in “void main() { … }”
             decl_block = ("\n".join(decl_lines) + "\n") if decl_lines else ""
-            full_fn = f"{decl_block}void main() {{\n{raw_body}\n}}"
+            orig_fn = f"{info['ret_type']} {info['name']}() {{\n{raw_body}\n}}"
+            full_fn = f"{decl_block}{orig_fn}\n\nvoid main() {{\n    {info['name']}();\n}}"
 
             info['body'] = raw_body
             info['full_function'] = full_fn
             entry_points.append(info)
-            logger.debug("Found entry point %s", info['name'])
             removals.append((start_idx, i))
 
-        # remove all matched entry-point blocks from the source
+        # strip out entry point sections
         stripped_src = src
         for start, end in sorted(removals, reverse=True):
             stripped_src = stripped_src[:start] + stripped_src[end:]
 
-        logger.debug("Extracted %d entry points", len(entry_points))
+        logger.debug(f"Extracted {len(entry_points)} entry points")
         return stripped_src, entry_points
