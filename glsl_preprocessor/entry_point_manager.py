@@ -22,10 +22,6 @@ ENTRY_HEADER = re.compile(
 class EntryPointManager:
     @classmethod
     def _parse_io_pairs(cls, text: str) -> list[tuple[str, str]]:
-        """
-        Parse a comma-separated list of “name:type” pairs (e.g. “pos:vec3, normal:vec3”).
-        Returns a list of (name, type) tuples, trimming whitespace.
-        """
         out = []
         for pair in text.split(','):
             pair = pair.strip()
