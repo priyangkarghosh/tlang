@@ -8,16 +8,6 @@ INCLUDE_PATTERN = re.compile(
 
 class Linker:
     @staticmethod
-    def _refactor_incl_statements(src: str) -> str:
-        def repl(m: re.Match) -> str:
-            prefix = m.group('prefix')
-            filenames = m.group('filenames')
-            includes = [f"{prefix}{{% include \"{f.strip()}\" %}}" for f in filenames.split(',')]
-            return '\n'.join(includes) + '\n'
-
-        return INCLUDE_PATTERN.sub(repl, src)
-
-    @staticmethod
     def _process_includes(src: str):
         pass
 
