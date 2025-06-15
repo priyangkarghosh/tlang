@@ -1,5 +1,8 @@
 import bisect
+from attribute import Attribute
+from shader_stages import ShaderStage
 from dataclasses import dataclass, field
+from enum import Enum
 import re
 
 from shader_source_line import ShaderSourceLine
@@ -18,16 +21,16 @@ class FunctionDef:
     name: str
     return_type: str
     params: str
-
-    char_start: int
-    char_end: int
-    char_body: str
+    stage: ShaderStage | None
 
     line_start: int
     line_end: int
     line_body: dict[int, ShaderSourceLine]
 
-    attrs: list[dict[str, str | None]] = field(
+    attrs: list[Attribute] = field(
+        default_factory=list
+    )
+    config: list[str] = field(
         default_factory=list
     )
 
@@ -94,14 +97,11 @@ class FunctionManager:
                 name=name,
                 return_type=ret_type,
                 params=params,
+                stage=None,
 
                 line_start=line_start,
                 line_end=line_end,
                 line_body=line_body,
-
-                char_start=func_start,
-                char_end=func_end,
-                char_body=char_body,
             ))
 
             # move past the current function

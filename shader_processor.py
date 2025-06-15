@@ -2,8 +2,9 @@ from dataclasses import dataclass
 import re
 
 from attribute_manager import AttributeManager
-from function_manager import FunctionManager
+from function_manager import FunctionDef, FunctionManager
 from shader_source_line import ShaderSourceLine
+from shader_stages import ShaderStage
 
 EXTENSION_GROUPS = {
     'subgroup': [
@@ -25,26 +26,6 @@ EXTENSION_GROUPS = {
     ],
 }
 
-ARG_PATTERN = re.compile(
-    r"""
-    (?:
-        @(?P<key>\w+)\s*=\s*   # @key =
-        (?:
-            '(?P<val1>[^']*)'  # '@key'='value'
-            |"(?P<val2>[^"]*)"
-            |(?P<val3>[^'",\s\]]+)
-        )
-    )
-    |
-    (?:
-        '(?P<pos1>[^']*)'
-        |"(?P<pos2>[^"]*)"
-        |(?P<pos3>[^'",\s\]]+)
-    )
-    """,
-    re.VERBOSE
-)
-
 class ShaderProcessor:
     def __init__(self, name: str, src: str) -> None:
         self.name, self.src = name, src
@@ -52,77 +33,82 @@ class ShaderProcessor:
             index: ShaderSourceLine(name, line) # store line info and virtual context (file)
             for index, line in enumerate(src.splitlines(keepends=True), start=1)
         }
+
+        self.dps: set[str] = set()
+        self.ext: set[str] = set(['GL_KHR_vulkan_glsl : require'])
+        self.programs: dict[str, dict[ShaderStage, str | None]] = {}
         
+        # processing steps
         self.funcs = FunctionManager.extract_funcs(self.src, self.src_map)
         self.glob_attrs = AttributeManager.process_attrs(self.src_map, self.funcs)
-
-        self.ext: set[str] = set()
-        self.dps: set[str] = set()
-        self.programs: dict[str, dict[str, str | None]] = {}
-        self.entries = []
-        self.module = {}
-    
-    @staticmethod
-    def parse_args(arg_str: str) -> tuple[list[str], dict[str, str]]:
-        def strip(s: str | None):
-            s = (s or '').strip()
-            return (s[1:-1] if s.startswith(("'", '"')) and s.endswith(("'", '"')) 
-                    else s)
-
-        args = []
-        kwargs = {}
-        for match in ARG_PATTERN.finditer(arg_str):
-            if (key := strip(match.group("key"))):
-                kwargs[key] = strip(match.group("value"))
-            elif (val := strip(match.group("positional"))):
-                args.append(val)
-        return args, kwargs
+        
+        # create module
+        self.module: dict[int, ShaderSourceLine] = {}
+        self._process_global_attrs()
+        self._process_function_attrs()
+        self._create_module()
     
     # is basically whats exported to other files in the project
     # -> this includes all common code (excluding kernels/shader defs)
     # -> also includes buffers and shared memory and stuff
-    def _create_module(self):
-        pass
+    def _create_module(self) -> None:
+        self.module = self.src_map.copy()
+        for func in self.funcs.items:
+            if not func.stage: self.module.update(func.line_body)
 
-    def _process_global_attrs(self):
+    def _process_global_attrs(self) -> None:
         for attr in self.glob_attrs:
-            # split the args into tokens
-            args, kwargs = self.parse_args(attr.get('args', ''))
-
-            match attr.get('name', ''):
+            match attr.name:
                 case 'program':
-                    if not args: raise ValueError("Missing program name in [program(...)]")
-                    if (name := args[0]) in self.programs: raise ValueError(f"Program '{name}' is already defined")
-
-                    # take the first arg to be the name
-                    self.programs[args[0]] = {
-                        'vert': kwargs.get('vert') or kwargs.get('vertex'),
-                        'frag': kwargs.get('frag') or kwargs.get('fragment'),
-                        'geom': kwargs.get('geom') or kwargs.get('geometry'),
-                        'tesc': kwargs.get('tesc') or kwargs.get('tess_control'),
-                        'tese': kwargs.get('tese') or kwargs.get('tess_eval')
-                    }
+                    if not attr.args: raise ValueError("Missing program name in [program(...)]")
+                    if (name := attr.args[0]) in self.programs: raise ValueError(f"Program '{name}' is already defined")
+                    self.programs[attr.args[0]] = ShaderStage.gather_stages(attr.kwargs)
 
                 case 'include':
-                    self.dps.update(args)
+                    self.dps.update(attr.args)
 
                 case 'extend':
                     # resolve groups and flatten
-                    for token in args: 
+                    for token in attr.args: 
                         mapped = EXTENSION_GROUPS.get(token)
-                        if mapped: self.ext.update(mapped)
-                        else: self.ext.add(token)
+                        if mapped: self.ext.update([ext + ' : enable' for ext in mapped])
+                        else: self.ext.add(token + ' : enable')
+                
+                case 'extend!' | 'require':
+                    # resolve groups and flatten
+                    for token in attr.args: 
+                        mapped = EXTENSION_GROUPS.get(token)
+                        if mapped: self.ext.update([ext + ' : require' for ext in mapped])
+                        else: self.ext.add(token + ' : require')
+
                 case _:
                     break
 
-    def _process_function_attrs(self):
+    def _process_function_attrs(self) -> None:
         for func in self.funcs.items:
             for attr in func.attrs:
-                match attr.get('name', ''):
+                match attr.name:
                     case 'shader':
-                        break
+                        func.stage = ShaderStage.from_token(attr.args[0])
+
                     case 'numthreads':
-                        break
+                        # get num threads
+                        if attr.args:
+                            numthreads = [1, 1, 1]
+                            for i in range(min(len(attr.args), 3)):
+                                numthreads[i] = int(attr.args[i])
+                        else:
+                            numthreads = (
+                                int(attr.kwargs.get('x', 1)),
+                                int(attr.kwargs.get('y', 1)),
+                                int(attr.kwargs.get('z', 1)),
+                            )
+                        
+                        # add layout str to config
+                        func.config.append(
+                            f'layout(local_size_x={numthreads[0]}, local_size_y={numthreads[1]}, local_size_z={numthreads[2]}) in;'
+                        )
+
                     case _:
                         break
         

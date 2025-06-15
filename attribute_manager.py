@@ -1,7 +1,9 @@
+from dataclasses import dataclass
 import re
 import logging
 from typing import Callable
 
+from attribute import Attribute
 from function_manager import FunctionList
 from shader_source_line import ShaderSourceLine
 
@@ -13,23 +15,37 @@ ATTR_PATTERN = re.compile(r'(?P<name>\w+)(?:\((?P<args>[^)]*)\))?') # i.e. [shad
 ALT_ATTR_PATTERN = re.compile(r'#(?P<name>\w+)\s*<\s*(?P<args>.*?)\s*>') # i.e. #shader('test')
 # ALT_ATTR_PATTERN ONLY SUPPORTS 1 LINE PER PATTERN
 
+ARG_PATTERN = re.compile(
+    r"""
+    \s*
+    (?:@?(?P<key>\w+)\s*=\s*)?
+    (?P<value>        
+        '[^']*'
+        |"[^"]*"
+        |[^'",\s\]]+
+    )
+    \s*(?:,|$)
+    """, 
+    re.VERBOSE
+)
+
 class AttributeHandlers:
     @staticmethod
-    def unroll(attr: dict[str, str | None], **kwargs) -> str:
+    def unroll(attr: Attribute, **kwargs) -> str:
         return '#pragma unroll'
     
     @staticmethod
-    def program(attr: dict[str, str | None], **kwargs) -> str:
+    def program(attr: Attribute, **kwargs) -> str:
         # type checks
         if not isinstance(glob_attachments := kwargs.get('glob_attachments'), list):
             raise TypeError("Expected 'glob_attachments' to be a list")
         
         # add attribute to attachments
         glob_attachments.append(attr)
-        return f"//<<PROGRAM DEC '{attr.get('name')}'>>//"
+        return f"//<<PROGRAM DEC '{attr.name}'>>//\n"
     
     @staticmethod
-    def entry_point(attr: dict[str, str | None], **kwargs) -> str:
+    def entry_point(attr: Attribute, **kwargs) -> str:
         # type checks
         if not isinstance(funcs := kwargs.get('funcs'), FunctionList):
             raise TypeError("Expected 'funcs' to be a FunctionList")
@@ -38,27 +54,27 @@ class AttributeHandlers:
 
         # add attribute to the function definition
         if fn := funcs.find_next(index): fn.attrs.append(attr)
-        return f"//<<ATTR '{attr.get('name')}', ARGS: {attr.get('args')}>>//"
+        return f"//<<ATTR '{attr.name}'>>//\n"
     
     @staticmethod
-    def dependency(attr: dict[str, str | None], **kwargs) -> str:
+    def dependency(attr: Attribute, **kwargs) -> str:
         # type checks
         if not isinstance(glob_attachments := kwargs.get('glob_attachments'), list):
             raise TypeError("Expected 'glob_attachments' to be a list")
         
         # add attribute to attachments
         glob_attachments.append(attr)
-        return f"//<<DEPENDENCY '{attr.get('name')}', ARGS: {attr.get('args')}>>//"
+        return '\n'.join([f"{{% include '{sn}' %}}" for sn in attr.args])
     
     @staticmethod
-    def extension(attr: dict[str, str | None], **kwargs) -> str:
+    def extension(attr: Attribute, **kwargs) -> str:
         # type checks
         if not isinstance(glob_attachments := kwargs.get('glob_attachments'), list):
             raise TypeError("Expected 'glob_attachments' to be a list")
         
         # add attribute to attachments
         glob_attachments.append(attr)
-        return f"//<<EXTENSION '{attr.get('name')}', ARGS: {attr.get('args')}>>//"
+        return f"//<<EXTENSION '{attr.name}', ARGS: {attr.args}>>//\n"
 
 GLOB_CTX_ATTR_MAP: dict[str, Callable[..., str]] = {
     'shader': AttributeHandlers.entry_point,
@@ -66,6 +82,8 @@ GLOB_CTX_ATTR_MAP: dict[str, Callable[..., str]] = {
     'program': AttributeHandlers.program,
     'include': AttributeHandlers.dependency,
     'extend': AttributeHandlers.extension,
+    'extend!': AttributeHandlers.extension,
+    'require': AttributeHandlers.extension,
 }
 
 FUNC_CTX_ATTR_MAP: dict[str, Callable[..., str]] = {
@@ -74,22 +92,41 @@ FUNC_CTX_ATTR_MAP: dict[str, Callable[..., str]] = {
     
 # class to extract anything in the form []
 class AttributeManager:
+    @classmethod
+    def match_attr(cls, attr_str: str) -> Attribute | None:
+        if (m := ATTR_PATTERN.fullmatch(attr_str)):
+            return Attribute(
+                m.group('name'), 
+                *cls.parse_args(m.group('args') or '')
+            )
+        return None
+
     @staticmethod
-    def match_attr(attr_str: str) -> dict[str, str | None]:
-        if m := ATTR_PATTERN.fullmatch(attr_str): return m.groupdict()
-        return {}
+    def parse_args(arg_str: str) -> tuple[list[str], dict[str, str]]:
+        args: list[str] = []
+        kwargs: dict[str, str] = {}
+        for m in ARG_PATTERN.finditer(arg_str):
+            val = m.group("value").strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in "'\"":
+                val = val[1:-1]
+
+            key = m.group("key")
+            if key: kwargs[key] = val
+            else: args.append(val)
+        return args, kwargs
 
     # takes an attr line in the form "[shader('compute'), numthreads(64, 1, 1)]"
     # -> splits it into its individual attribute components
     # -> i.e. ["shader('compute')", "numthreads(64, 1, 1)"]
     @classmethod
-    def split_attr_block(cls, block_str: str) -> list[dict[str, str | None]]:
+    def split_attr_block(cls, block_str: str) -> list[Attribute]:
         buffer: list[str] = []
-        attrs: list[dict[str, str | None]] = []
+        attrs: list[Attribute] = []
         stack_depth: int = 0
 
         def flush_buffer():
-            attrs.append(cls.match_attr(''.join(buffer).strip()))
+            attr = cls.match_attr(''.join(buffer).strip())
+            if attr: attrs.append(attr)
             buffer.clear()      
 
         for c in block_str:
@@ -109,7 +146,7 @@ class AttributeManager:
         return attrs
 
     @classmethod
-    def process_attrs(cls, src_map: dict[int, ShaderSourceLine], funcs: FunctionList) -> list[dict]:
+    def process_attrs(cls, src_map: dict[int, ShaderSourceLine], funcs: FunctionList) -> list[Attribute]:
         cls._attach_func_ctx_attrs(funcs)
         return cls._attach_glob_ctx_attrs(src_map, funcs)
     
@@ -122,8 +159,8 @@ class AttributeManager:
                 )
     
     @classmethod
-    def _attach_glob_ctx_attrs(cls, src_map: dict[int, ShaderSourceLine], funcs: FunctionList) -> list[dict]:
-        glob_attachments: list[dict] = []
+    def _attach_glob_ctx_attrs(cls, src_map: dict[int, ShaderSourceLine], funcs: FunctionList) -> list[Attribute]:
+        glob_attachments: list[Attribute] = []
         
         # if a match exists in src it MUST also exist in stripped_src or in a func definition
         # -> this automatically skips any code that is within a function
@@ -151,8 +188,8 @@ class AttributeManager:
         last_match: int = 0
 
         # handle an attribute
-        def handle_attr(attr: dict[str, str | None], attr_type: str) -> str:
-            handler = attr_map.get(name := attr['name'] or '')
+        def handle_attr(attr: Attribute, attr_type: str) -> str:
+            handler = attr_map.get(name := attr.name or '')
             if handler: return handler(attr, **kwargs)
             else: logger.warning(f"Unhandled {line_type} {attr_type} attribute: %s", name)
             return ''
@@ -165,7 +202,8 @@ class AttributeManager:
         
         # now try processing using the alt attr pattern
         if match := ALT_ATTR_PATTERN.search(line_str, last_match):
-            out_line += handle_attr(match.groupdict(), 'direct')
+            attr = Attribute(match.group('name'), *cls.parse_args(match.group('args')))
+            out_line += handle_attr(attr, 'direct')
             last_match = match.end()
         
         # add any code left over at the end of all the attributes
