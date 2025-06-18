@@ -1,30 +1,12 @@
 from dataclasses import dataclass
 import re
+from typing import Any
 
 from attribute_manager import AttributeManager
 from function_manager import FunctionDef, FunctionManager
 from shader_source_line import ShaderSourceLine
 from shader_stages import ShaderStage
-
-EXTENSION_GROUPS = {
-    'subgroup': [
-        'GL_KHR_shader_subgroup_basic',
-        'GL_KHR_shader_subgroup_vote',
-        'GL_KHR_shader_subgroup_ballot',
-        'GL_KHR_shader_subgroup_arithmetic',
-    ],
-
-    'subgroup_all': [
-        'GL_KHR_shader_subgroup_basic',
-        'GL_KHR_shader_subgroup_vote',
-        'GL_KHR_shader_subgroup_ballot',
-        'GL_KHR_shader_subgroup_arithmetic',
-        'GL_KHR_shader_subgroup_shuffle',
-        'GL_KHR_shader_subgroup_shuffle_relative',
-        'GL_KHR_shader_subgroup_clustered',
-        'GL_KHR_shader_subgroup_quad'
-    ],
-}
+from shader_utils import *
 
 class ShaderProcessor:
     def __init__(self, name: str, src: str) -> None:
@@ -44,8 +26,8 @@ class ShaderProcessor:
         
         # create module
         self.module: dict[int, ShaderSourceLine] = {}
-        self._process_global_attrs()
         self._process_function_attrs()
+        self._process_global_attrs()
         self._create_module()
     
     # is basically whats exported to other files in the project
@@ -82,33 +64,74 @@ class ShaderProcessor:
                         else: self.ext.add(token + ' : require')
 
                 case _:
-                    break
+                    continue
 
     def _process_function_attrs(self) -> None:
         for func in self.funcs.items:
+            # settings-dict lookup
+            stage_settings: dict[str, Any] | None = None
+            match func.stage:
+                case ShaderStage.FRAG: stage_settings = FRAG_DEFAULTS.copy()
+                case ShaderStage.GEOM: stage_settings = GEOM_DEFAULTS.copy()
+                case ShaderStage.TESC: stage_settings = TESC_DEFAULTS.copy()
+                case ShaderStage.TESE: stage_settings = TESE_DEFAULTS.copy()
+            
+            # process the passed functions
             for attr in func.attrs:
+                # stage settings specific handling
+                if stage_settings:
+                    if attr.name == (func.stage.value if func.stage else ''):
+                        for k, v in attr.kwargs.items():   # iterate over key-value pairs
+                            if (k := ALIAS.get(k, k)) not in stage_settings:
+                                raise ValueError(
+                                    f"Unknown modifier '{k}' for stage '{func.stage}' "
+                                    f"in [{attr.name}] on function '{func.name}'"
+                                )
+                            stage_settings[k] = ALIAS.get(v, v)
+                    
+                    elif (simp_attr := SIMPLE_ATTR.get(attr.name)):
+                        stage_key, setting_key, kind, *fixed = simp_attr
+                        # skip if this attr is for a different stage
+                        if (func.stage and func.stage.value) != stage_key:
+                            continue
+
+                        match kind:
+                            case 'flag': stage_settings[setting_key] = True
+                            case 'alias': stage_settings[setting_key] = fixed[0]
+                            case 'value':
+                                val = attr.args[0] if attr.args else next(iter(attr.kwargs.values()))
+                                stage_settings[setting_key] = ALIAS.get(val, val)
+                        continue
+                
+                # other processes
                 match attr.name:
-                    case 'shader':
-                        func.stage = ShaderStage.from_token(attr.args[0])
+                    case _: continue
+            
+            # emit layout for the func
+            if stage_settings: self._emit_layout(func, stage_settings)
 
-                    case 'numthreads':
-                        # get num threads
-                        if attr.args:
-                            numthreads = [1, 1, 1]
-                            for i in range(min(len(attr.args), 3)):
-                                numthreads[i] = int(attr.args[i])
-                        else:
-                            numthreads = (
-                                int(attr.kwargs.get('x', 1)),
-                                int(attr.kwargs.get('y', 1)),
-                                int(attr.kwargs.get('z', 1)),
-                            )
-                        
-                        # add layout str to config
-                        func.config.append(
-                            f'layout(local_size_x={numthreads[0]}, local_size_y={numthreads[1]}, local_size_z={numthreads[2]}) in;'
-                        )
+    def _emit_layout(self, func: FunctionDef, settings: dict[str, str]) -> None:
+        def _tokens(table):
+            parts = []
+            for key, fn in table:
+                tok = fn(settings[key])
+                if tok is None: continue
+                if isinstance(tok, tuple): parts.extend(tok)
+                else: parts.append(tok)
+            return parts
 
-                    case _:
-                        break
-        
+        match func.stage:
+            case ShaderStage.FRAG:
+                if in_parts := _tokens(FRAG_EMIT_IN): 
+                    func.config.append(f"layout({', '.join(in_parts)}) in;")
+            case ShaderStage.GEOM:
+                if in_parts := _tokens(GEOM_EMIT_IN): 
+                    func.config.append(f"layout({', '.join(in_parts)}) in;")
+                if out_parts := _tokens(GEOM_EMIT_OUT): 
+                    func.config.append(f"layout({', '.join(out_parts)}) out;")
+            case ShaderStage.TESC:
+                if out_parts := _tokens(TESC_EMIT_OUT):
+                    func.config.append(f"layout({', '.join(out_parts)}) out;")
+            case ShaderStage.TESE:
+                if in_parts := _tokens(TESE_EMIT_IN): 
+                    func.config.append(f"layout({', '.join(in_parts)}) in;")

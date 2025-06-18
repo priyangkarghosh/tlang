@@ -1,20 +1,37 @@
 import re
 from moderngl import ComputeShader, Context, Program
-
+from kernel import Kernel
 from shader_processor import ShaderProcessor
 from shader_source_line import ShaderSourceLine
 from shader_stages import ShaderStage
-
-FUNC_REG_EXP = r'\b{ret_type}\s+{name}\s*\('
 
 class Shader:
     def __init__(self, ctx: Context, version: str, module: str, processor: ShaderProcessor) -> None:
         self._ctx = ctx
         self._version = version
 
-        self._kernels: dict[str, ComputeShader] = {}
+        self._kernels: dict[str, Kernel] = {}
         self._programs: dict[str, Program] = {}
         self._build(module, processor)
+    
+    @property
+    def kernels(self) -> dict[str, Kernel]:
+        return self._kernels
+
+    @property
+    def programs(self) -> dict[str, Program]:
+        return self._programs
+
+    def get_kernel(self, name: str) -> Kernel:
+        return self._kernels[name]
+
+    def get_program(self, name: str) -> Program:
+        return self._programs[name]
+    
+    @staticmethod
+    def _func_header_regex(ret_type: str, name: str) -> re.Pattern:
+        ret = r'\s+'.join([re.escape(w) for w in ret_type.split()])
+        return re.compile(rf'\b{ret}\s+{re.escape(name)}\s*\(', re.MULTILINE)
     
     def _build(self, module: str, process: ShaderProcessor):
         # create a str combining all the extensions
@@ -25,29 +42,20 @@ class Shader:
         # go through each func and build if necessary
         stages: dict[str, str] = {}
         for func in process.funcs.items:
-            # create the replacement pattern
-            pattern = re.compile(
-                FUNC_REG_EXP.format(
-                    ret_type=func.return_type, name=func.name
-                )
-            )
+            # # create the replacement pattern
+            pattern = Shader._func_header_regex(func.return_type, func.name)
 
             # create the src str
             src = f'#version {self._version}\n' + base
             src += f'#line 1 "FUNC_CONFIG({func.name})"\n' + '\n'.join(func.config) + '\n'
-            src += Shader.build_map(func.line_body)
-            src = re.sub(pattern, 'void main(', src, count=1)
+            src += pattern.sub('void main(', Shader.build_map(func.line_body), count=1)
 
             # behaviour based off stage
             match func.stage:
                 case ShaderStage.COMP:
-                    self._kernels[func.name] = self._ctx.compute_shader(src)
-                    continue
-                
+                    self._kernels[func.name] = Kernel(self._ctx, func.name, self._ctx.compute_shader(src))
                 case ShaderStage.VERT | ShaderStage.FRAG | ShaderStage.GEOM | ShaderStage.TESC | ShaderStage.TESE:
                     stages[func.name] = src
-                    continue
-                
                 case _:
                     continue
 
@@ -66,8 +74,6 @@ class Shader:
                 geometry_shader = stages.get(geom) if geom else None,
                 tess_control_shader = stages.get(tesc) if tesc else None,
                 tess_evaluation_shader = stages.get(tese) if tese else None,
-
-                # --> LOOK INTO VARYINGS AND OUTPUTS
             )
 
     

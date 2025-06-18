@@ -1,95 +1,34 @@
+import bisect
 from dataclasses import dataclass
 import re
 import logging
 from typing import Callable
 
 from attribute import Attribute
+from attribute_handlers import *
 from function_manager import FunctionList
 from shader_source_line import ShaderSourceLine
+from shader_stages import ShaderStage
 
 
 logger = logging.getLogger(__name__)
 
 BLOCK_PATTERN = re.compile(r'\[([^\]]+)\]')
-ATTR_PATTERN = re.compile(r'(?P<name>\w+)(?:\((?P<args>[^)]*)\))?') # i.e. [shader('test')]
-ALT_ATTR_PATTERN = re.compile(r'#(?P<name>\w+)\s*<\s*(?P<args>.*?)\s*>') # i.e. #shader('test')
-# ALT_ATTR_PATTERN ONLY SUPPORTS 1 LINE PER PATTERN
+ATTR_PATTERN = re.compile(r'(?P<name>\w+!?)(?:\((?P<args>[^)]*)\))?')
+ALT_ATTR_PATTERN = re.compile(r'#(?P<name>\w+!?)\s*<\s*(?P<args>.*?)\s*>')
+# ALT_ATTR_PATTERN ONLY SUPPORTS 1 LINE PER PATTERN AND SINGLE LINE DECLARATIONS
 
-ARG_PATTERN = re.compile(
-    r"""
+ARG_PATTERN = re.compile(r"""
     \s*
     (?:@?(?P<key>\w+)\s*=\s*)?
-    (?P<value>        
+    (?P<value>
         '[^']*'
         |"[^"]*"
-        |[^'",\s\]]+
+        |[^,]+
     )
     \s*(?:,|$)
-    """, 
-    re.VERBOSE
-)
+""", re.VERBOSE)
 
-class AttributeHandlers:
-    @staticmethod
-    def unroll(attr: Attribute, **kwargs) -> str:
-        return '#pragma unroll'
-    
-    @staticmethod
-    def program(attr: Attribute, **kwargs) -> str:
-        # type checks
-        if not isinstance(glob_attachments := kwargs.get('glob_attachments'), list):
-            raise TypeError("Expected 'glob_attachments' to be a list")
-        
-        # add attribute to attachments
-        glob_attachments.append(attr)
-        return f"//<<PROGRAM DEC '{attr.name}'>>//\n"
-    
-    @staticmethod
-    def entry_point(attr: Attribute, **kwargs) -> str:
-        # type checks
-        if not isinstance(funcs := kwargs.get('funcs'), FunctionList):
-            raise TypeError("Expected 'funcs' to be a FunctionList")
-        if not isinstance(index := kwargs.get('index'), int):
-            raise TypeError("Expected 'index' to be an int")
-
-        # add attribute to the function definition
-        if fn := funcs.find_next(index): fn.attrs.append(attr)
-        return f"//<<ATTR '{attr.name}'>>//\n"
-    
-    @staticmethod
-    def dependency(attr: Attribute, **kwargs) -> str:
-        # type checks
-        if not isinstance(glob_attachments := kwargs.get('glob_attachments'), list):
-            raise TypeError("Expected 'glob_attachments' to be a list")
-        
-        # add attribute to attachments
-        glob_attachments.append(attr)
-        return '\n'.join([f"{{% include '{sn}' %}}" for sn in attr.args])
-    
-    @staticmethod
-    def extension(attr: Attribute, **kwargs) -> str:
-        # type checks
-        if not isinstance(glob_attachments := kwargs.get('glob_attachments'), list):
-            raise TypeError("Expected 'glob_attachments' to be a list")
-        
-        # add attribute to attachments
-        glob_attachments.append(attr)
-        return f"//<<EXTENSION '{attr.name}', ARGS: {attr.args}>>//\n"
-
-GLOB_CTX_ATTR_MAP: dict[str, Callable[..., str]] = {
-    'shader': AttributeHandlers.entry_point,
-    'numthreads': AttributeHandlers.entry_point,
-    'program': AttributeHandlers.program,
-    'include': AttributeHandlers.dependency,
-    'extend': AttributeHandlers.extension,
-    'extend!': AttributeHandlers.extension,
-    'require': AttributeHandlers.extension,
-}
-
-FUNC_CTX_ATTR_MAP: dict[str, Callable[..., str]] = {
-    'unroll': AttributeHandlers.unroll
-}
-    
 # class to extract anything in the form []
 class AttributeManager:
     @classmethod
@@ -108,11 +47,12 @@ class AttributeManager:
         for m in ARG_PATTERN.finditer(arg_str):
             val = m.group("value").strip()
             if len(val) >= 2 and val[0] == val[-1] and val[0] in "'\"":
-                val = val[1:-1]
+                val = val[1:-1].strip()
 
-            key = m.group("key")
-            if key: kwargs[key] = val
-            else: args.append(val)
+            if len(val):
+                key = m.group("key")
+                if key: kwargs[key] = val
+                else: args.append(val)
         return args, kwargs
 
     # takes an attr line in the form "[shader('compute'), numthreads(64, 1, 1)]"
@@ -153,54 +93,69 @@ class AttributeManager:
     @classmethod
     def _attach_func_ctx_attrs(cls, funcs: FunctionList):
         for func in funcs.items:
-            for index, ssl in func.line_body.items():
-                func.line_body[index].data = cls._process_attr_line(
-                    ssl.data, 'function', FUNC_CTX_ATTR_MAP
+            line_indices, i = sorted(func.line_body), 0
+            while i < len(line_indices):
+                idx_out, repl = cls._process_attr_line(
+                    line_indices[i], func.line_body, "function", FUNC_CTX_ATTR_MAP
                 )
-    
+                func.line_body[idx_out].data = repl
+                i = bisect.bisect_right(line_indices, idx_out)
+
     @classmethod
     def _attach_glob_ctx_attrs(cls, src_map: dict[int, ShaderSourceLine], funcs: FunctionList) -> list[Attribute]:
         glob_attachments: list[Attribute] = []
-        
-        # if a match exists in src it MUST also exist in stripped_src or in a func definition
-        # -> this automatically skips any code that is within a function
-        for index, ssl in src_map.items():
-            # restore line number if there's been a change
-            src_map[index].data = cls._process_attr_line(
-                ssl.data, 'global', GLOB_CTX_ATTR_MAP, index=index,
-                line=ssl.data, funcs=funcs, glob_attachments=glob_attachments
+        line_indices, i = sorted(src_map), 0
+        while i < len(line_indices):
+            idx_out, repl = cls._process_attr_line(
+                line_indices[i], src_map, "global", GLOB_CTX_ATTR_MAP,
+                funcs=funcs, glob_attachments=glob_attachments
             )
-
-        # return stripped src code and attachments
+            src_map[idx_out].data = repl
+            i = bisect.bisect_right(line_indices, idx_out)
         return glob_attachments
 
     @classmethod
     def _process_attr_line(
         cls,
-        line_str: str,
+        index: int,
+        map: dict[int, ShaderSourceLine],
         line_type: str,
         attr_map: dict[str, Callable[..., str]],
         **kwargs
-    ) -> str:
+    ) -> tuple[int, str]:
+        # early exit to first check whether this is an actual attribute
+        # -> i.e. the line must actually start with a [ or a #
+        if not re.match(r'^\s*(?:\[|#)', init := map[index].data):
+            return index, init
+
         # first try processing the line using the block pattern
         # -> this is attributes in the style [attr(val)]
-        out_line: str = ''
-        last_match: int = 0
+        # -> have to check if it spans multiple lines
+        # -> thus, use brace match to find the entire attribute
+        start_index = index
+        line_str, depth = '', 0
+        while True:
+            line_str += (line := map[index].data)
+            map[index].data = '\n'
+            depth += line.count('[') - line.count(']')
+            if depth <= 0 or (index + 1) not in map: break
+            index += 1
 
         # handle an attribute
         def handle_attr(attr: Attribute, attr_type: str) -> str:
             handler = attr_map.get(name := attr.name or '')
-            if handler: return handler(attr, **kwargs)
+            if handler: return handler(attr, index=start_index, **kwargs)
             else: logger.warning(f"Unhandled {line_type} {attr_type} attribute: %s", name)
             return ''
-
+        
+        out_line, last_match = '', 0
         for match in BLOCK_PATTERN.finditer(line_str):
             # handle the attribute(s)
             for attr in cls.split_attr_block(match.group(1).strip()): 
                 out_line += handle_attr(attr, 'block')
             last_match = match.end()
         
-        # now try processing using the alt attr pattern
+        # try processing using the alt attr pattern
         if match := ALT_ATTR_PATTERN.search(line_str, last_match):
             attr = Attribute(match.group('name'), *cls.parse_args(match.group('args')))
             out_line += handle_attr(attr, 'direct')
@@ -210,4 +165,4 @@ class AttributeManager:
         # -> this allows for comments at the end, but no other code (also includes the \n)
         # -> replace the line
         out_line += line_str[last_match:]
-        return out_line
+        return index, out_line

@@ -10,7 +10,7 @@ from shader_processor import ShaderProcessor
 FILE_EXT = '.tlang'
 class ShaderManager:
     def __init__(self, ctx: Context, version: str, dir: str, constants: dict = {}) -> None:
-        self.dm = DependencyManager(constants)
+        dm = DependencyManager(constants)
 
         # process each file in the 
         processors: dict[str, ShaderProcessor] = {}
@@ -22,13 +22,13 @@ class ShaderManager:
                 Path(file_path).read_text()
             )
 
-            self.dm.register(process)     
+            dm.register(process)     
 
         # build each common src
-        commons = self.dm.build_all()
+        commons = dm.build_all()
 
         # create a shader obj for each shader
-        self.shaders: dict[str, Shader] = {}
+        self._shaders: dict[str, Shader] = {}
         for name, common in commons.items():
             process = processors[name]
 
@@ -37,7 +37,10 @@ class ShaderManager:
                 process.ext.update(processors[dp].ext)
 
             # create the shader obj
-            self.shaders[name] = Shader(
+            self._shaders[name] = Shader(
                 ctx, version, common, process
             )
+    
+    def get_shader(self, name: str) -> Shader | None:
+        return self._shaders.get(name)
 
