@@ -11,6 +11,7 @@ from tlang.dependency_manager import DependencyManager
 from tlang.shader import Shader
 from tlang.shader_processor import ShaderProcessor
 
+
 FILE_EXT = '.tlang'
 class ShaderManager:
     def __init__(self, ctx: Context, version: str, dir: str, constants: dict = {}) -> None:

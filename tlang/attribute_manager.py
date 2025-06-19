@@ -17,6 +17,7 @@ ATTR_PATTERN = re.compile(r'(?P<name>\w+!?)(?:\((?P<args>[^)]*)\))?')
 ALT_ATTR_PATTERN = re.compile(r'#(?P<name>\w+!?)\s*<\s*(?P<args>.*?)\s*>')
 # ALT_ATTR_PATTERN ONLY SUPPORTS 1 LINE PER PATTERN AND SINGLE LINE DECLARATIONS
 
+
 ARG_PATTERN = re.compile(r"""
     \s*
     (?:@?(?P<key>\w+)\s*=\s*)?
@@ -27,6 +28,7 @@ ARG_PATTERN = re.compile(r"""
     )
     \s*(?:,|$)
 """, re.VERBOSE)
+
 
 # class to extract anything in the form []
 class AttributeManager:

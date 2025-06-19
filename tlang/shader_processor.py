@@ -1,8 +1,8 @@
 import logging
 logger = logging.getLogger(__name__)
 
-from dataclasses import dataclass
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from tlang.attribute_manager import AttributeManager
@@ -10,6 +10,7 @@ from tlang.function_manager import FunctionDef, FunctionManager
 from tlang.shader_source_line import ShaderSourceLine
 from tlang.shader_stages import ShaderStage
 from tlang.shader_utils import *
+
 
 class ShaderProcessor:
     def __init__(self, name: str, src: str) -> None:

@@ -7,6 +7,7 @@ from tlang.attribute import Attribute
 from tlang.function_manager import FunctionList
 from tlang.shader_stages import ShaderStage
 
+
 DECL_RE = re.compile(r'''
     ^\s*
     (?P<qual>uniform|shared|in|out)            # qualifier we trust
@@ -18,6 +19,7 @@ DECL_RE = re.compile(r'''
     (?://(?P<comment>.*))?                    # optional // comment
     \s*$
 ''', re.VERBOSE)
+
 
 class AttributeHandlers:
     @staticmethod

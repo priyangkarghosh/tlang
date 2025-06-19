@@ -2,11 +2,12 @@ import logging
 logger = logging.getLogger(__name__)
 
 import re
-from moderngl import ComputeShader, Context, Program
+from moderngl import Context, Program
 from tlang.kernel import Kernel
 from tlang.shader_processor import ShaderProcessor
 from tlang.shader_source_line import ShaderSourceLine
 from tlang.shader_stages import ShaderStage
+
 
 class Shader:
     def __init__(self, ctx: Context, name: str, version: str, module: str, processor: ShaderProcessor) -> None:

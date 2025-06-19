@@ -1,5 +1,6 @@
 from typing import Any
 
+
 EXTENSION_GROUPS: dict[str, list[str]] = {
     'subgroup': [
         'GL_KHR_shader_subgroup_basic',
