@@ -1,6 +1,9 @@
+import logging
+logger = logging.getLogger(__name__)
+
 from jinja2 import DictLoader, Environment, TemplateNotFound
-from shader import Shader
-from shader_processor import ShaderProcessor
+from tlang.shader import Shader
+from tlang.shader_processor import ShaderProcessor
 
 
 class DependencyManager:

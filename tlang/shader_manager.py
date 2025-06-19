@@ -1,25 +1,36 @@
-from glob import glob
+import logging
+logger = logging.getLogger(__name__)
+
+import inspect
 import os
+from glob import glob
 from pathlib import Path
 
 from moderngl import Context
-from dependency_manager import DependencyManager
-from shader import Shader
-from shader_processor import ShaderProcessor
+from tlang.dependency_manager import DependencyManager
+from tlang.shader import Shader
+from tlang.shader_processor import ShaderProcessor
 
 FILE_EXT = '.tlang'
 class ShaderManager:
     def __init__(self, ctx: Context, version: str, dir: str, constants: dict = {}) -> None:
         dm = DependencyManager(constants)
 
+        # check if the file path given is absolute
+        # -> if not, convert it to an absolute dir   
+        path = Path(dir)
+        if not path.is_absolute():
+            frame = inspect.stack()[1]
+            path = (Path(frame.filename).resolve().parent / dir).resolve()
+
         # process each file in the 
         processors: dict[str, ShaderProcessor] = {}
         pattern = os.path.join(dir, f'**/*{FILE_EXT}')
-        for file_path in glob(pattern, recursive=True):
+        for fp in glob(pattern, recursive=True):
             # create the new processor
             processors[name] = process = ShaderProcessor(
-                name := os.path.relpath(file_path, dir).replace('\\', '/').replace(FILE_EXT, ''), 
-                Path(file_path).read_text()
+                name := (fp := Path(fp)).relative_to(dir).with_suffix('').as_posix(), 
+                fp.read_text()
             )
 
             dm.register(process)     
@@ -38,7 +49,7 @@ class ShaderManager:
 
             # create the shader obj
             self._shaders[name] = Shader(
-                ctx, version, common, process
+                ctx, name, version, common, process
             )
     
     def get_shader(self, name: str) -> Shader | None:

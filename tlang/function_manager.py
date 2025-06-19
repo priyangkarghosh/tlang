@@ -1,11 +1,14 @@
+import logging
+logger = logging.getLogger(__name__)
+
 import bisect
-from attribute import Attribute
-from shader_stages import ShaderStage
+from tlang.attribute import Attribute
+from tlang.shader_stages import ShaderStage
 from dataclasses import dataclass, field
 from enum import Enum
 import re
 
-from shader_source_line import ShaderSourceLine
+from tlang.shader_source_line import ShaderSourceLine
 
 # matches function declarations with opening brace
 FUNC_PATTERN = re.compile(r'''
@@ -57,7 +60,7 @@ class FunctionList:
 
 class FunctionManager:
     @staticmethod
-    def extract_funcs(src: str, src_map: dict[int, ShaderSourceLine]) -> FunctionList:
+    def extract_funcs(shader_name: str, src: str, src_map: dict[int, ShaderSourceLine]) -> FunctionList:
         funcs: list[FunctionDef] = []
 
         # search for function declarations
@@ -86,13 +89,13 @@ class FunctionManager:
             
             # get the full function body
             line_end = src[:func_end].count('\n') + 1
-            char_body = src[header_end - 1: func_end].strip()
             line_body = {
                 index: src_map.pop(index) 
                 for index in range(line_start, line_end + 1) if index in src_map
             }
 
             # add to func list
+            logger.info("Found function '%s' in %s", name, shader_name)
             funcs.append(FunctionDef(
                 name=name,
                 return_type=ret_type,

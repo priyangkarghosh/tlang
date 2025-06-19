@@ -1,13 +1,17 @@
+import logging
+logger = logging.getLogger(__name__)
+
 import re
 from moderngl import ComputeShader, Context, Program
-from kernel import Kernel
-from shader_processor import ShaderProcessor
-from shader_source_line import ShaderSourceLine
-from shader_stages import ShaderStage
+from tlang.kernel import Kernel
+from tlang.shader_processor import ShaderProcessor
+from tlang.shader_source_line import ShaderSourceLine
+from tlang.shader_stages import ShaderStage
 
 class Shader:
-    def __init__(self, ctx: Context, version: str, module: str, processor: ShaderProcessor) -> None:
+    def __init__(self, ctx: Context, name: str, version: str, module: str, processor: ShaderProcessor) -> None:
         self._ctx = ctx
+        self._name = name
         self._version = version
 
         self._kernels: dict[str, Kernel] = {}
@@ -34,6 +38,8 @@ class Shader:
         return re.compile(rf'\b{ret}\s+{re.escape(name)}\s*\(', re.MULTILINE)
     
     def _build(self, module: str, process: ShaderProcessor):
+        logger.info("Starting build for %s...", self._name)
+
         # create a str combining all the extensions
         # -> then create the base src string using the extensions and common module
         ext_str = '\n'.join(f"#extension {ext}" for ext in process.ext)
@@ -53,6 +59,7 @@ class Shader:
             # behaviour based off stage
             match func.stage:
                 case ShaderStage.COMP:
+                    logger.info("-> Created new kernel: %s", func.name)
                     self._kernels[func.name] = Kernel(self._ctx, func.name, self._ctx.compute_shader(src))
                 case ShaderStage.VERT | ShaderStage.FRAG | ShaderStage.GEOM | ShaderStage.TESC | ShaderStage.TESE:
                     stages[func.name] = src
@@ -61,6 +68,8 @@ class Shader:
 
         # create each program
         for prog_name, prog_dec in process.programs.items():
+            logger.info("-> Created new program: %s", prog_name)
+
             # get all stage names
             frag = prog_dec.get(ShaderStage.FRAG)
             geom = prog_dec.get(ShaderStage.GEOM)
@@ -75,6 +84,9 @@ class Shader:
                 tess_control_shader = stages.get(tesc) if tesc else None,
                 tess_evaluation_shader = stages.get(tese) if tese else None,
             )
+        
+        #
+        logger.info('Shader built successfully')
 
     
     @staticmethod

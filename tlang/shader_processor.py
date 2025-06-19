@@ -1,12 +1,15 @@
+import logging
+logger = logging.getLogger(__name__)
+
 from dataclasses import dataclass
 import re
 from typing import Any
 
-from attribute_manager import AttributeManager
-from function_manager import FunctionDef, FunctionManager
-from shader_source_line import ShaderSourceLine
-from shader_stages import ShaderStage
-from shader_utils import *
+from tlang.attribute_manager import AttributeManager
+from tlang.function_manager import FunctionDef, FunctionManager
+from tlang.shader_source_line import ShaderSourceLine
+from tlang.shader_stages import ShaderStage
+from tlang.shader_utils import *
 
 class ShaderProcessor:
     def __init__(self, name: str, src: str) -> None:
@@ -21,8 +24,8 @@ class ShaderProcessor:
         self.programs: dict[str, dict[ShaderStage, str | None]] = {}
         
         # processing steps
-        self.funcs = FunctionManager.extract_funcs(self.src, self.src_map)
-        self.glob_attrs = AttributeManager.process_attrs(self.src_map, self.funcs)
+        self.funcs = FunctionManager.extract_funcs(self.name, self.src, self.src_map)
+        self.glob_attrs = AttributeManager.process_attrs(self.name, self.src_map, self.funcs)
         
         # create module
         self.module: dict[int, ShaderSourceLine] = {}

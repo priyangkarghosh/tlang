@@ -1,8 +1,11 @@
+import logging
+logger = logging.getLogger(__name__)
+
 import re
 from typing import Callable
-from attribute import Attribute
-from function_manager import FunctionList
-from shader_stages import ShaderStage
+from tlang.attribute import Attribute
+from tlang.function_manager import FunctionList
+from tlang.shader_stages import ShaderStage
 
 DECL_RE = re.compile(r'''
     ^\s*

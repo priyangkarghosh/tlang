@@ -1,17 +1,16 @@
+import logging
+logger = logging.getLogger(__name__)
+
+import re
 import bisect
 from dataclasses import dataclass
-import re
-import logging
 from typing import Callable
 
-from attribute import Attribute
-from attribute_handlers import *
-from function_manager import FunctionList
-from shader_source_line import ShaderSourceLine
-from shader_stages import ShaderStage
+from tlang.attribute import Attribute
+from tlang.attribute_handlers import *
+from tlang.function_manager import FunctionList
+from tlang.shader_source_line import ShaderSourceLine
 
-
-logger = logging.getLogger(__name__)
 
 BLOCK_PATTERN = re.compile(r'\[([^\]]+)\]')
 ATTR_PATTERN = re.compile(r'(?P<name>\w+!?)(?:\((?P<args>[^)]*)\))?')
@@ -86,28 +85,28 @@ class AttributeManager:
         return attrs
 
     @classmethod
-    def process_attrs(cls, src_map: dict[int, ShaderSourceLine], funcs: FunctionList) -> list[Attribute]:
-        cls._attach_func_ctx_attrs(funcs)
-        return cls._attach_glob_ctx_attrs(src_map, funcs)
+    def process_attrs(cls, shader_name: str, src_map: dict[int, ShaderSourceLine], funcs: FunctionList) -> list[Attribute]:
+        cls._attach_func_ctx_attrs(shader_name, funcs)
+        return cls._attach_glob_ctx_attrs(shader_name, src_map, funcs)
     
     @classmethod
-    def _attach_func_ctx_attrs(cls, funcs: FunctionList):
+    def _attach_func_ctx_attrs(cls, shader_name: str, funcs: FunctionList):
         for func in funcs.items:
             line_indices, i = sorted(func.line_body), 0
             while i < len(line_indices):
                 idx_out, repl = cls._process_attr_line(
-                    line_indices[i], func.line_body, "function", FUNC_CTX_ATTR_MAP
+                    shader_name, line_indices[i], func.line_body, "function", FUNC_CTX_ATTR_MAP
                 )
                 func.line_body[idx_out].data = repl
                 i = bisect.bisect_right(line_indices, idx_out)
 
     @classmethod
-    def _attach_glob_ctx_attrs(cls, src_map: dict[int, ShaderSourceLine], funcs: FunctionList) -> list[Attribute]:
+    def _attach_glob_ctx_attrs(cls, shader_name: str, src_map: dict[int, ShaderSourceLine], funcs: FunctionList) -> list[Attribute]:
         glob_attachments: list[Attribute] = []
         line_indices, i = sorted(src_map), 0
         while i < len(line_indices):
             idx_out, repl = cls._process_attr_line(
-                line_indices[i], src_map, "global", GLOB_CTX_ATTR_MAP,
+                shader_name, line_indices[i], src_map, "global", GLOB_CTX_ATTR_MAP,
                 funcs=funcs, glob_attachments=glob_attachments
             )
             src_map[idx_out].data = repl
@@ -117,6 +116,7 @@ class AttributeManager:
     @classmethod
     def _process_attr_line(
         cls,
+        shader_name: str,
         index: int,
         map: dict[int, ShaderSourceLine],
         line_type: str,
@@ -145,7 +145,7 @@ class AttributeManager:
         def handle_attr(attr: Attribute, attr_type: str) -> str:
             handler = attr_map.get(name := attr.name or '')
             if handler: return handler(attr, index=start_index, **kwargs)
-            else: logger.warning(f"Unhandled {line_type} {attr_type} attribute: %s", name)
+            else: logger.warning(f"Unhandled {line_type} {attr_type} attribute '%s' in %s", name, shader_name)
             return ''
         
         out_line, last_match = '', 0
