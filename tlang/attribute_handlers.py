@@ -10,13 +10,13 @@ from tlang.shader_stages import ShaderStage
 
 DECL_RE = re.compile(r'''
     ^\s*
-    (?P<qual>uniform|shared|in|out)            # qualifier we trust
+    (?P<qual>uniform|shared|in|out)           # qualifier
     \s+
-    (?P<type>[A-Za-z_]\w*)\s+                  # GLSL type
-    (?P<name>[A-Za-z_]\w*)                     # identifier
-    (?:\s*:\s*LOC(?P<loc>\d+))?               # optional : LOC#
+    (?P<type>[A-Za-z_]\w*)\s+                 # type
+    (?P<name>[A-Za-z_]\w*(?:\[\s*[^]]+\s*\])?)# name with optional [size]
+    (?:\s*:\s*LOC(?P<loc>\d+))?               # optional location
     \s*
-    (?://(?P<comment>.*))?                    # optional // comment
+    (?://(?P<comment>.*))?                    # optional comment
     \s*$
 ''', re.VERBOSE)
 
