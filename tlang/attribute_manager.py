@@ -12,7 +12,7 @@ from tlang.function_manager import FunctionList
 from tlang.shader_source_line import ShaderSourceLine
 
 
-BLOCK_PATTERN = re.compile(r'\[([^\]]+)\]')
+BLOCK_PATTERN = re.compile(r'\[((?:[^\[\]]|\[[^\[\]]*\])*)\]',re.DOTALL) # support for one nested bracket
 ATTR_PATTERN = re.compile(r'(?P<name>\w+!?)(?:\((?P<args>[^)]*)\))?')
 ALT_ATTR_PATTERN = re.compile(r'#(?P<name>\w+!?)\s*<\s*(?P<args>.*?)\s*>')
 # ALT_ATTR_PATTERN ONLY SUPPORTS 1 LINE PER PATTERN AND SINGLE LINE DECLARATIONS
@@ -36,7 +36,7 @@ class AttributeManager:
     def match_attr(cls, attr_str: str) -> Attribute | None:
         if (m := ATTR_PATTERN.fullmatch(attr_str)):
             return Attribute(
-                m.group('name'), 
+                m.group('name'), m.group('args'),
                 *cls.parse_args(m.group('args') or '')
             )
         return None
@@ -159,7 +159,7 @@ class AttributeManager:
         
         # try processing using the alt attr pattern
         if match := ALT_ATTR_PATTERN.search(line_str, last_match):
-            attr = Attribute(match.group('name'), *cls.parse_args(match.group('args')))
+            attr = Attribute(match.group('name'), match.group('args'), *cls.parse_args(match.group('args')))
             out_line += handle_attr(attr, 'direct')
             last_match = match.end()
         

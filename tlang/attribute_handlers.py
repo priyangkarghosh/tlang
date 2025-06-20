@@ -115,17 +115,7 @@ class AttributeHandlers:
             raise TypeError("Expected 'index' to be an int")
 
         # find a function to attach to
-        if fn := funcs.find_next(index):
-            # add to config for each resource attribute
-            for item in attr.args:
-                m = DECL_RE.match(item)
-                if not m: raise ValueError(f"Un-recognised resource declaration: {item!r}")
-                
-                q, loc = m['qual'], m['loc'], 
-                layout = f"layout(location = {loc}) " if loc and q in ('in', 'out') else ''
-                line = f"{layout}{q} {m['type']} {m['name']};"
-                if (cmt := m['comment']): line += f" //{cmt.strip()}"
-                fn.config.append(line)
+        if fn := funcs.find_next(index): fn.config.append(attr.raw_args)
         return f"//<<RESOURCE BLOCK DECL>>//\n"
     
     @staticmethod
