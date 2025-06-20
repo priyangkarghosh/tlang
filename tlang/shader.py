@@ -2,6 +2,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 import re
+import time
 from moderngl import Context, Program
 from tlang.kernel import Kernel
 from tlang.shader_processor import ShaderProcessor
@@ -39,6 +40,8 @@ class Shader:
         return re.compile(rf'\b{ret}\s+{re.escape(name)}\s*\(', re.MULTILINE)
     
     def _build(self, module: str, process: ShaderProcessor):
+        # start time for shader manager
+        t0 = time.perf_counter()
         logger.info("Starting build for %s...", self._name)
 
         # create a str combining all the extensions
@@ -86,10 +89,13 @@ class Shader:
                 tess_evaluation_shader = stages.get(tese) if tese else None,
             )
         
-        #
-        logger.info('Shader built successfully')
+        # log build
+        t1 = time.perf_counter()
+        logger.info(
+            'Shader built in %.2f seconds with %d kernels and %d programs',
+            (t1 - t0) * 1000, len(self._kernels), len(self._programs)
+        )
 
-    
     @staticmethod
     def build_map(map: dict[int, ShaderSourceLine]) -> str:
         parts = []

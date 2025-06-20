@@ -1,8 +1,9 @@
 import logging
 logger = logging.getLogger(__name__)
 
-import inspect
 import os
+import time
+import inspect
 from glob import glob
 from pathlib import Path
 
@@ -15,7 +16,8 @@ from tlang.shader_processor import ShaderProcessor
 FILE_EXT = '.tlang'
 class ShaderManager:
     def __init__(self, ctx: Context, version: str, dir: str, constants: dict = {}) -> None:
-        dm = DependencyManager(constants)
+        # start time for shader manager
+        t0 = time.perf_counter()
 
         # check if the file path given is absolute
         # -> if not, convert it to an absolute dir   
@@ -24,7 +26,8 @@ class ShaderManager:
             frame = inspect.stack()[1]
             path = (Path(frame.filename).resolve().parent / dir).resolve()
 
-        # process each file in the 
+        # process each file in the dir
+        dm = DependencyManager(constants)
         processors: dict[str, ShaderProcessor] = {}
         pattern = os.path.join(dir, f'**/*{FILE_EXT}')
         for fp in glob(pattern, recursive=True):
@@ -52,6 +55,19 @@ class ShaderManager:
             self._shaders[name] = Shader(
                 ctx, name, version, common, process
             )
+        
+        # elapsed time for shader manager for logging
+        t1 = time.perf_counter()
+        logging.info(
+            'Built and compiled %d shaders in %.2f seconds', 
+            len(self._shaders), (t1 - t0) * 1000
+        )
+    
+    def __getitem__(self, name: str) -> Shader | None:
+        return self.get_shader(name)
+
+    def __contains__(self, value: str) -> bool:
+        return value in self._shaders
     
     def get_shader(self, name: str) -> Shader | None:
         return self._shaders.get(name)
