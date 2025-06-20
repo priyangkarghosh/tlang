@@ -33,7 +33,7 @@ class ShaderManager:
         for fp in glob(pattern, recursive=True):
             # create the new processor
             processors[name] = process = ShaderProcessor(
-                name := (fp := Path(fp)).relative_to(dir).with_suffix('').as_posix(), 
+                name := '.'.join((fp := Path(fp)).relative_to(dir).with_suffix('').parts), 
                 fp.read_text()
             )
 
