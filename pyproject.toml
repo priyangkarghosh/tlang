@@ -1,6 +1,6 @@
 [project]
 name = "tlang"
-version = "0.1.3"
+version = "0.1.4"
 description = "GLSL Shader Preprocessor with modern language features."
 authors = [
     { name = "Priyangkar Ghosh", email = "priyangkar.ghosh@gmail.com" }
@@ -9,8 +9,10 @@ readme = "README.md"
 requires-python = ">=3.9"
 
 dependencies = [
+    "glcontext",
     "moderngl",
     "jinja2",
+    "regex"
 ]
 
 [build-system]
