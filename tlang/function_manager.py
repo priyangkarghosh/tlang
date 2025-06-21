@@ -6,7 +6,7 @@ from tlang.attribute import Attribute
 from tlang.shader_stages import ShaderStage
 from dataclasses import dataclass, field
 from enum import Enum
-import re
+import regex as re
 
 from tlang.shader_source_line import ShaderSourceLine
 

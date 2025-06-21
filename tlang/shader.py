@@ -1,8 +1,8 @@
 import logging
 logger = logging.getLogger(__name__)
 
-import re
 import time
+import regex as re
 from moderngl import Context, Program
 from tlang.kernel import Kernel
 from tlang.shader_processor import ShaderProcessor

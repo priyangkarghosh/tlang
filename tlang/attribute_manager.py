@@ -1,7 +1,7 @@
 import logging
 logger = logging.getLogger(__name__)
 
-import re
+import regex as re
 import bisect
 from dataclasses import dataclass
 from typing import Callable
@@ -13,7 +13,21 @@ from tlang.shader_source_line import ShaderSourceLine
 
 
 BLOCK_PATTERN = re.compile(r'\[((?:[^\[\]]|\[[^\[\]]*\])*)\]',re.DOTALL) # support for one nested bracket
-ATTR_PATTERN = re.compile(r'(?P<name>\w+!?)(?:\((?P<args>[^)]*)\))?')
+ATTR_PATTERN = re.compile(
+    r'''
+    (?P<name>\w+!?)          # attribute name: shader / include / resourceblock / …
+    \(                       # opening '('
+        (?P<args>            # everything up to the matching ')', with unlimited nesting
+            (?:              # non-capturing group
+                [^()]        #   any char except parentheses
+                |            #   …or…
+                (?R)         #   recurse: the whole pattern again (handles nested ())
+            )*
+        )
+    \)                       # closing ')'
+    ''',
+    re.VERBOSE | re.DOTALL
+)
 ALT_ATTR_PATTERN = re.compile(r'#(?P<name>\w+!?)\s*<\s*(?P<args>.*?)\s*>')
 # ALT_ATTR_PATTERN ONLY SUPPORTS 1 LINE PER PATTERN AND SINGLE LINE DECLARATIONS
 
@@ -34,7 +48,7 @@ ARG_PATTERN = re.compile(r"""
 class AttributeManager:
     @classmethod
     def match_attr(cls, attr_str: str) -> Attribute | None:
-        if (m := ATTR_PATTERN.fullmatch(attr_str)):
+        if (m := ATTR_PATTERN.fullmatch(attr_str.strip())):
             return Attribute(
                 m.group('name'), m.group('args'),
                 *cls.parse_args(m.group('args') or '')

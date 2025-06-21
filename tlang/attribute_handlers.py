@@ -1,7 +1,7 @@
 import logging
 logger = logging.getLogger(__name__)
 
-import re
+import regex as re
 from typing import Callable
 from tlang.attribute import Attribute
 from tlang.function_manager import FunctionList

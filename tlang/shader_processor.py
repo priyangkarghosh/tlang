@@ -1,7 +1,7 @@
 import logging
 logger = logging.getLogger(__name__)
 
-import re
+import regex as re
 from dataclasses import dataclass
 from typing import Any
 
