@@ -70,14 +70,14 @@ class AttributeHandlers:
         # find function to attach to
         if fn := funcs.find_next(index):
             if attr.args:
-                numthreads = [1, 1, 1]
+                numthreads = ['1', '1', '1']
                 for i in range(min(len(attr.args), 3)):
-                    numthreads[i] = int(attr.args[i])
+                    numthreads[i] = attr.args[i]
             else:
                 numthreads = (
-                    int(attr.kwargs.get('x', 1)),
-                    int(attr.kwargs.get('y', 1)),
-                    int(attr.kwargs.get('z', 1)),
+                    attr.kwargs.get('x', '1'),
+                    attr.kwargs.get('y', '1'),
+                    attr.kwargs.get('z', '1'),
                 )
             
             # add layout str to config
@@ -94,7 +94,8 @@ class AttributeHandlers:
         
         # add attribute to attachments
         glob_attachments.append(attr)
-        return '\n'.join([f"{{% include '{sn}' %}}" for sn in attr.args])
+        #return '\n'.join([f"{{ % extends '{sn}' % }}" for sn in attr.args])
+        return '//DEPENDENCY DECLR\n'
     
     @staticmethod
     def extension(attr: Attribute, **kwargs) -> str:

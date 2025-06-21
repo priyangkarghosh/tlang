@@ -11,6 +11,7 @@ from tlang.shader_source_line import ShaderSourceLine
 from tlang.shader_stages import ShaderStage
 from tlang.shader_utils import *
 
+# '\n'.join([f"{{ % extends '{sn}' % }}" for sn in attr.args])
 
 class ShaderProcessor:
     def __init__(self, name: str, src: str) -> None:
@@ -38,6 +39,7 @@ class ShaderProcessor:
     # -> this includes all common code (excluding kernels/shader defs)
     # -> also includes buffers and shared memory and stuff
     def _create_module(self) -> None:
+        # create the module
         self.module = self.src_map.copy()
         for func in self.funcs.items:
             if not func.stage: self.module.update(func.line_body)
