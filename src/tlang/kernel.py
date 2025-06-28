@@ -1,7 +1,7 @@
 import time
 from typing import Any
-from moderngl import Buffer, ComputeShader, Context
-
+from moderngl import SHADER_STORAGE_BARRIER_BIT, Buffer, ComputeShader, Context, StorageBlock, Uniform
+from OpenGL.GL import glBindBufferRange, glBindBufferBase, GL_ATOMIC_COUNTER_BUFFER
 
 class Kernel:
     def __init__(self, ctx: Context, name: str, shader: ComputeShader):
@@ -31,8 +31,12 @@ class Kernel:
     def __contains__(self, value: str) -> bool:
         return value in self._mglo
 
-    def dispatch(self, group_x: int = 1, group_y: int = 1, group_z: int = 1):
+    def dispatch(self, 
+        group_x: int = 1, group_y: int = 1, group_z: int = 1, 
+        barrier: bool = True, barrier_bits: int = SHADER_STORAGE_BARRIER_BIT
+    ):
         self._mglo.run(group_x, group_y, group_z)
+        if barrier: self._ctx.memory_barrier(barrier_bits)
 
     def dispatch_timed(self, group_x: int = 1, group_y: int = 1, group_z: int = 1):
         t0 = time.perf_counter()
@@ -41,23 +45,34 @@ class Kernel:
         self._ctx.finish()
         t1 = time.perf_counter()
         return (t1 - t0) * 1000
-    
-    def has_uniform(self, name: str) -> bool:
-        return name in self._mglo
+   
+    def set_uniforms(self, cache=True, **uniforms: Any):
+        loc = self.set_uniform
+        for k, v in uniforms.items():
+            loc(k, v, cache=cache)
 
     # set uniform for a kernel
     def set_uniform(self, uniform: str, value: Any, cache=True):
-        # make sure that the uniform actually exists
-        if uniform not in self._mglo: raise ValueError('Uniform does not exist')
-
-        # check the uniform cache and don't set it if it's already the same value
-        # -> only set it if it hasn't
+        block = self._mglo.get(uniform, None)
+        if not isinstance(block, Uniform): raise ValueError(f"'{uniform}' is not a uniform")
         if cache and self._uniform_cache.get(uniform) == value: return
-        self._mglo[uniform] = self._uniform_cache[uniform] = value
+        self._uniform_cache[uniform] = value
+        block.value = value
+
+    def bind_ssbos(self, **buffers: Buffer | tuple[Buffer, int, int]):
+        loc = self.bind_ssbo
+        for k, v in buffers.items(): loc(k, *v) if isinstance(v, tuple) else loc(k, v)
 
     # bind buffer, size is -1 by 0 to not specify a fixed size
-    def bind_buffer(self, buffer_name: str, buffer: Buffer, offset: int = 0, size: int = -1):
-        if not hasattr(block := self._mglo[buffer_name], 'binding'):
-            raise TypeError(f"'{buffer_name}' is not a valid buffer block (Missing binding!)")
-        buffer.bind_to_storage_buffer(int(block.binding), offset, size) # type: ignore
+    def bind_ssbo(self, buffer_name: str, buffer: Buffer, offset: int = 0, size: int = -1):
+        block = self._mglo.get(buffer_name, None)
+        if not isinstance(block, StorageBlock):
+            raise TypeError(f"'{buffer_name}' is not a valid buffer block (Missing binding)")
+        buffer.bind_to_storage_buffer(block.binding, offset, size)
+    
+    def bind_atomic_counter(self, binding: int, buffer: Buffer, offset: int = 0):
+        glBindBufferRange(GL_ATOMIC_COUNTER_BUFFER, binding, buffer.glo, offset, 4)
 
+    def bind_atomic_counters(self, *buffers: tuple[int, Buffer] | tuple[int, Buffer, int]):
+        loc = self.bind_atomic_counter
+        for v in buffers: loc(*v) if len(v) == 3 else loc(v[0], v[1])

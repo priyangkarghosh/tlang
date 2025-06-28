@@ -16,6 +16,8 @@ from tlang.shader_processor import ShaderProcessor
 FILE_EXT = '.tlang'
 class ShaderManager:
     def __init__(self, ctx: Context, version: str, dir: str, constants: dict = {}) -> None:
+        self._ctx = ctx
+
         # start time for shader manager
         t0 = time.perf_counter()
 
@@ -62,6 +64,9 @@ class ShaderManager:
             'Built and compiled %d shaders in %.2f seconds', 
             len(self._shaders), t1 - t0
         )
+    
+    @property
+    def ctx(self) -> Context: return self._ctx
     
     def __getitem__(self, name: str) -> Shader | None:
         return self.get_shader(name)

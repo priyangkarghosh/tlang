@@ -2,9 +2,17 @@ from collections import deque
 import logging
 logger = logging.getLogger(__name__)
 
-from jinja2 import DictLoader, Environment, TemplateNotFound
+from jinja2 import DictLoader, Environment, TemplateNotFound, Undefined
 from tlang.shader import Shader
 from tlang.shader_processor import ShaderProcessor
+
+class LogUndefined(Undefined):
+    def __str__(self):
+        logger.warning(f"Missing constant: '{self._undefined_name}'")
+        return self._undefined_name
+
+    def __repr__(self):
+        return str(self)
 
 class DependencyManager:
     def __init__(self, constants) -> None:
@@ -31,6 +39,7 @@ class DependencyManager:
             autoescape=False,
             trim_blocks=False,
             lstrip_blocks=False,
+            undefined=LogUndefined,
         )
 
     def _build(self, name: str) -> str:
@@ -45,9 +54,9 @@ class DependencyManager:
 
                 # if this node has already been added to the link tree, its a circular import
                 if node in tree: raise ValueError(f"Circular dependency detected at '{node}'")
-                visited.add(node)
 
                 # continue dfs through each dps this node has
+                tree.add(node)
                 for dep in self.dps_graph.get(node, set()):
                     if dep not in self.modules:
                         raise ValueError(f"Missing dependency: '{dep}'")
