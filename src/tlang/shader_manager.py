@@ -1,4 +1,6 @@
 import logging
+
+from tlang.binding_registry import BindingRegistry
 logger = logging.getLogger(__name__)
 
 import os
@@ -42,7 +44,7 @@ class ShaderManager:
             dm.register(process)     
 
         # build each common src
-        commons = dm.build_all()
+        commons = BindingRegistry.inject_bindings(ctx, dm.build_all())
 
         # create a shader obj for each shader
         self._shaders: dict[str, Shader] = {}

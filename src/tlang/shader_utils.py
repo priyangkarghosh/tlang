@@ -2,6 +2,12 @@ from typing import Any
 
 
 EXTENSION_GROUPS: dict[str, list[str]] = {
+    'int64': [
+        'GL_ARB_gpu_shader_int64',
+        'GL_EXT_shader_atomic_int64',
+        'GL_KHR_shader_atomic_int64',
+        'GL_NV_shader_atomic_int64'
+    ],
     'subgroup': [
         'GL_KHR_shader_subgroup_basic',
         'GL_KHR_shader_subgroup_vote',

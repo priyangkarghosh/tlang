@@ -1,6 +1,8 @@
 import logging
 
 from bitarray import bitarray
+
+from tlang.binding_registry import BindingRegistry
 logger = logging.getLogger(__name__)
 
 import time
@@ -52,7 +54,7 @@ class Shader:
         free_bindings = bitarray(max_bindings := ctx.info['GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS'])
         free_bindings.setall(True)
 
-        # First pass: mark manually assigned bindings as unavailable
+        # mark manually assigned bindings as unavailable
         explicit_pattern = re.compile(
             r'layout\s*\(\s*([^)]*?)\s*\)\s*(?:readonly\s+|coherent\s+|volatile\s+|restrict\s+|)*buffer\s+(\w+)\s*{',
             re.MULTILINE,
@@ -67,14 +69,13 @@ class Shader:
                 if binding < max_bindings:
                     free_bindings[binding] = False
 
-        # Second pass: inject bindings into blocks in `used` set with no explicit binding
+        # inject bindings into blocks in 'used' set with no explicit binding
         def replacer(match):
             layout_args, qualifier, block_name = match.group(1), match.group(2) or '', match.group(3)
             if binding_regex.search(layout_args): return match.group(0)
 
-            # Find first available binding
-            try:
-                binding = free_bindings.index(True)
+            # find first available binding
+            try: binding = free_bindings.index(True)
             except ValueError:
                 raise RuntimeError("Out of SSBO bindings!")
 
@@ -112,7 +113,7 @@ class Shader:
             src += pattern.sub('void main(', Shader.build_map(func.line_body), count=1)
             
             # inject ssbo bindings into the src
-            src = Shader._inject_bindings(self._ctx, src)
+            src = BindingRegistry.remove_unused_buffers(src)
 
             # behaviour based off stage
             match func.stage:
