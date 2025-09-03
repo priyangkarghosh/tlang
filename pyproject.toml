@@ -1,6 +1,6 @@
 [project]
 name = "tlang"
-version = "6.21.252"
+version = "9.03.250"
 description = "GLSL Shader Preprocessor with modern language features."
 authors = [{ name = "Priyangkar Ghosh", email = "priyangkar.ghosh@gmail.com" }]
 readme = "README.md"
