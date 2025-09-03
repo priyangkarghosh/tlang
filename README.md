@@ -196,9 +196,7 @@ void main() {
 
 1.  **Install from source**
 ```bash
-git clone https://github.com/priyangkarghosh/tlang.git
-cd tlang
-pip install -e .
+pip install git+https://github.com/priyangkarghosh/tlang.git
 ```
 
 2.  **Write your shaders in `.tlang` format**, combining multiple stages as needed.
