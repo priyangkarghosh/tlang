@@ -1,5 +1,5 @@
 # tlang
-**tlang** is a **shader preprocessing language** that extends GLSL with **attributes** and **templating**, making it easier to organize, reuse, and maintain GPU shaders across all stages — vertex, fragment, compute, etc. It is designed to work with python and ModernGL.
+tlang is a shader preprocessing language that extends GLSL with attributes and templating, making it easier to organize, reuse, and maintain GPU shaders across all stages. Designed specifically for Python and ModernGL, tlang lets you define vertex, fragment, compute, and geometry shaders in a single file while keeping your code clean and maintainable.
 
 ##  Features
 -  **Multi-stage Shaders in One File**
@@ -7,9 +7,9 @@ Define **vertex, fragment, compute (and more)** shaders in the same file using `
 
 - **Attribute-based Metadata**
   - `[shader('vertex')]`, `[shader('fragment')]`, `[shader('compute'), numthreads(...)]`
-  -  `[resourceblock(...)]` for declaring uniforms + shared memory compactly.
-  -  `[program(...)]` to define **pipeline programs** linking shader stages together
-  -   `[extend!('name')]` for importing shared utilities (e.g. subgroup helpers).
+  - `[resourceblock(...)]` for declaring uniforms + shared memory compactly.
+  - `[program(...)]` to define **pipeline programs** linking shader stages together
+  - `[extend('name')]` for importing shared utilities (e.g. subgroup helpers).
 
 -  **Templating**
 Replace placeholders like `{{ BLOCK_SIZE }}` with values at build time.
@@ -229,17 +229,3 @@ kernel = shader.get_kernel('cs_randomize') # compute kernel
 ```
 
 ---
-
-  
-
-## Attributes & Directives
-
--  **`[shader('stage'), ...]`** → marks a shader stage (`vertex`, `fragment`, `compute`, `geometry`, etc.).
-
--  **`numthreads(x,y,z)`** → compute shader thread group size.
-
--  **`[resourceblock(...)]`** → declare uniforms + shared memory.
-
--  **`[extend!('name')]`** → import shared utilities.
-
--  **`{{ VAR_NAME }}`** → template substitution (constants/macros).
