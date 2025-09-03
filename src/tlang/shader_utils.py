@@ -1,3 +1,11 @@
+# -------------------------------------------------------------
+# @file          shader_utils.py
+# @author        Priyangkar Ghosh
+# @created       2025-06-10
+# @description   Basically just a bunch of constants
+# @license       MIT
+# -------------------------------------------------------------
+
 from typing import Any
 
 

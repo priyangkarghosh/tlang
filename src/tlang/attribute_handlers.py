@@ -1,3 +1,12 @@
+# -------------------------------------------------------------
+# @file          attribute_handlers.py
+# @author        Priyangkar Ghosh
+# @created       2025-06-17
+# @description   Class which defines how different attributes are 
+#                handled when processed
+# @license       MIT
+# -------------------------------------------------------------
+
 import logging
 logger = logging.getLogger(__name__)
 

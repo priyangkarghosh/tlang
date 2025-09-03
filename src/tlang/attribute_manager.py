@@ -1,3 +1,12 @@
+# -------------------------------------------------------------
+# @file          attribute_manager.py
+# @author        Priyangkar Ghosh
+# @created       2025-06-10
+# @description   Goes through the .tlang source file and extracts 
+#                attributes for processing
+# @license       MIT
+# -------------------------------------------------------------
+
 import logging
 logger = logging.getLogger(__name__)
 

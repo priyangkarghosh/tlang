@@ -1,3 +1,11 @@
+# -------------------------------------------------------------
+# @file          shader_processor.py
+# @author        Priyangkar Ghosh
+# @created       2025-06-10
+# @description   Creates all Kernel/Program objects
+# @license       MIT
+# -------------------------------------------------------------
+
 import logging
 logger = logging.getLogger(__name__)
 

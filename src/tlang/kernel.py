@@ -1,3 +1,11 @@
+# -------------------------------------------------------------
+# @file          kernel.py
+# @author        Priyangkar Ghosh
+# @created       2025-06-08
+# @description   Kernel/Compute Shader wrapper with helper functions
+# @license       MIT
+# -------------------------------------------------------------
+
 import time
 from typing import Any
 from moderngl import (

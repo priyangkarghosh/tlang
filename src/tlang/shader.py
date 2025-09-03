@@ -1,3 +1,11 @@
+# -------------------------------------------------------------
+# @file          shader_utils.py
+# @author        Priyangkar Ghosh
+# @created       2025-06-13
+# @description   Main shader class, contains building script
+# @license       MIT
+# -------------------------------------------------------------
+
 import logging
 
 from bitarray import bitarray

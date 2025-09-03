@@ -1,3 +1,11 @@
+# -------------------------------------------------------------
+# @file          attribute.py
+# @author        Priyangkar Ghosh
+# @created       2025-06-14
+# @description   Attribute dataclass
+# @license       MIT
+# -------------------------------------------------------------
+
 from dataclasses import dataclass
 
 

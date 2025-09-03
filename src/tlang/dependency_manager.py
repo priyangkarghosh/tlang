@@ -1,3 +1,11 @@
+# -------------------------------------------------------------
+# @file          dependency_manager.py
+# @author        Priyangkar Ghosh
+# @created       2025-07-13
+# @description   Handles imports between seperate files
+# @license       MIT
+# -------------------------------------------------------------
+
 from collections import deque
 import logging
 logger = logging.getLogger(__name__)

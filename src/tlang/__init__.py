@@ -1,3 +1,11 @@
+# -------------------------------------------------------------
+# @file          __init__.py
+# @author        Priyangkar Ghosh
+# @created       2025-06-18
+# @description   Initializes the tlang package
+# @license       MIT
+# -------------------------------------------------------------
+
 import logging
 logger = logging.getLogger(__name__)
 

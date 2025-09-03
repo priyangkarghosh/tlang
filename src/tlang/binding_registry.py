@@ -1,3 +1,13 @@
+# -------------------------------------------------------------
+# @file          binding_registry.py
+# @author        Priyangkar Ghosh
+# @created       2025-07-13
+# @description   Goes through the .tlang source file and finds 
+#                buffer declarations. Assigns buffer bindings
+#                based on usage, when NOT user assigned.
+# @license       MIT
+# -------------------------------------------------------------
+
 from collections import defaultdict
 from bitarray import bitarray
 from moderngl import Context
@@ -102,7 +112,7 @@ class BindingRegistry():
             full_decl = match.group(1)
             fields = match.group("fields")
 
-            # Extract variable names from the field block
+            # extract variable names from the field block
             var_names = []
             for line in fields.splitlines():
                 line = line.strip()
@@ -119,11 +129,11 @@ class BindingRegistry():
                 except ValueError:
                     continue  # malformed line
 
-            # Check if any variable is used outside this block
+            # check if any variable is used outside this block
             rest_of_code = src[:match.start()] + src[match.end():]
             used = False
             for name in var_names:
-                # Match whole words only
+                # match whole words only
                 if re.search(r'\b' + re.escape(name) + r'\b', rest_of_code):
                     used = True
                     break
@@ -131,8 +141,7 @@ class BindingRegistry():
             if not used:
                 to_remove.append(full_decl)
 
-        # Safely remove unused buffers
+        # safely remove unused buffers
         for block in to_remove:
             src = src.replace(block, '')
-
         return src

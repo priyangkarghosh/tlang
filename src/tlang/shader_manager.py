@@ -1,3 +1,12 @@
+# -------------------------------------------------------------
+# @file          shader_manager.py
+# @author        Priyangkar Ghosh
+# @created       2025-06-04
+# @description   Main entry point, compiles and gives access to
+#                all shaders
+# @license       MIT
+# -------------------------------------------------------------
+
 import logging
 
 from tlang.binding_registry import BindingRegistry

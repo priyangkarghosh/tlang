@@ -1,3 +1,11 @@
+# -------------------------------------------------------------
+# @file          shader_stages.py
+# @author        Priyangkar Ghosh
+# @created       2025-06-10
+# @description   Enum for the different types/stages of shader
+# @license       MIT
+# -------------------------------------------------------------
+
 from enum import Enum
 
 

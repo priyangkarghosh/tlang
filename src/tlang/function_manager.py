@@ -1,3 +1,12 @@
+# -------------------------------------------------------------
+# @file          function_manager.py
+# @author        Priyangkar Ghosh
+# @created       2025-06-13
+# @description   Extracts all functions (including kernels) from
+#                the shader src
+# @license       MIT
+# -------------------------------------------------------------
+
 import logging
 logger = logging.getLogger(__name__)
 
