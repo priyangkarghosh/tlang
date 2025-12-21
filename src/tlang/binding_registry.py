@@ -93,7 +93,7 @@ class BindingRegistry():
     
     @staticmethod
     def remove_unused_buffers(src: str) -> str:
-        # Matches complete layout buffer declarations
+        # matches complete layout buffer declarations
         buffer_pattern = re.compile(
             r'''(
                 layout\s*\([^)]*\)\s*      # layout(...)

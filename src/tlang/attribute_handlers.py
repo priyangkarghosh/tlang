@@ -127,6 +127,38 @@ class AttributeHandlers:
         # find a function to attach to
         if fn := funcs.find_next(index): fn.config.append(attr.raw_args)
         return f"//<<RESOURCE BLOCK DECL>>//\n"
+
+    @staticmethod
+    def link(attr: Attribute, **kwargs) -> str:
+        # type checks
+        if not isinstance(funcs := kwargs.get('funcs'), FunctionList):
+            raise TypeError("Expected 'funcs' to be a FunctionList")
+        if not isinstance(index := kwargs.get('index'), int):
+            raise TypeError("Expected 'index' to be an int")
+
+        # find function this attribute is attached to
+        if not (fn := funcs.find_next(index)): 
+            raise AttributeError("Could not find which function this attribute is attached to")
+        
+        # find function this attribute wants to link to
+        if not (link_fn := funcs.keyed_items.get(attr.args[0])): 
+            raise AttributeError("Could not find function to link with")
+        
+        # link the two functions
+        link_fn.links.append(fn)
+        return f"//<<LINK>>//\n"
+
+    @staticmethod
+    def export(attr: Attribute, **kwargs) -> str:
+        # type checks
+        if not isinstance(funcs := kwargs.get('funcs'), FunctionList):
+            raise TypeError("Expected 'funcs' to be a FunctionList")
+        if not isinstance(index := kwargs.get('index'), int):
+            raise TypeError("Expected 'index' to be an int")
+
+        # find a function to attach to
+        if fn := funcs.find_next(index): fn.exported = True
+        return f"//<<EXPORT DECL>>//\n"
     
     @staticmethod
     def passthrough(attr: Attribute, **kwargs) -> str:
@@ -148,6 +180,8 @@ GLOB_CTX_ATTR_MAP: dict[str, Callable[..., str]] = {
     'extend!':        AttributeHandlers.extension,
     'require':        AttributeHandlers.extension,
     'resourceblock':  AttributeHandlers.resourceblock,
+    'link':           AttributeHandlers.link,
+    'export':         AttributeHandlers.export,
 
     'frag':           AttributeHandlers.passthrough,
     'geom':           AttributeHandlers.passthrough,

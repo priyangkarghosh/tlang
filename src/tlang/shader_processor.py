@@ -50,7 +50,8 @@ class ShaderProcessor:
         # create the module
         self.module = self.src_map.copy()
         for func in self.funcs.items:
-            if not func.stage: self.module.update(func.line_body)
+            if not func.stage and func.exported: 
+                self.module.update(func.line_body)
 
     def _process_global_attrs(self) -> None:
         for attr in self.glob_attrs:

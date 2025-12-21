@@ -35,20 +35,30 @@ class FunctionDef:
     params: str
     stage: ShaderStage | None
 
+    body: str
     line_start: int
     line_end: int
     line_body: dict[int, ShaderSourceLine]
 
+    exported: bool = False
+
+    links: list['FunctionDef'] = field(
+        default_factory=list
+    )
     attrs: list[Attribute] = field(
         default_factory=list
     )
     config: list[str] = field(
         default_factory=list
     )
+    helpers: list[str] = field(
+        default_factory=list
+    )
 
 @dataclass
 class FunctionList:
     items: list[FunctionDef]
+    keyed_items: dict[str, FunctionDef]
 
     def __post_init__(self):
         self.starts: list[int] = [fn.line_start for fn in self.items]
@@ -71,6 +81,7 @@ class FunctionManager:
     @staticmethod
     def extract_funcs(shader_name: str, src: str, src_map: dict[int, ShaderSourceLine]) -> FunctionList:
         funcs: list[FunctionDef] = []
+        keyed_funcs: dict[str, FunctionDef] = {}
 
         # search for function declarations
         # -> loop while there are matches
@@ -105,19 +116,23 @@ class FunctionManager:
 
             # add to func list
             logger.info("Found function '%s' in %s", name, shader_name)
-            funcs.append(FunctionDef(
+
+            fdef = FunctionDef(
                 name=name,
                 return_type=ret_type,
                 params=params,
                 stage=None,
 
+                body=src[func_start:func_end],
                 line_start=line_start,
                 line_end=line_end,
                 line_body=line_body,
-            ))
+            )
+            funcs.append(fdef)
+            keyed_funcs[name] = fdef
 
             # move past the current function
             search_pos = func_end
 
         # return the stripped src and a list of the functions
-        return FunctionList(funcs)
+        return FunctionList(funcs, keyed_funcs)
