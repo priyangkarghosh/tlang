@@ -118,7 +118,7 @@ class Shader:
             # create the src str
             src = f'#version {self._version}\n' + base
             src += f'#line 1 "FUNC_CONFIG({func.name})"\n' + '\n'.join(func.config) + '\n'
-            src += '\n\n'.join([f.body for f in func.links]) + '\n' # link/helper functions
+            src += '\n\n'.join([f'#line {f.line_start} "{self._name}"\n' + f.body for f in func.links]) + '\n' # link/helper functions
             src += pattern.sub('void main(', Shader.build_map(func.line_body), count=1)
             
             # inject ssbo bindings into the src
