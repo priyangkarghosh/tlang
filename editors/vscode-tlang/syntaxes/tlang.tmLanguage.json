@@ -1,0 +1,267 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "tlang",
+  "scopeName": "source.tlang",
+  "fileTypes": ["tlang"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#template-expression" },
+    { "include": "#alt-attribute-directive" },
+    { "include": "#preprocessor-line" },
+    { "include": "#attribute-block" },
+    { "include": "#expression" }
+  ],
+  "repository": {
+
+    "expression": {
+      "patterns": [
+        { "include": "#comments" },
+        { "include": "#template-expression" },
+        { "include": "#strings" },
+        { "include": "#numbers" },
+        { "include": "#storage-qualifiers" },
+        { "include": "#control-keywords" },
+        { "include": "#types" },
+        { "include": "#builtin-functions" },
+        { "include": "#builtin-variables" },
+        { "include": "#operators" },
+        { "include": "#punctuation" }
+      ]
+    },
+
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.block.tlang",
+          "begin": "/\\*",
+          "end": "\\*/",
+          "captures": {
+            "0": { "name": "punctuation.definition.comment.tlang" }
+          }
+        },
+        {
+          "name": "comment.line.double-slash.tlang",
+          "begin": "//",
+          "end": "$",
+          "captures": {
+            "0": { "name": "punctuation.definition.comment.tlang" }
+          }
+        }
+      ]
+    },
+
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.tlang",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [{ "name": "constant.character.escape.tlang", "match": "\\\\." }]
+        },
+        {
+          "name": "string.quoted.single.tlang",
+          "begin": "'",
+          "end": "'",
+          "patterns": [{ "name": "constant.character.escape.tlang", "match": "\\\\." }]
+        }
+      ]
+    },
+
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.hex.tlang",
+          "match": "\\b0[xX][0-9a-fA-F]+[uU]?\\b"
+        },
+        {
+          "name": "constant.numeric.float.tlang",
+          "match": "\\b[0-9]+\\.[0-9]*([eE][+-]?[0-9]+)?[fFlL]?\\b|\\b\\.[0-9]+([eE][+-]?[0-9]+)?[fFlL]?\\b|\\b[0-9]+[eE][+-]?[0-9]+[fFlL]?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.tlang",
+          "match": "\\b[0-9]+[uU]?\\b"
+        }
+      ]
+    },
+
+    "control-keywords": {
+      "match": "\\b(if|else|for|while|do|switch|case|default|break|continue|return|discard)\\b",
+      "name": "keyword.control.tlang"
+    },
+
+    "storage-qualifiers": {
+      "match": "\\b(in|out|inout|uniform|buffer|shared|const|flat|smooth|noperspective|centroid|patch|sample|coherent|volatile|restrict|readonly|writeonly|precise|invariant|layout|varying|attribute|highp|mediump|lowp|precision|struct)\\b",
+      "name": "storage.modifier.tlang"
+    },
+
+    "types": {
+      "match": "\\b(void|bool|int|uint|float|double|vec2|vec3|vec4|ivec2|ivec3|ivec4|uvec2|uvec3|uvec4|dvec2|dvec3|dvec4|bvec2|bvec3|bvec4|mat2|mat3|mat4|mat2x2|mat2x3|mat2x4|mat3x2|mat3x3|mat3x4|mat4x2|mat4x3|mat4x4|dmat2|dmat3|dmat4|sampler1D|sampler2D|sampler3D|samplerCube|sampler1DArray|sampler2DArray|samplerCubeArray|sampler1DShadow|sampler2DShadow|samplerCubeShadow|sampler2DArrayShadow|samplerCubeArrayShadow|sampler2DMS|sampler2DMSArray|isampler1D|isampler2D|isampler3D|isamplerCube|isampler2DArray|usampler1D|usampler2D|usampler3D|usamplerCube|usampler2DArray|image1D|image2D|image3D|imageCube|image2DArray|iimage2D|iimage3D|uimage2D|uimage3D|atomic_uint)\\b",
+      "name": "storage.type.tlang"
+    },
+
+    "builtin-functions": {
+      "match": "\\b(radians|degrees|sin|cos|tan|asin|acos|atan|sinh|cosh|tanh|asinh|acosh|atanh|pow|exp|log|exp2|log2|sqrt|inversesqrt|abs|sign|floor|trunc|round|roundEven|ceil|fract|mod|modf|min|max|clamp|mix|step|smoothstep|isnan|isinf|floatBitsToInt|floatBitsToUint|intBitsToFloat|uintBitsToFloat|length|distance|dot|cross|normalize|faceforward|reflect|refract|matrixCompMult|outerProduct|transpose|inverse|determinant|lessThan|lessThanEqual|greaterThan|greaterThanEqual|equal|notEqual|any|all|not|texture|textureProj|textureLod|textureOffset|texelFetch|texelFetchOffset|textureProjLod|textureLodOffset|textureProjLodOffset|textureGrad|textureGradOffset|textureProjGrad|textureProjGradOffset|textureGather|textureGatherOffset|textureSize|textureQueryLod|textureQueryLevels|imageLoad|imageStore|imageSize|imageAtomicAdd|imageAtomicMin|imageAtomicMax|imageAtomicAnd|imageAtomicOr|imageAtomicXor|imageAtomicExchange|imageAtomicCompSwap|atomicAdd|atomicMin|atomicMax|atomicAnd|atomicOr|atomicXor|atomicExchange|atomicCompSwap|barrier|memoryBarrier|memoryBarrierAtomicCounter|memoryBarrierBuffer|memoryBarrierShared|memoryBarrierImage|groupMemoryBarrier|dFdx|dFdy|dFdxCoarse|dFdyCoarse|dFdxFine|dFdyFine|fwidth|fwidthCoarse|fwidthFine|EmitVertex|EndPrimitive|EmitStreamVertex|EndStreamPrimitive|packHalf2x16|unpackHalf2x16|packUnorm2x16|unpackUnorm2x16|packSnorm2x16|unpackSnorm2x16|packUnorm4x8|unpackUnorm4x8|packSnorm4x8|unpackSnorm4x8|bitfieldExtract|bitfieldInsert|bitfieldReverse|bitCount|findLSB|findMSB)\\b(?=\\s*\\()",
+      "name": "support.function.builtin.tlang"
+    },
+
+    "builtin-variables": {
+      "match": "\\bgl_(Position|PointSize|ClipDistance|FragCoord|FrontFacing|PointCoord|FragDepth|SampleID|SamplePosition|SampleMaskIn|SampleMask|VertexID|InstanceID|PrimitiveIDIn|PrimitiveID|Layer|ViewportIndex|InvocationID|GlobalInvocationID|LocalInvocationID|WorkGroupID|WorkGroupSize|NumWorkGroups|LocalInvocationIndex|TessCoord|TessLevelInner|TessLevelOuter|PatchVerticesIn|in|out)\\b",
+      "name": "variable.language.tlang"
+    },
+
+    "operators": {
+      "match": "(<<=|>>=|<=|>=|==|!=|&&|\\|\\||\\+\\+|--|\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=|<<|>>|[+\\-*/%<>=!&|^~?:])",
+      "name": "keyword.operator.tlang"
+    },
+
+    "punctuation": {
+      "patterns": [
+        { "match": ";", "name": "punctuation.terminator.statement.tlang" },
+        { "match": ",", "name": "punctuation.separator.comma.tlang" },
+        { "match": "\\.", "name": "punctuation.accessor.tlang" }
+      ]
+    },
+
+    "template-expression": {
+      "name": "meta.template-expression.tlang",
+      "begin": "\\{\\{",
+      "beginCaptures": {
+        "0": { "name": "punctuation.definition.template-expression.begin.tlang" }
+      },
+      "end": "\\}\\}",
+      "endCaptures": {
+        "0": { "name": "punctuation.definition.template-expression.end.tlang" }
+      },
+      "patterns": [
+        { "include": "#comments" },
+        { "include": "#numbers" },
+        {
+          "match": "[A-Za-z_][A-Za-z0-9_]*",
+          "name": "variable.other.constant.tlang"
+        }
+      ]
+    },
+
+    "alt-attribute-directive": {
+      "comment": "#name<args> on one line only, e.g. #shader<'compute'>. Must not consume real directives like #version, which have no '<' right after the name.",
+      "match": "^(\\s*)(#)([A-Za-z_]\\w*!?)\\s*(<)\\s*([^>\\n]*?)\\s*(>)",
+      "captures": {
+        "2": { "name": "punctuation.definition.directive.tlang" },
+        "3": { "name": "entity.other.attribute-name.tlang" },
+        "4": { "name": "punctuation.definition.parameters.begin.tlang" },
+        "5": {
+          "patterns": [
+            { "include": "#strings" },
+            { "include": "#numbers" },
+            { "match": ",", "name": "punctuation.separator.comma.tlang" },
+            { "match": "[A-Za-z_]\\w*", "name": "variable.parameter.tlang" }
+          ]
+        },
+        "6": { "name": "punctuation.definition.parameters.end.tlang" }
+      }
+    },
+
+    "preprocessor-line": {
+      "comment": "any remaining '#...' line: real GLSL preprocessor directives (#version, #define, #extension, #ifdef, ...). Runs only after alt-attribute-directive fails to match.",
+      "name": "meta.preprocessor.tlang",
+      "begin": "^(\\s*)(#)\\s*([A-Za-z_]\\w*)",
+      "beginCaptures": {
+        "2": { "name": "punctuation.definition.directive.tlang" },
+        "3": { "name": "keyword.control.directive.tlang" }
+      },
+      "end": "$",
+      "patterns": [{ "include": "#expression" }]
+    },
+
+    "paren-group": {
+      "comment": "a balanced (...) group; recurses so nested calls inside attribute arguments or resourceblock GLSL tokenize normally",
+      "begin": "\\(",
+      "beginCaptures": { "0": { "name": "punctuation.definition.parameters.begin.tlang" } },
+      "end": "\\)",
+      "endCaptures": { "0": { "name": "punctuation.definition.parameters.end.tlang" } },
+      "patterns": [
+        { "include": "#attribute-arguments" }
+      ]
+    },
+
+    "bracket-group": {
+      "comment": "a balanced [...] group nested inside an attribute block, e.g. an array subscript/size inside a [resourceblock(...)] payload",
+      "begin": "\\[",
+      "beginCaptures": { "0": { "name": "punctuation.definition.array.begin.tlang" } },
+      "end": "\\]",
+      "endCaptures": { "0": { "name": "punctuation.definition.array.end.tlang" } },
+      "patterns": [
+        { "include": "#bracket-group" },
+        { "include": "#expression" }
+      ]
+    },
+
+    "attribute-arguments": {
+      "comment": "contents of an attribute's (...) argument list: kwarg keys, strings, numbers, nested groups, and raw GLSL for [resourceblock(...)]",
+      "patterns": [
+        { "include": "#comments" },
+        { "include": "#template-expression" },
+        { "include": "#strings" },
+        {
+          "match": "\\b([A-Za-z_]\\w*)\\s*(=)(?!=)",
+          "captures": {
+            "1": { "name": "variable.parameter.tlang" },
+            "2": { "name": "keyword.operator.assignment.tlang" }
+          }
+        },
+        { "include": "#numbers" },
+        { "include": "#storage-qualifiers" },
+        { "include": "#control-keywords" },
+        { "include": "#types" },
+        { "include": "#builtin-functions" },
+        { "include": "#builtin-variables" },
+        { "include": "#paren-group" },
+        { "include": "#bracket-group" },
+        { "include": "#operators" },
+        { "match": ",", "name": "punctuation.separator.comma.tlang" },
+        { "match": ";", "name": "punctuation.terminator.statement.tlang" },
+        { "match": "[A-Za-z_]\\w*", "name": "variable.parameter.tlang" }
+      ]
+    },
+
+    "attribute-name-with-args": {
+      "begin": "([A-Za-z_]\\w*!?)\\s*(\\()",
+      "beginCaptures": {
+        "1": { "name": "entity.other.attribute-name.tlang" },
+        "2": { "name": "punctuation.definition.parameters.begin.tlang" }
+      },
+      "end": "\\)",
+      "endCaptures": {
+        "0": { "name": "punctuation.definition.parameters.end.tlang" }
+      },
+      "patterns": [
+        { "include": "#attribute-arguments" }
+      ]
+    },
+
+    "attribute-name-bare": {
+      "match": "[A-Za-z_]\\w*!?",
+      "name": "entity.other.attribute-name.tlang"
+    },
+
+    "attribute-block": {
+      "comment": "[shader('compute'), numthreads(64,1,1)] at file scope, or a function-body pragma like [unroll]. Only recognized at the start of a line (mod whitespace), matching how AttributeManager distinguishes an attribute block from a GLSL array subscript such as data[gid].",
+      "name": "meta.attribute.tlang",
+      "begin": "^(\\s*)(\\[)",
+      "beginCaptures": {
+        "2": { "name": "punctuation.definition.attribute.begin.tlang" }
+      },
+      "end": "(\\])",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.attribute.end.tlang" }
+      },
+      "patterns": [
+        { "include": "#comments" },
+        { "include": "#bracket-group" },
+        { "include": "#attribute-name-with-args" },
+        { "include": "#attribute-name-bare" },
+        { "match": ",", "name": "punctuation.separator.comma.tlang" }
+      ]
+    }
+  }
+}

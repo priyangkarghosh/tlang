@@ -1,0 +1,36 @@
+{
+  "name": "tlang",
+  "displayName": "tlang",
+  "description": "Syntax highlighting for .tlang files (GLSL plus tlang attribute blocks, #name<args> directives, and {{ }} templating).",
+  "version": "0.1.0",
+  "publisher": "tlang",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "tlang",
+        "aliases": [
+          "tlang",
+          "Tlang"
+        ],
+        "extensions": [
+          ".tlang"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "tlang",
+        "scopeName": "source.tlang",
+        "path": "./syntaxes/tlang.tmLanguage.json"
+      }
+    ]
+  }
+}

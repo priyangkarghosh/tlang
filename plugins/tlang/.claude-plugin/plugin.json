@@ -1,0 +1,15 @@
+{
+  "name": "tlang",
+  "displayName": "tlang",
+  "version": "1.3.26",
+  "description": "Write, debug and build .tlang shaders — a GLSL preprocessor for Python/ModernGL with struct-declared resources, cross-file includes and constant templating.",
+  "author": {
+    "name": "Priyangkar Ghosh",
+    "email": "priyangkar.ghosh@gmail.com",
+    "url": "https://github.com/priyangkarghosh"
+  },
+  "homepage": "https://github.com/priyangkarghosh/tlang",
+  "repository": "https://github.com/priyangkarghosh/tlang",
+  "license": "MIT",
+  "keywords": ["glsl", "shader", "preprocessor", "moderngl", "opengl", "compute", "graphics"]
+}

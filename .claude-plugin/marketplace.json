@@ -1,0 +1,16 @@
+{
+  "name": "tlang",
+  "description": "Claude Code plugin for tlang, a GLSL preprocessor for Python/ModernGL.",
+  "owner": {
+    "name": "Priyangkar Ghosh",
+    "url": "https://github.com/priyangkarghosh"
+  },
+  "plugins": [
+    {
+      "name": "tlang",
+      "source": "./plugins/tlang",
+      "version": "1.3.26",
+      "description": "Write, debug and build .tlang shaders — a GLSL preprocessor for Python/ModernGL."
+    }
+  ]
+}
