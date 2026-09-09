@@ -2,14 +2,59 @@
 # @file          shader_utils.py
 # @author        Priyangkar Ghosh
 # @created       2025-06-10
-# @description   Basically just a bunch of constants
+# @description   Extension-group constants plus comment/string-aware text-scanning helpers
+#                shared by the attribute and function extraction passes.
 # @license       MIT
 # -------------------------------------------------------------
 
-from typing import Any
+
+def mask_comments_and_strings(src: str) -> str:
+    """Return a same-length copy of ``src`` with ``//`` / ``/* */`` comments
+    and ``"..."`` / ``'...'`` string literals blanked out to spaces.
+
+    Newlines are always preserved (even inside block comments), so line
+    numbers computed against the mask line up exactly with the original
+    text. Callers should use the mask only to locate/measure things (regex
+    matches, bracket depth, …) and slice the real content out of ``src``.
+    """
+    out = list(src)
+    n = len(src)
+    i = 0
+    while i < n:
+        two = src[i:i + 2]
+
+        if two == '//':
+            end = j if (j := src.find('\n', i)) != -1 else n
+            for k in range(i, end): out[k] = ' '
+            i = end
+            continue
+
+        if two == '/*':
+            end = j + 2 if (j := src.find('*/', i + 2)) != -1 else n
+            for k in range(i, end):
+                if out[k] != '\n': out[k] = ' '
+            i = end
+            continue
+
+        if (quote := src[i]) in ('"', "'"):
+            j = i + 1
+            while j < n:
+                if src[j] == '\\': j += 2; continue
+                j += 1
+                if src[j - 1] == quote: break
+            for k in range(i, min(j, n)):
+                if out[k] != '\n': out[k] = ' '
+            i = j
+            continue
+
+        i += 1
+    return ''.join(out)
 
 
 EXTENSION_GROUPS: dict[str, list[str]] = {
+    'vulkan_glsl': [
+        'GL_KHR_vulkan_glsl',
+    ],
     'int64': [
         'GL_ARB_gpu_shader_int64',
         'GL_EXT_shader_atomic_int64',
@@ -34,91 +79,3 @@ EXTENSION_GROUPS: dict[str, list[str]] = {
     ],
 }
 
-ALIAS: dict[str, str] = {
-    # geometry
-    'tri': 'triangles',
-    'tris': 'triangles',
-    'tri_adj': 'triangles_adjacency',
-    'lines_adj': 'lines_adjacency',
-    'tri_strip': 'triangle_strip',
-    'line_strip': 'line_strip',
-    # tess spacing
-    'even': 'equal_spacing',
-    'odd': 'fractional_odd_spacing',
-    'frac_even': 'fractional_even_spacing',
-    'frac_odd': 'fractional_odd_spacing',
-    # tessellation patch size
-    'vert': 'vertices',
-    'verts': 'vertices',
-    'patch': 'vertices',
-    'patch_size': 'vertices',
-}
-
-FRAG_DEFAULTS: dict[str, Any] = {
-    'early_tests': False,
-}
-
-GEOM_DEFAULTS: dict[str, Any] = {
-    'in': 'triangles',
-    'out': 'triangle_strip',
-    'max_verts': 3,
-}
-
-TESC_DEFAULTS: dict[str, int] = {
-    'vertices': 0,
-}
-
-TESE_DEFAULTS: dict[str, str] = {
-    'in': 'triangles',
-    'spacing': 'equal_spacing',
-    'order': 'ccw',
-}
-
-FRAG_EMIT_IN: tuple = (
-    ('early_tests', lambda v: 'early_fragment_tests' if v else None),
-)
-
-GEOM_EMIT_IN: tuple = (
-    ('in', lambda v: v),
-)
-
-GEOM_EMIT_OUT: tuple = (
-    ('out', lambda v: v),
-    ('max_verts', lambda v: f'max_vertices = {v}'),
-)
-
-TESC_EMIT_OUT: tuple = (
-    ('vertices', lambda v: f'vertices = {v}' if v else None),
-)
-
-TESE_EMIT_IN: tuple = (
-    ('in', lambda v: v),
-    ('spacing', lambda v: v),
-    ('order', lambda v: v),
-)
-
-SIMPLE_ATTR: dict[str, Any] = {
-    # frag
-    'early_fragment_tests': ('frag', 'early_tests', 'flag'),
-
-    # geom
-    'points': ('geom', 'in', 'alias', 'points'),
-    'lines': ('geom', 'in', 'alias', 'lines'),
-    'triangles': ('geom', 'in', 'alias', 'triangles'),
-    'line_strip': ('geom', 'out', 'alias', 'line_strip'),
-    'triangle_strip': ('geom', 'out', 'alias', 'triangle_strip'),
-    'max_verts': ('geom', 'max_verts', 'value'),
-
-    # tesc
-    'vertices': ('tesc', 'vertices', 'value'),
-
-    # tese
-    'triangles_tese': ('tese', 'in', 'alias', 'triangles'),
-    'quads': ('tese', 'in', 'alias', 'quads'),
-    'isolines': ('tese', 'in', 'alias', 'isolines'),
-    'equal_spacing': ('tese', 'spacing', 'alias', 'equal_spacing'),
-    'fractional_even_spacing': ('tese', 'spacing', 'alias', 'fractional_even_spacing'),
-    'fractional_odd_spacing': ('tese', 'spacing', 'alias', 'fractional_odd_spacing'),
-    'cw': ('tese', 'order', 'alias', 'cw'),
-    'ccw': ('tese', 'order', 'alias', 'ccw'),
-}

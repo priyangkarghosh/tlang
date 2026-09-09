@@ -8,6 +8,8 @@
 
 from dataclasses import dataclass
 
+from tlang.errors import SourceLocation
+
 
 @dataclass(slots=True)
 class Attribute:
@@ -15,3 +17,5 @@ class Attribute:
     raw_args: str
     args: list[str]
     kwargs: dict[str, str]
+    # Where in the .tlang source this was written; set by AttributeManager.
+    location: SourceLocation | None = None

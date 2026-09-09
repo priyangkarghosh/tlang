@@ -2,8 +2,7 @@
 # @file          function_manager.py
 # @author        Priyangkar Ghosh
 # @created       2025-06-13
-# @description   Extracts all functions (including kernels) from
-#                the shader src
+# @description   Extracts all functions (including kernels) from the shader source.
 # @license       MIT
 # -------------------------------------------------------------
 
@@ -11,24 +10,39 @@ import logging
 logger = logging.getLogger(__name__)
 
 import bisect
-from tlang.attribute import Attribute
+from tlang.frontend.attribute import Attribute
+from tlang.errors import SourceLocation, TlangSyntaxError
+from tlang.frontend.interface_registry import InterfaceTable
 from tlang.shader_stages import ShaderStage
+from tlang.shader_utils import mask_comments_and_strings
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import NamedTuple
 import regex as re
 
 from tlang.shader_source_line import ShaderSourceLine
 
+
+class InterfaceRef(NamedTuple):
+    """One [uses(...)] reference, resolved later against the merged table."""
+    name: str
+    direction: str
+    location: SourceLocation
+
 # matches function declarations with opening brace
 FUNC_PATTERN = re.compile(r'''
-    ^\s*
+    ^[ \t]*                          # leading indent only -- \s* would span into a
+                                     # masked-out comment block above the function
     (?P<ret_type>\w[\w\s\*]*)\s+     # return type
     (?P<name>\w+)\s*                 # function name
     \((?P<params>[^\)]*)\)\s*        # parameter list
     \{                               # opening brace
 ''', re.MULTILINE | re.VERBOSE)
 
-@dataclass
+# GLSL control-flow keywords, so `else if (cond) {` isn't mistaken for a function header.
+CONTROL_KEYWORDS: frozenset[str] = frozenset({'if', 'for', 'while', 'switch', 'else', 'do'})
+
+@dataclass(eq=False)
 class FunctionDef:
     name: str
     return_type: str
@@ -42,6 +56,8 @@ class FunctionDef:
 
     exported: bool = False
 
+    # FunctionDefs this function depends on via [link(...)]; their bodies are emitted ahead of
+    # this function's own in its stage source.
     links: list['FunctionDef'] = field(
         default_factory=list
     )
@@ -55,10 +71,21 @@ class FunctionDef:
         default_factory=list
     )
 
+    # [uses(...)] references recorded at attach time, resolved later
+    iface_refs: list[InterfaceRef] = field(
+        default_factory=list
+    )
+
 @dataclass
 class FunctionList:
     items: list[FunctionDef]
-    keyed_items: dict[str, FunctionDef]
+    # GLSL permits overloads, so a name may map to more than one FunctionDef; a lookup that
+    # needs exactly one must check the list length and diagnose ambiguity itself.
+    keyed_items: dict[str, list[FunctionDef]]
+
+    # [varyings]/[uniforms]/[buffer] declarations for this module only (ShaderManager merges
+    # in transitive dependencies).
+    interfaces: InterfaceTable = field(default_factory=InterfaceTable)
 
     def __post_init__(self):
         self.starts: list[int] = [fn.line_start for fn in self.items]
@@ -81,40 +108,44 @@ class FunctionManager:
     @staticmethod
     def extract_funcs(shader_name: str, src: str, src_map: dict[int, ShaderSourceLine]) -> FunctionList:
         funcs: list[FunctionDef] = []
-        keyed_funcs: dict[str, FunctionDef] = {}
+        keyed_funcs: dict[str, list[FunctionDef]] = {}
 
-        # search for function declarations
-        # -> loop while there are matches
+        # Mask used only to locate headers and match braces, so comments/strings/`if (x) {`
+        # can't be mistaken for a function. Bodies are always sliced from the original `src`.
+        mask = mask_comments_and_strings(src)
+
         search_pos: int = 0
-        while match := FUNC_PATTERN.search(src, search_pos):
-            # this is only the span of the function HEADER
-            # -> again, this pattern ONLY matches the HEADER
-            func_start, header_end = match.span()
+        while match := FUNC_PATTERN.search(mask, search_pos):
+            func_start, header_end = match.span()  # span of the function header only
 
-            # get function parameters from the match
             name = match.group("name")
             ret_type = match.group("ret_type").strip()
             params = match.group("params").strip()
+
+            # `else if (cond) {` reads as a two-word header ("else" + "if") -- reject it.
+            ret_last_word = ret_type.rsplit(None, 1)[-1] if ret_type else ''
+            if ret_last_word in CONTROL_KEYWORDS or name in CONTROL_KEYWORDS:
+                search_pos = func_start + 1
+                continue
+
             line_start = src[:func_start].count('\n') + 1
 
-            # find the full func body using brace matching
+            # Brace matching runs on the mask, not the original source.
             def match_brace():
                 brace_depth = 1
-                for i, chr in enumerate(src[header_end:], start=header_end):
+                for i, chr in enumerate(mask[header_end:], start=header_end):
                     if chr == '{': brace_depth += 1
                     elif chr == '}': brace_depth -= 1
                     if not brace_depth: return i
-                raise SyntaxError("Unmatched brace in function")
+                raise TlangSyntaxError("Unmatched brace in function", SourceLocation(shader_name, line_start))
             func_end = match_brace() + 1
-            
-            # get the full function body
+
             line_end = src[:func_end].count('\n') + 1
             line_body = {
-                index: src_map.pop(index) 
+                index: src_map.pop(index)
                 for index in range(line_start, line_end + 1) if index in src_map
             }
 
-            # add to func list
             logger.info("Found function '%s' in %s", name, shader_name)
 
             fdef = FunctionDef(
@@ -129,10 +160,12 @@ class FunctionManager:
                 line_body=line_body,
             )
             funcs.append(fdef)
-            keyed_funcs[name] = fdef
 
-            # move past the current function
+            # GLSL allows overloads -- keep every definition instead of clobbering earlier ones.
+            overloads = keyed_funcs.setdefault(name, [])
+            if overloads: logger.info("Function '%s' has %d overloads in %s", name, len(overloads) + 1, shader_name)
+            overloads.append(fdef)
+
             search_pos = func_end
 
-        # return the stripped src and a list of the functions
         return FunctionList(funcs, keyed_funcs)

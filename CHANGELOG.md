@@ -94,6 +94,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`tlang.binding_registry`) must now use `tlang.compiler.binding_registry`.
 
 ### Fixed
+- A malformed `[attr(...)]` block (unbalanced parentheses, or text that is not
+  `name`/`name(args)`) produced an empty attribute list silently, so a shader whose
+  `[shader(...)]` was mistyped built "successfully" with no kernels even under
+  `strict=True`. It now raises a located `TlangSyntaxError` naming the offending block,
+  and honours `strict=False` by logging instead.
+- `BindingRegistry._patch_bindings` scanned raw source while allocation scanned masked
+  source, so a `layout(...) buffer|uniform` declaration inside a comment reached the
+  patcher with no assigned binding and raised `KeyError`, surfacing as a misleading
+  `TlangCompileError` naming a block that exists only in a comment. Such matches are now
+  left untouched.
+- `Diagnostics.fail` accepts the error type to raise, so a parse-level problem reports as
+  `TlangSyntaxError` rather than `TlangAttributeError`.
+- `BufferPool.temp`/`frame` annotate their `@contextmanager` return as `Generator`
+  rather than the deprecated `Iterator` form.
+- `parse_resourceblock` types its direction keys as `Direction` instead of `str`,
+  matching what `StageConfig.set_layout` accepts.
 - `requirements.txt` was UTF-16 encoded with a BOM, which broke or
   misparsed `pip install -r requirements.txt` on many setups; it is now
   plain UTF-8 with LF line endings.
