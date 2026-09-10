@@ -30,10 +30,12 @@ ATTR_PATTERN = re.compile(
         \(                       # opening '('
             (?P<args>            # everything up to the matching ')', with unlimited nesting
                 (?:              # non-capturing group
-                    [^()]        #   any char except parentheses
+                    [^()]++      #   a run of non-paren chars (possessive: no backtracking into it)
                     |            #   …or…
-                    (?R)         #   recurse: the whole pattern again (handles nested ())
-                )*
+                    \( (?&args) \)  #   a balanced nested parenthetical, referring only to
+                                    #   this group (not the whole pattern, unlike (?R))
+                )*+              #   possessive: once a branch is taken it is never revisited,
+                                  #   which is what makes this linear instead of exponential
             )
         \)                       # closing ')'
     )?
@@ -42,6 +44,25 @@ ATTR_PATTERN = re.compile(
 )
 ALT_ATTR_PATTERN = re.compile(r'#(?P<name>\w+!?)\s*<\s*(?P<args>.*?)\s*>')
 # Only matches within a single line.
+
+# The old ATTR_PATTERN used `(?R)` (recurse the whole name+args pattern) inside the args
+# body. Since `\w+!?` can consume 1..k chars of any word that `[^()]` could also consume one
+# char of at a time, this made every word in the argument list ambiguous between the two
+# alternatives -- a word of length k has ~2^(k-1) parses. That's free as long as the overall
+# match succeeds (the first parse found wins), but the moment the argument text contains a
+# parenthesis `(?R)` can't close (e.g. a `(` in a comment with no partner), the engine has to
+# enumerate the whole exponential space before giving up, hanging the preprocessor.
+#
+# `(?&args)` instead recurses only the self-contained balanced-parens group, and both
+# alternatives are possessive (`++` / `*+`), so a character or a balanced parenthetical, once
+# consumed, is never reconsidered. This makes matching (and failing) linear in input length.
+
+# A generous ceiling on how long attribute-regex matching may run. Even with the pattern
+# above being linear, this is the backstop that turns "some other pathological input we
+# didn't think of hangs the preprocessor forever" into "the preprocessor raises a clear
+# error" -- matching real attribute text takes well under a millisecond, so seconds of
+# budget is never spent in practice.
+ATTR_MATCH_TIMEOUT_SECONDS = 5.0
 
 
 ARG_PATTERN = re.compile(r"""
@@ -59,8 +80,18 @@ ARG_PATTERN = re.compile(r"""
 # class to extract anything in the form []
 class AttributeManager:
     @classmethod
-    def match_attr(cls, attr_str: str) -> Attribute | None:
-        if (m := ATTR_PATTERN.fullmatch(attr_str.strip())):
+    def match_attr(cls, attr_str: str, location: SourceLocation | None = None) -> Attribute | None:
+        text = attr_str.strip()
+        try:
+            m = ATTR_PATTERN.fullmatch(text, timeout=ATTR_MATCH_TIMEOUT_SECONDS)
+        except TimeoutError:
+            name = nm.group(0) if (nm := re.match(r'\w+!?', text)) else text
+            raise TlangSyntaxError(
+                f"Attribute '{name}' took longer than {ATTR_MATCH_TIMEOUT_SECONDS:g}s to parse "
+                f"-- aborting instead of hanging. This usually means unbalanced parentheses "
+                f"somewhere in its argument list.", location,
+            )
+        if m:
             # a bare attribute (no parens at all) has raw_args='', args=[], kwargs={}
             raw_args = m.group('args') or ''
             return Attribute(m.group('name'), raw_args, *cls.parse_args(raw_args))
@@ -70,7 +101,12 @@ class AttributeManager:
     def parse_args(arg_str: str) -> tuple[list[str], dict[str, str]]:
         args: list[str] = []
         kwargs: dict[str, str] = {}
-        for m in ARG_PATTERN.finditer(arg_str):
+        # Comments are masked to spaces (not stripped from arg_str itself -- callers that
+        # want the raw text, e.g. resourceblock, read attr.raw_args directly) so a comment's
+        # commas can't mis-split the argument list. String literals are left untouched so
+        # quoted commas/parens keep parsing exactly as before.
+        masked = mask_comments_and_strings(arg_str, mask_strings=False)
+        for m in ARG_PATTERN.finditer(masked):
             val = m.group("value").strip()
             if len(val) >= 2 and val[0] == val[-1] and val[0] in "'\"":
                 val = val[1:-1].strip()
@@ -91,6 +127,12 @@ class AttributeManager:
         attrs: list[Attribute] = []
         stack_depth: int = 0
 
+        # Paren depth and top-level commas are decided on a masked copy, so a comment inside
+        # one attribute's argument list can't desync the split (a stray '(' or a ',' in a
+        # `//` or `/* */` comment no longer fools the depth counter). The actual characters
+        # -- comment text included -- still come from block_str itself via `buffer`.
+        masked = mask_comments_and_strings(block_str)
+
         # Without a collector (direct calls, tests) this raises; with one it honours `strict`.
         def fail(message: str) -> None:
             if diagnostics is None: raise TlangSyntaxError(message, location)
@@ -100,17 +142,17 @@ class AttributeManager:
             text = ''.join(buffer).strip()
             buffer.clear()
             if not text: return
-            if (attr := cls.match_attr(text)) is None:
+            if (attr := cls.match_attr(text, location)) is None:
                 fail(f"Malformed attribute '{text}' in [{block_str.strip()}]. "
                      f"Expected 'name' or 'name(args)'.")
                 return
             attrs.append(attr)
 
-        for c in block_str:
-            if c == '(': stack_depth += 1
-            elif c == ')': stack_depth -= 1
+        for c, mc in zip(block_str, masked):
+            if mc == '(': stack_depth += 1
+            elif mc == ')': stack_depth -= 1
 
-            if c == ',' and not stack_depth: flush_buffer()
+            if mc == ',' and not stack_depth: flush_buffer()
             else: buffer.append(c)
 
         if stack_depth != 0:

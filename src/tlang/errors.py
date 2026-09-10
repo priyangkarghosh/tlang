@@ -83,6 +83,17 @@ class TlangLinkError(TlangError):
     """A [program(...)] could not be linked into a GL program."""
 
 
+class TlangBuildError(TlangError):
+    """Raised once by `ShaderManager(strict=True)` when more than one module in the tree
+    failed to build. `failures` maps each failed module name to the errors it hit; a tree
+    with only one failing module re-raises that module's original error instead of this one.
+    """
+
+    def __init__(self, message: str, failures: dict[str, list[Exception]] | None = None) -> None:
+        self.failures: dict[str, list[Exception]] = failures if failures is not None else {}
+        super().__init__(message)
+
+
 __all__ = [
     'SourceLocation',
     'TlangError',
@@ -92,4 +103,5 @@ __all__ = [
     'TlangBindingError',
     'TlangCompileError',
     'TlangLinkError',
+    'TlangBuildError',
 ]

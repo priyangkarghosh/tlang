@@ -9,7 +9,7 @@
 import logging
 
 from tlang.compiler.binding_registry import BindingRegistry
-from tlang.errors import SourceLocation, TlangBindingError, TlangCompileError, TlangLinkError
+from tlang.errors import SourceLocation, TlangAttributeError, TlangBindingError, TlangCompileError, TlangLinkError
 logger = logging.getLogger(__name__)
 
 import time
@@ -36,18 +36,42 @@ class Shader:
     def __init__(
         self, ctx: Context, name: str, version: str, module: str, processor: ShaderProcessor,
         pref_rank: dict[str, int] | None = None, strict: bool = True,
+        dep_plain_funcs: dict[str, str] | None = None,
     ) -> None:
         self._ctx = ctx
         self._name = name
         self._version = version
         self._strict = strict  # raise TlangCompileError/TlangLinkError instead of logging and continuing
 
+        # name -> module it's declared in, for every module-scope ([shader]-less) function in
+        # this module's [include] dependency closure (this module itself excluded -- that's
+        # `processor.funcs.items`, checked directly). Used only by the T15 diagnostic below to
+        # tell "genuinely undefined" apart from "defined, just never exported/emitted".
+        self._dep_plain_funcs: dict[str, str] = dep_plain_funcs or {}
+
         self._kernels: dict[str, Kernel] = {}
         self._programs: dict[str, Program] = {}
         self._pipelines: dict[str, Pipeline] = {}
         self._sources: dict[str, str] = {}
         self._interfaces: dict[str, InterfaceDecl] = {d.name: d for d in processor.resolved_interfaces}
+        self._failures: list[Exception] = []
+        self._ok = True
         self._build(module, processor, pref_rank or {})
+
+    @property
+    def ok(self) -> bool:
+        """True when every declared entry point of this module produced a kernel (compute) or
+        was part of a successfully linked program (vert/frag/geom/tesc/tese). False means at
+        least one entry point failed -- the natural `get_shader(name) is not None` check on
+        `ShaderManager` reflects this, so a module that didn't fully compile is never mistaken
+        for one that did."""
+        return self._ok
+
+    @property
+    def failures(self) -> list[Exception]:
+        """Errors this module hit while compiling/linking (empty when `ok`). Populated even
+        under `strict=False`, where the module otherwise builds silently around the gap."""
+        return self._failures
 
     @property
     def kernels(self) -> dict[str, Kernel]:
@@ -98,6 +122,44 @@ class Shader:
         ret = r'\s+'.join([re.escape(w) for w in ret_type.split()])
         return re.compile(rf'\b{ret}\s+{re.escape(name)}\s*\(', re.MULTILINE)
 
+    def _raise_missing_export(self, func: FunctionDef, missing: set[str], process: ShaderProcessor) -> None:
+        """Raises for the first `missing` name (sorted for determinism) that resolves to a
+        real module-scope function -- same file or an [include]d one -- so T15's raw driver
+        error ("undefined variable") gets a tlang diagnostic naming the fix instead. A name
+        matching neither is a genuine unknown (builtin, typo, macro) and is left alone; the
+        driver's own message will name it.
+        """
+        same_file = {f.name: f for f in process.funcs.items if f.stage is None}
+
+        for name in sorted(missing):
+            if (helper := same_file.get(name)) is not None:
+                note = ''
+                if helper.links:
+                    # T10: [link(...)] was attached to the helper instead of the caller, so
+                    # the helper gained a link of its own instead of being pulled into `func`.
+                    note = (
+                        f" Note: '{name}' itself carries a [link(...)] -- if that was meant to pull "
+                        f"'{name}' into '{func.name}', [link(...)] belongs on '{func.name}', not on '{name}'."
+                    )
+                raise TlangAttributeError(
+                    f"'{func.name}' calls '{name}', a module-scope function defined in '{self._name}' "
+                    f"but never emitted into this translation unit.{note} Fix: add [export()] to "
+                    f"'{name}', or [link('{name}')] on '{func.name}'.",
+                    SourceLocation(self._name, helper.line_start),
+                )
+
+            if (owner := self._dep_plain_funcs.get(name)) is not None:
+                raise TlangAttributeError(
+                    f"'{func.name}' calls '{name}', a module-scope function defined in included "
+                    f"module '{owner}' but never exported, so it was never emitted into this "
+                    f"translation unit. [link(...)] can't reach across modules -- fix: add "
+                    f"[export()] to '{name}' in '{owner}'.",
+                    SourceLocation(self._name, func.line_start),
+                )
+
+        # None of `missing` matched a known module-scope function -- an ordinary undefined
+        # identifier (builtin typo, etc), not this diagnostic's concern.
+
     @staticmethod
     def _parse_error_location(message: str, fallback_module: str) -> SourceLocation:
         if (m := DRIVER_LOCATION_PATTERN.search(message)):
@@ -136,6 +198,19 @@ class Shader:
 
             src += pattern.sub('void main(', Shader.build_map(func.line_body), count=1)
 
+            # T15: before DFE removes anything, check whether reachable code calls a name
+            # that exists as a module-scope function (this file, or an [include]d one) but
+            # was never emitted into this unit -- an `[export()]`/`[link(...)]` omission,
+            # not a real "undefined variable". Once DFE runs, an unreachable caller's call
+            # sites are gone; a reachable caller's aren't, but the check is cheap enough
+            # to just always run here rather than depend on that distinction.
+            if (missing := BindingRegistry.find_missing_export_calls(src)):
+                self._raise_missing_export(func, missing, process)
+
+            # strip functions unreachable from `main` -- must run before the block DCE below
+            # so it only sees blocks text `main` can actually reach.
+            src = BindingRegistry.remove_dead_functions(src)
+
             # strip SSBO blocks this entry point never references
             src = BindingRegistry.remove_unused_buffers(src)
 
@@ -164,16 +239,18 @@ class Shader:
 
             except TlangBindingError as e:
                 logger.error(str(e))
+                self._failures.append(e)
                 if self._strict: raise
 
             except Exception as e:
                 logger.error("Failed to compile %s shader '%s': %s", stage, name, e)
-                if self._strict:
-                    raise TlangCompileError(
-                        f"Failed to compile {stage} shader '{name}': {e}",
-                        Shader._parse_error_location(str(e), self._name),
-                        stage=str(stage), entry_point=name, source=dced[name],
-                    ) from e
+                err = TlangCompileError(
+                    f"Failed to compile {stage} shader '{name}': {e}",
+                    Shader._parse_error_location(str(e), self._name),
+                    stage=str(stage), entry_point=name, source=dced[name],
+                )
+                self._failures.append(err)
+                if self._strict: raise err from e
 
         # Pass 3: programs -- every stage of one [program(...)] is one
         # artifact, so a block shared across e.g. vertex + fragment keeps
@@ -203,15 +280,34 @@ class Shader:
 
             except (TlangLinkError, TlangBindingError) as e:
                 logger.error(str(e))
+                self._failures.append(e)
                 if self._strict: raise
 
             except Exception as e:
                 logger.error("Failed to link program '%s': %s", prog_name, e)
-                if self._strict:
-                    raise TlangLinkError(
-                        f"Failed to link program '{prog_name}': {e}",
-                        Shader._parse_error_location(str(e), self._name),
-                    ) from e
+                err = TlangLinkError(
+                    f"Failed to link program '{prog_name}': {e}",
+                    Shader._parse_error_location(str(e), self._name),
+                )
+                self._failures.append(err)
+                if self._strict: raise err from e
+
+        # A declared entry point is "ok" when it produced a kernel (compute) or belongs to a
+        # program that linked (raster). A raster entry orphaned from every [program(...)] was
+        # never going to produce anything either way -- `_warn_orphan_stage_functions` already
+        # flags that (non-fatally) at process time, so it's excluded here rather than counted
+        # as a build failure.
+        entry_programs: dict[str, list[str]] = {}
+        for prog_name, pdef in process.programs.items():
+            for fn in pdef.stages.values():
+                entry_programs.setdefault(fn.name, []).append(prog_name)
+
+        def _entry_ok(name: str, stage: ShaderStage) -> bool:
+            if stage == ShaderStage.COMP: return name in self._kernels
+            progs = entry_programs.get(name)
+            return progs is None or any(p in self._programs for p in progs)
+
+        self._ok = all(_entry_ok(name, stage) for name, stage in stage_of.items())
 
         t1 = time.perf_counter()
         logger.info(

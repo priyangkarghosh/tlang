@@ -13,6 +13,7 @@ from moderngl import ComputeShader, Context, Program, StorageBlock, UniformBlock
 import regex as re
 
 from tlang.errors import SourceLocation, TlangBindingError
+from tlang.frontend.function_manager import CONTROL_KEYWORDS, FUNC_PATTERN
 from tlang.shader_stages import ShaderStage
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,12 @@ MASK_PATTERN = re.compile(
     r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"|^[ \t]*#[^\n]*',
     re.DOTALL | re.MULTILINE,
 )
+
+# An identifier immediately followed by '(' -- a call site, a function header, OR a builtin/
+# type-constructor invocation (`vec4(...)`, `atomicAdd(...)`). Builtins are never keys in the
+# function map this module builds, so they fall out of consideration on their own -- nothing
+# here special-cases them.
+CALL_SITE_PATTERN = re.compile(r'\b([A-Za-z_]\w*)\s*\(')
 
 class BindingRegistry():
     @staticmethod
@@ -435,3 +442,159 @@ class BindingRegistry():
         AND `uniform` blocks alike. Kept because `Shader._build` and
         existing tests call it under this name."""
         return BindingRegistry.remove_dead_blocks(src)
+
+    # -----------------------------------------------------------------
+    # dead-function elimination -- same textual-approximation class as the
+    # block DCE above, sharing `_mask`/`_match_brace`. Must run before
+    # `remove_dead_blocks` so the block DCE only sees text `main` can
+    # actually reach; see `remove_dead_functions`.
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def _function_spans(masked: str) -> list[tuple[str, int, int, int, int]] | None:
+        """Every top-level function definition in `masked`, in source order.
+
+        Each entry is `(name, def_start, def_end, body_start, body_end)` where
+        `[def_start, def_end)` spans the whole definition (header + body, for
+        blanking) and `[body_start, body_end)` spans just the body (for a callee
+        scan that must not mistake a function's own header for a call to itself).
+
+        Reuses `FunctionManager.FUNC_PATTERN`/`CONTROL_KEYWORDS` so a multi-line
+        parameter list (its `[^\\)]*` spans newlines) and an `else if (` false
+        match are handled identically to real function extraction. Returns
+        `None` -- "do nothing, bias toward keeping" -- on an unbalanced brace,
+        the same policy `remove_dead_blocks` applies per-block.
+        """
+        spans: list[tuple[str, int, int, int, int]] = []
+        pos = 0
+        while (m := FUNC_PATTERN.search(masked, pos)):
+            def_start, header_end = m.span()
+            name = m.group('name')
+            ret_type = m.group('ret_type').strip()
+            ret_last_word = ret_type.rsplit(None, 1)[-1] if ret_type else ''
+
+            if ret_last_word in CONTROL_KEYWORDS or name in CONTROL_KEYWORDS:
+                pos = def_start + 1
+                continue
+
+            open_brace = header_end - 1
+            if (close_brace := BindingRegistry._match_brace(masked, open_brace)) is None:
+                logger.warning("DFE: unbalanced braces in function '%s' -- keeping everything.", name)
+                return None
+
+            spans.append((name, def_start, close_brace + 1, open_brace + 1, close_brace))
+            pos = close_brace + 1
+
+        return spans
+
+    @staticmethod
+    def _analyze_reachability(
+        src: str,
+    ) -> tuple[list[tuple[str, int, int, int, int]], set[str], set[str]] | None:
+        """Walks the call graph of `src` from `main`, on masked text.
+
+        Returns `(spans, reachable_names, unresolved_calls)`:
+          - `spans`: every top-level function definition, as `_function_spans` returns.
+          - `reachable_names`: function names reachable from `main`, keyed by NAME (an
+            overload group is one node -- if any overload is called, the name is reachable
+            and every body sharing it is kept; a textual walk cannot resolve overloads, and
+            over-inclusion is the safe direction).
+          - `unresolved_calls`: names called from `main`, from a name in `reachable_names`,
+            or from module-scope code (outside any function -- a global initializer counts
+            as a root, same as `main`), that resolve to no definition anywhere in `src`.
+            Builtins/type-constructors end up here and are simply never looked up further.
+
+        Returns `None` -- do nothing -- when the text can't be safely analyzed (unbalanced
+        braces) or has no `main` to root the walk at.
+        """
+        masked = BindingRegistry._mask(src)
+        if (spans := BindingRegistry._function_spans(masked)) is None: return None
+
+        by_name: dict[str, list[tuple[int, int, int, int]]] = defaultdict(list)
+        for name, def_start, def_end, body_start, body_end in spans:
+            by_name[name].append((def_start, def_end, body_start, body_end))
+
+        if 'main' not in by_name:
+            logger.warning("DFE: no 'main' function found in generated unit -- keeping everything.")
+            return None
+
+        graph: dict[str, set[str]] = {}
+        unresolved: dict[str, set[str]] = {}
+        for name, occurrences in by_name.items():
+            callees: set[str] = set()
+            stray: set[str] = set()
+            for _, _, body_start, body_end in occurrences:
+                for call in CALL_SITE_PATTERN.finditer(masked, body_start, body_end):
+                    target = call.group(1)
+                    (callees if target in by_name else stray).add(target)
+            graph[name] = callees
+            unresolved[name] = stray
+
+        module_scope_text, cursor = [], 0
+        for _, def_start, def_end, _, _ in spans:
+            module_scope_text.append(masked[cursor:def_start])
+            cursor = def_end
+        module_scope_text.append(masked[cursor:])
+        module_calls = {m.group(1) for m in CALL_SITE_PATTERN.finditer(''.join(module_scope_text))}
+
+        roots = {'main'} | (module_calls & by_name.keys())
+        reachable: set[str] = set()
+        stack = list(roots)
+        while stack:
+            n = stack.pop()
+            if n in reachable: continue
+            reachable.add(n)
+            stack.extend(graph.get(n, ()))
+
+        reachable_unresolved = set(module_calls - by_name.keys())
+        for n in reachable:
+            reachable_unresolved |= unresolved.get(n, set())
+
+        return spans, reachable, reachable_unresolved
+
+    @staticmethod
+    def remove_dead_functions(src: str) -> str:
+        """Blanks every top-level function definition in `src` unreachable from `main`.
+
+        Must run before `remove_dead_blocks` (and before `allocate_artifact`) so the block
+        DCE sees only text `main` can actually reach -- otherwise an `[export()]`ed helper
+        that this particular entry point never calls still keeps whatever SSBO/UBO blocks
+        it touches alive. Same bias as `remove_dead_blocks`: keep when uncertain, since a
+        wrongly-removed function is a loud compile error, never silent wrongness.
+
+        Blanks with `'\\n' * newline-count`, exactly like `remove_dead_blocks`, so `#line`
+        directives further down the unit stay line-accurate.
+        """
+        if (analysis := BindingRegistry._analyze_reachability(src)) is None: return src
+        spans, reachable, _ = analysis
+
+        removable = [(def_start, def_end) for name, def_start, def_end, _, _ in spans if name not in reachable]
+        if not removable: return src
+        removable.sort()
+
+        out, cursor = [], 0
+        for start, end in removable:
+            out.append(src[cursor:start])
+            out.append('\n' * src.count('\n', start, end))
+            cursor = end
+        out.append(src[cursor:])
+        return ''.join(out)
+
+    @staticmethod
+    def find_missing_export_calls(src: str) -> set[str]:
+        """Names called from `main`-reachable code (or module scope) in `src` that resolve
+        to no function definition anywhere in `src` itself.
+
+        `Shader._build` must call this before `remove_dead_functions` touches the same
+        `src`: this diagnostic exists to name the fix for a helper that was never emitted
+        at all, and once DFE runs the reachable call sites it needs are the only evidence
+        that a call happened -- checking after would mean re-deriving exactly what DFE just
+        threw away, for no benefit.
+
+        A name that comes back here is either a builtin/type-constructor (not this
+        diagnostic's concern) or a real problem for the caller to classify against whatever
+        it knows about the project's module-scope functions (same file, `[include]` closure).
+        """
+        if (analysis := BindingRegistry._analyze_reachability(src)) is None: return set()
+        _, _, reachable_unresolved = analysis
+        return reachable_unresolved

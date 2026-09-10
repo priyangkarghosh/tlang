@@ -227,8 +227,11 @@ UBOs and SSBOs are separate GL binding pools (`GL_MAX_UNIFORM_BUFFER_BINDINGS` /
 per-stage `GL_MAX_*_UNIFORM_BLOCKS` vs. `GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS` /
 per-stage `GL_MAX_*_SHADER_STORAGE_BLOCKS`). tlang allocates and strips dead blocks
 in each pool independently, per compiled artifact (one compute kernel, or one
-`[program(...)]`'s stages together). See `references/runtime.md` for
-`bind_ssbo`/`bind_ubo` and the exact stripping/limit-exceeded errors.
+`[program(...)]`'s stages together). "Dead" means unreachable from that entry point's
+`main()`: functions the entry point cannot reach are removed first, so a block reaching
+the file only through an `[export()]`ed helper nobody calls does not survive. See
+`references/runtime.md` for `kernel.bind(...)`, the per-kernel binding model, and the
+exact stripping/limit-exceeded errors.
 
 A `std140` block must be laid out to the std140 rules, which is why loose
 `[uniforms]` (set with `set_uniforms(...)`, no layout rules to get right) is the

@@ -13,6 +13,7 @@ from typing import Any
 from moderngl import Buffer, Context, Program, StorageBlock, UniformBlock, Uniform
 
 from tlang.errors import SourceLocation, TlangBindingError
+from tlang.runtime.kernel import bump_ssbo_table_generation
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,22 @@ class Pipeline:
     def bind_ssbo(
         self, buffer_name: str, buffer: Buffer, offset: int = 0, size: int = -1
     ) -> None:
+        """Bind `buffer` to `buffer_name` IMMEDIATELY, unlike `Kernel.bind_ssbo`.
+
+        `Kernel` can defer its binds because every dispatch entry point re-asserts the kernel's
+        full recorded set right before running -- there's a hook to do it at. A `Pipeline` has no
+        such hook: drawing happens in moderngl's `VAO.render`, entirely outside tlang, so there is
+        no "just before this pipeline runs" moment to re-assert at. Binding immediately is
+        therefore the only option here.
+
+        This does still bump the same process-global generation counter `Kernel` uses (see
+        `tlang.runtime.kernel.bump_ssbo_table_generation`), so any `Kernel` that dispatches after
+        this call correctly notices the table has moved and re-asserts its own bindings. The
+        asymmetry this leaves: a compute dispatch issued BETWEEN a `pipeline.bind_ssbo(s)` call
+        and the eventual `VAO.render` draw can still silently rewire this pipeline's bindings out
+        from under it, and tlang currently has no mechanism to detect or prevent that -- only to
+        keep kernels honest about it.
+        """
         if (binding := self._binding_cache.get(buffer_name, None)) is None:
             block = self._mglo.get(buffer_name, None)
             if not isinstance(block, StorageBlock):
@@ -103,6 +120,7 @@ class Pipeline:
             self._binding_cache[buffer_name] = binding = block.binding
         # offset/size are keyword-only on moderngl <= 5.8.x; positional args raise TypeError there.
         buffer.bind_to_storage_buffer(binding, offset=offset, size=size)
+        bump_ssbo_table_generation()
 
     def bind_ubos(self, **buffers: Buffer | tuple[Buffer, int, int]) -> None:
         loc = self.bind_ubo

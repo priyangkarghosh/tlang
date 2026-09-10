@@ -23,17 +23,30 @@ launched from. Absolute paths are used as-is.
 extension: `shaders/fx/blur.tlang` -> `'fx.blur'`. Two files mapping to the same
 module name (`a/b.tlang` and `a.b.tlang`) are rejected.
 
-**`strict`.** `True` (default): any compile/link/attribute/pipeline error raises
-immediately. `False`: downgrades to a logged warning and continues with a partial
-build — a missing kernel/program then surfaces later as a plain `KeyError`, so this
-trades an early loud failure for a late confusing one. Prefer `True` except while
-actively iterating.
+**`strict`.** `True` (default): the whole tree is still built — every module is
+attempted, in isolation, so one broken file can never stop another from compiling —
+and then a single error is raised at the end. If exactly one module failed, its own
+exception is re-raised unchanged; if several did, a `TlangBuildError` names every one
+of them, with `.failures` mapping module -> its errors. `False`: failures are logged
+and collected, and the build continues.
+
+**A failed module is not silently usable.** `get_shader(name)` returns `None` for a
+module that built but did not fully compile, so the cheap check is also the correct
+one:
 
 ```python
-sm.ctx                      # the moderngl.Context
-sm['name']                  # same as get_shader(name)
-'name' in sm                # was this module built
-sm.get_shader('demo')       # -> Shader | None (None if absent -- does NOT raise)
+assert sm.get_shader('physics.dynamics') is not None   # correct: fails if it failed
+```
+
+```python
+sm.ctx                       # the moderngl.Context
+sm['name']                   # same as get_shader(name)
+'name' in sm                 # was this module built
+sm.get_shader('demo')        # -> Shader | None (None if absent OR not fully compiled)
+sm.get_shader('demo', allow_failed=True)   # -> the Shader anyway, to inspect .failures
+sm.failures                  # {module: [errors]} for every module that failed
+shader.ok                    # did every declared entry point of this module build
+shader.failures              # this module's errors (empty when ok)
 ```
 
 ## Shader
@@ -101,24 +114,33 @@ covering `n` elements is `kernel.dispatch((n + 255) // 256)`. Passing `n` direct
 launches 256x too many threads — nothing errors, you just get wrong results or an
 out-of-bounds write.
 
-## Unused SSBO/UBO blocks are stripped per artifact
+## Blocks are stripped per artifact, by reachability from `main()`
 
-tlang deletes any buffer/uniform block an entry point's reachable code doesn't
-reference, because the per-stage block limit is far lower than the binding-index
+Each entry point gets its own translation unit, and tlang removes from it, in order:
+every top-level function not reachable from `main()`, then every buffer/uniform block
+none of the surviving code references. So `kernel.bindings` means **"blocks the code
+reachable from this kernel's `main()` touches"** — not "blocks declared anywhere in
+the file or its `[include]`s".
+
+That distinction matters: an `[export()]`ed helper is emitted into every entry point
+of the including file, so before reachability analysis a one-line kernel could declare
+a dozen blocks it never touches. It no longer does.
+
+Stripping exists because the per-stage block limit is far lower than the binding-index
 ceiling — `GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS` is often 96 while
-`GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS` is often only 16, and exceeding the latter is
-a hard link failure. The analysis is textual, not a real GLSL parse, and is
-deliberately biased toward keeping a block when uncertain.
+`GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS` is often only 16, and exceeding the latter is a
+hard link failure. Both passes are textual, not a real GLSL parse, and are deliberately
+biased toward keeping when uncertain.
 
-A stripped block is gone from reflection too — `bind_ssbo`/`bind_ubo` on one raises
-`TlangBindingError`:
+**You no longer need to match a bind list to the stripped set by hand.** `kernel.bind()`
+takes the superset you own and binds only what this artifact declares:
 
+```python
+kernel.bind(**self._buffers)      # extra names ignored; a REQUIRED name missing raises
 ```
-cs_noop: 'Unused' is not a valid buffer block (Missing binding)
-```
 
-The fix is never on the Python side: something in that entry point's reachable code
-must actually read or write the block's fields.
+`bind_ssbo`/`bind_ssbos` remain the explicit form and still raise `TlangBindingError`
+for a name the artifact does not declare — that is a typo, and worth catching.
 
 Inspect what an artifact actually got:
 
@@ -126,6 +148,44 @@ Inspect what an artifact actually got:
 print(dict(kernel.bindings))         # {'Particles': 0, 'Fixed': 3}
 print(dict(kernel.uniform_blocks))   # {'Lights': 0}
 ```
+
+## Bindings are per-kernel, and re-asserted at dispatch
+
+GL's SSBO binding table is process-global, and each artifact numbers its blocks
+independently. Binding through kernel A and then dispatching kernel B therefore used to
+write A's name->index mapping and run B against its own, differently-numbered indices —
+silently, with no exception and plausible-looking output.
+
+That is now structurally impossible:
+
+* `bind_ssbo`/`bind_ssbos`/`bind` **record** on the kernel; they do not write GL. The
+  name is validated immediately, so a typo still raises at the call.
+* `dispatch`, `dispatch_indirect` and `dispatch_timed` each re-assert that kernel's
+  entire recorded set immediately before running. What is in the table always matches
+  what the kernel about to run asked for.
+* A module-level generation counter makes a repeat dispatch of an already-current
+  kernel free; any other kernel's or pipeline's bind invalidates it.
+
+```python
+a.bind_ssbos(X=buf1); b.bind_ssbos(X=buf2)
+a.dispatch(n)    # a sees buf1
+b.dispatch(n)    # b sees buf2 -- no interleaving hazard
+```
+
+**Dispatching with a required block never bound raises** `TlangBindingError` naming it,
+rather than reading whatever another kernel left at that index:
+
+```python
+kernel.dispatch(n, allow_unbound={'Debug'})   # opt out deliberately
+```
+
+A `TempHandle` freed back to the `BufferPool` while still recorded on a kernel also
+raises at the next dispatch, instead of dispatching against a buffer the pool has since
+handed to someone else.
+
+**`Pipeline` (raster) is the exception.** Drawing happens in moderngl's `VAO.render`,
+outside tlang, so `Pipeline.bind_ssbo` binds immediately and cannot re-assert. A compute
+dispatch between a pipeline's bind and its draw can still rewire it.
 
 ## BufferPool
 
@@ -171,6 +231,22 @@ oversized pooled buffer.
 Use of buffer handle after free: 'read' accessed on a freed temp buffer
 Buffer handle already freed (double free)
 ```
+
+## Which tlang am I actually running?
+
+A copied (non-editable) install and an editable checkout are indistinguishable by version
+number — and the version has gone *backwards* across a refactor before, so comparing
+versions cannot answer "is my install current?". The package directory can:
+
+```python
+import tlang
+tlang.__version__          # '1.3.26'
+tlang.build_info()         # {'version': ..., 'package_dir': PosixPath(...), 'editable': True}
+```
+
+`package_dir` is the load-bearing field: if it points into your source checkout, your edits
+are live; if it points into `site-packages`, you are running a copy and edits to the source
+tree do nothing.
 
 ## Verifying a change
 

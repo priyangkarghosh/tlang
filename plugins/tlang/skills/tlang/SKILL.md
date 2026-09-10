@@ -27,10 +27,11 @@ sm = ShaderManager(
     version='460 core',
     dir='shaders',            # resolves against the CALLING FILE's dir, not cwd
     constants={'BLOCK_SIZE': 256},
-    strict=True,              # default: raise on any compile/link/attribute failure
+    strict=True,              # default: build everything, then raise once naming
+                              # every module that failed
 )
 
-shader   = sm.get_shader('demo')           # -> Shader | None
+shader   = sm.get_shader('demo')           # -> Shader | None (None if it didn't compile)
 kernel   = shader.get_kernel('cs_go')      # -> Kernel        (KeyError if absent)
 pipeline = shader.get_pipeline('default')  # -> Pipeline      (prefer over get_program)
 ```
@@ -93,7 +94,7 @@ void cs_go() {
 
 ```python
 kernel = shader.get_kernel('cs_go')
-kernel.bind_ssbo('Data', buf)                 # bind BY NAME, never a hardcoded number
+kernel.bind(Data=buf, Unused=other)           # bind BY NAME; extras are ignored
 kernel.dispatch((n + 255) // 256)             # workgroup counts, not thread counts
 ```
 
@@ -123,9 +124,24 @@ kernel.dispatch((n + 255) // 256)             # workgroup counts, not thread cou
 - **Raw GLSL declarations (`layout(std430) buffer X {...};`, plain `in`/`out`) still
   work exactly as before.** The struct form is an alternative, never required — mix
   freely, migrate one stage at a time or never.
-- **Unused SSBO/UBO blocks are stripped per artifact.** An entry point that doesn't
-  reference a block loses it entirely — `bind_ssbo`/`bind_ubo` on a stripped name
-  raises `TlangBindingError` at runtime, not at build time.
+- **Blocks are stripped per artifact, by reachability from `main()`.** Functions the
+  entry point can't reach are removed first, then blocks nothing surviving references.
+  So `kernel.bindings` is "what this kernel's code actually touches" — an `[export()]`ed
+  helper's buffers don't leak into kernels that never call it.
+- **Prefer `kernel.bind(**buffers)` over `bind_ssbos`.** Pass the whole superset you
+  own; the kernel takes the blocks its artifact declares and ignores the rest, so no
+  per-kernel name list has to be kept in sync with the GLSL. A *required* block missing
+  from what you pass raises. `bind_ssbo`/`bind_ssbos` stay the explicit form and still
+  raise on a name the artifact doesn't declare (that's a typo).
+- **Binds are recorded on the kernel and applied at dispatch, not immediately.**
+  `dispatch`/`dispatch_indirect`/`dispatch_timed` re-assert that kernel's whole set
+  first, so binding through one kernel and dispatching another can no longer cross-wire
+  them. Dispatching with a required block never bound raises `TlangBindingError`; pass
+  `allow_unbound={'Name'}` to opt out.
+- **A module-scope helper needs `[export()]`** (module-wide) or `[link('name')]` on the
+  entry point (that one kernel). This is deliberate — it's what keeps artifacts small.
+  Calling a helper that has neither is now a tlang error naming the helper and the
+  attribute it needs, not a raw GLSL "undefined variable".
 - **`{{ }}` collides with GLSL brace initializers** (`mat2({{1.0,0.0},{0.0,1.0}})`)
   — add a space or use constructor form.
 - **A raster stage function with no `[program(...)]` reference is compiled and

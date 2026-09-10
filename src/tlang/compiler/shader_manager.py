@@ -17,7 +17,7 @@ from pathlib import Path
 
 from moderngl import Context
 from tlang.compiler.dependency_manager import DependencyManager
-from tlang.errors import SourceLocation, TlangAttributeError, TlangDependencyError
+from tlang.errors import SourceLocation, TlangAttributeError, TlangBuildError, TlangDependencyError
 from tlang.frontend.interface_registry import InterfaceDecl, InterfaceTable
 from tlang.compiler.shader import Shader
 from tlang.compiler.shader_processor import ShaderProcessor
@@ -108,17 +108,48 @@ class ShaderManager:
         usage = BindingRegistry.compute_usage(commons)
         pref_rank = BindingRegistry.preference_rank(usage)
 
+        # Each module is built in isolation: one module's failure (a broken kernel, a bad link)
+        # must never prevent the rest of the tree from building, and must never be reported only
+        # as "the first thing that went wrong" -- under strict=True every module is still
+        # attempted, and every failure collected, before a single error is raised at the end.
         self._shaders: dict[str, Shader] = {}
+        self._failures: dict[str, list[Exception]] = {}
         for name, common in commons.items():
             process = processors[name]
 
             # Consolidate extensions from transitive dependencies too, not just direct
-            # [include(...)] targets.
+            # [include(...)] targets. Also collect every module-scope function name declared
+            # anywhere in the dependency closure (module it's defined in, first one wins on a
+            # name clash) -- `Shader` uses this only to name the module in its T15 diagnostic
+            # when a call resolves to a real function that was simply never exported.
+            dep_plain_funcs: dict[str, str] = {}
             for dep in dm.resolve_dependencies(name):
-                if dep != name: process.ext.update(processors[dep].ext)
+                if dep == name: continue
+                process.ext.update(processors[dep].ext)
+                for fn in processors[dep].funcs.items:
+                    if fn.stage is None: dep_plain_funcs.setdefault(fn.name, dep)
 
-            self._shaders[name] = Shader(
-                ctx, name, version, common, process, pref_rank, strict=self._strict
+            try:
+                shader = Shader(
+                    ctx, name, version, common, process, pref_rank, strict=self._strict,
+                    dep_plain_funcs=dep_plain_funcs,
+                )
+            except Exception as e:
+                self._failures[name] = [e]
+                continue
+
+            self._shaders[name] = shader
+            if not shader.ok: self._failures[name] = shader.failures
+
+        if self._strict and self._failures:
+            named = [(name, err) for name, errs in self._failures.items() for err in errs]
+            if len(named) == 1:
+                raise named[0][1]  # sole failure: preserve its exact type/attributes
+
+            lines = '\n'.join(f'{name}: {err}' for name, err in named)
+            raise TlangBuildError(
+                f"{len(self._failures)} shader module(s) failed to build:\n{lines}",
+                failures=dict(self._failures),
             )
 
         t1 = time.perf_counter()
@@ -136,8 +167,18 @@ class ShaderManager:
     def __contains__(self, value: str) -> bool:
         return value in self._shaders
 
-    def get_shader(self, name: str) -> Shader | None:
+    @property
+    def failures(self) -> dict[str, list[Exception]]:
+        """Module name -> the errors it hit while building (only failed modules are keys)."""
+        return self._failures
+
+    def get_shader(self, name: str, *, allow_failed: bool = False) -> Shader | None:
         """Look up a built shader by name, returning `None` if it wasn't built (unlike
-        `Shader.get_kernel`/`get_program`, which raise `KeyError`)."""
-        return self._shaders.get(name)
+        `Shader.get_kernel`/`get_program`, which raise `KeyError`) OR if it built but didn't
+        fully compile (`strict=False`) -- `shader.ok` is False. Pass `allow_failed=True` to get
+        the `Shader` back anyway, e.g. to inspect `.failures` for diagnosis."""
+        shader = self._shaders.get(name)
+        if shader is None: return None
+        if not allow_failed and not shader.ok: return None
+        return shader
 

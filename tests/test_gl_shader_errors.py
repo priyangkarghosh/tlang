@@ -56,12 +56,19 @@ def test_compile_error_raises_with_stage_and_entry_point(gl_ctx, make_shader_dir
 
 
 def test_compile_error_strict_false_logs_and_continues(gl_ctx, make_shader_dir):
+    """A module whose only kernel failed to compile is not "built" in any useful sense: plain
+    `get_shader` must report that (None), matching `.ok`/`.failures` -- not hand back a Shader
+    that merely looks empty. `allow_failed=True` still reaches it for diagnosis."""
     from tlang import ShaderManager
 
     src = "[shader('compute')]\n[numthreads(1, 1, 1)]\nvoid cs_bad() {\n    int x = ;\n}\n"
     d = make_shader_dir({'bad2.tlang': src})
 
     sm = ShaderManager(ctx=gl_ctx, version='430 core', dir=str(d), strict=False)
-    shader = sm.get_shader('bad2')
+    assert sm.get_shader('bad2') is None
+
+    shader = sm.get_shader('bad2', allow_failed=True)
     assert shader is not None
+    assert shader.ok is False
+    assert shader.failures
     assert 'cs_bad' not in shader.kernels
