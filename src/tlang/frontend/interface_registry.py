@@ -42,7 +42,8 @@ class InterfaceMember:
 
 @dataclass(frozen=True, slots=True)
 class InterfaceDecl:
-    name: str
+    name: str                          # the HANDLE -- what Python binds by (kernel.bindings,
+                                        # bind(), BufferPool lookups, Shader.declared_blocks)
     kind: InterfaceKind
     members: tuple[InterfaceMember, ...]
     module: str
@@ -50,13 +51,24 @@ class InterfaceDecl:
     layout: str = ''                   # 'std430' | 'std140' | ''
     locations: bool = True             # False => emit without layout(location=N)
     block: bool = False                # uniforms only: True => UBO block form
+    emit_name: str = ''                # the GLSL block identifier actually emitted, when it
+                                        # differs from `name` (the [buffer] single-declarator
+                                        # shorthand only -- see `_synthesize_block_name`).
+                                        # '' means "same as `name`"; use `emitted_name` below.
     source_member: str = ''            # set only by the [buffer] single-declarator shorthand:
                                         # the member `name` was derived (or overridden) from,
-                                        # so a duplicate-name diagnostic can name it
+                                        # so a duplicate-handle diagnostic can name it
 
     @property
     def location(self) -> SourceLocation:
         return SourceLocation(self.module, self.line)
+
+    @property
+    def emitted_name(self) -> str:
+        """The identifier actually written into the generated GLSL for this block --
+        `name` itself, except for the [buffer] single-declarator shorthand, which emits a
+        synthesised name distinct from the handle (see `_synthesize_block_name`)."""
+        return self.emit_name or self.name
 
     @property
     def signature(self) -> str:
@@ -220,9 +232,18 @@ def parse_struct_at(
     return decl, end_offset
 
 
-def _derive_block_name(member_name: str) -> str:
-    """`ptcPositions` -> `PtcPositions`: upper-case the first character only."""
-    return member_name[:1].upper() + member_name[1:]
+def _synthesize_block_name(member_name: str) -> str:
+    """Deterministic GLSL block identifier for the [buffer] single-declarator shorthand,
+    e.g. `ptcPositions` -> `ptcPositions__blk`.
+
+    GLSL requires a block's own name to differ from its member's, so the shorthand can't
+    just emit `buffer ptcPositions { vec2 ptcPositions[]; }` -- that shadows the member and
+    fails to compile (verified: "undefined variable"). This name is purely a GLSL-legality
+    artifact: nothing in Python ever binds by it (see `InterfaceDecl.name`, the handle).
+    Deriving it from the member name keeps builds reproducible and driver errors greppable,
+    and the `__` marker makes it unmistakably tlang-synthesised rather than user-written.
+    """
+    return f'{member_name}__blk'
 
 
 def _find_top_level_semicolon(mask: str, start: int) -> int | None:
@@ -240,12 +261,16 @@ def parse_declarator_at(
 ) -> tuple[InterfaceDecl, int] | None:
     """Locate a single `Type name[...];` member statement at/after
     `start_offset` -- the `[buffer]` single-declarator shorthand, which
-    desugars e.g. `[buffer] vec2 ptcPositions[];` to the equivalent
-    `[buffer(std430)] struct PtcPositions { vec2 ptcPositions[]; };`.
+    desugars e.g. `[buffer] vec2 ptcPositions[];` to a block whose HANDLE
+    (what Python binds by) is `ptcPositions` -- the member's own name --
+    and whose emitted GLSL block name is a synthesised one, distinct from
+    the member so the block never shadows it (see `_synthesize_block_name`).
 
-    `block_name`, when given, overrides the name derived from the member
-    (`[buffer(name='ElementCount')]`); otherwise it's `_derive_block_name`
-    of the member's own name.
+    `block_name`, when given, overrides the handle (`[buffer(name='ElementCount')]`
+    makes `ElementCount` what Python binds by); otherwise the handle is the
+    member's own name, unchanged. Either way the emitted block name is always
+    synthesised from the member -- `name=...` no longer needs to defeat a
+    capitalisation collision, since there is no longer a capitalisation step.
 
     Returns `None` only when no statement-terminating ';' follows at all,
     mirroring `parse_struct_at`'s "nothing here" contract; a malformed or
@@ -276,18 +301,19 @@ def parse_declarator_at(
         )
     member = members[0]
 
-    name = block_name if block_name is not None else _derive_block_name(member.name)
-    if not name or not name.isidentifier():
+    handle = block_name if block_name is not None else member.name
+    if not handle or not handle.isidentifier():
         raise TlangAttributeError(
-            f"[buffer]: '{name!r}' is not a valid block name for member '{member.name}' -- "
+            f"[buffer]: '{handle!r}' is not a valid handle for member '{member.name}' -- "
             f"give a valid identifier with [buffer(name='...')]",
             loc,
         )
 
     decl = InterfaceDecl(
-        name=name, kind=kind, members=(member,), module=module, line=line,
+        name=handle, kind=kind, members=(member,), module=module, line=line,
         layout=opts.get('layout', ''), locations=opts.get('locations', True),
         block=opts.get('block', False), source_member=member.name,
+        emit_name=_synthesize_block_name(member.name),
     )
     return decl, end + 1
 
@@ -399,7 +425,7 @@ def _emit_loose(decl: InterfaceDecl, keyword: str) -> list[str]:
 
 def _emit_block(decl: InterfaceDecl, keyword: str) -> list[str]:
     header = f'layout({decl.layout}) ' if decl.layout else ''
-    lines = [f'{header}{keyword} {decl.name} {{']
+    lines = [f'{header}{keyword} {decl.emitted_name} {{']
     for m in decl.members:
         quals = ''.join(f'{q} ' for q in m.qualifiers)
         lines.append(f'    {quals}{m.type_name} {m.name}{m.array};')
@@ -438,10 +464,10 @@ class InterfaceTable:
     def add(self, decl: InterfaceDecl) -> None:
         if (existing := self._decls.get(decl.name)) is not None:
             def hint(d: InterfaceDecl) -> str:
-                # a shorthand-derived name never appears literally in its own
-                # source line, so name the member it came from or the error
-                # points at a symbol the author can't find
-                return f" (derived from [buffer] member '{d.source_member}')" if d.source_member else ''
+                # this handle is a [buffer] shorthand's member name (or its name='...'
+                # override), not a block declaration the author can grep the emitted
+                # GLSL for -- name the member so the duplicate is easy to find
+                return f" (the [buffer] shorthand handle for member '{d.source_member}')" if d.source_member else ''
             raise TlangAttributeError(
                 f"interface '{decl.name}' is declared twice in this module "
                 f"(first at {existing.location}{hint(existing)}, again at {decl.location}{hint(decl)})",

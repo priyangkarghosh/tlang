@@ -44,8 +44,10 @@ class Pipeline:
         self._uniform_cache: dict[str, Any] = {}
         self._binding_cache: dict[str, int] = {}
         self._ubo_cache: dict[str, int] = {}
-        # The binding map BindingRegistry.allocate_artifact decided for the program as a whole,
-        # kept for debugging/diffing; bind_ssbo independently reflects each binding by name.
+        # HANDLE -> binding: the canon BindingRegistry.allocate_artifact decided for the
+        # program as a whole, re-keyed from the emitted GLSL name onto tlang's own handle by
+        # `Shader._to_handles` before this constructor ever runs. `bind_ssbo` resolves against
+        # this first -- see `_resolve_ssbo_binding`.
         self._bindings: dict[str, int] = dict(bindings) if bindings is not None else {}
         # buffer source consulted by `bind()` for any required name not passed explicitly --
         # see the `source` property. `None` means bind() can only resolve explicit kwargs.
@@ -72,7 +74,7 @@ class Pipeline:
     def glo(self) -> int: return self._mglo.glo
 
     @property
-    def bindings(self) -> Mapping[str, int]: return self._bindings # name -> assigned SSBO binding
+    def bindings(self) -> Mapping[str, int]: return self._bindings # handle -> assigned SSBO binding
 
     @property
     def texture_units(self) -> Mapping[str, int]: return self._texture_units # name -> assigned texture unit
@@ -139,10 +141,30 @@ class Pipeline:
         loc = self.bind_ssbo
         for k, v in buffers.items(): loc(k, *v) if isinstance(v, tuple) else loc(k, v)
 
+    def _resolve_ssbo_binding(self, buffer_name: str) -> int:
+        """Resolve `buffer_name`'s GL binding index, preferring the static canon
+        (`self._bindings`, HANDLE-keyed -- see `Kernel._resolve_ssbo_binding`, which this
+        mirrors) over driver reflection. Reflection alone is not enough here: for a [buffer]
+        single-declarator shorthand block, the handle is never the name the driver reflects
+        under (that's the synthesised emitted block name -- see `InterfaceDecl.emitted_name`),
+        so a name absent from the canon falls back to reflection only for a block tlang's own
+        canon doesn't know about at all. Raises `TlangBindingError` if `buffer_name` isn't a
+        real storage block by either source -- that's a typo.
+        """
+        if (binding := self._bindings.get(buffer_name)) is not None:
+            return binding
+        if (binding := self._binding_cache.get(buffer_name)) is not None:
+            return binding
+        block = self._mglo.get(buffer_name, None)
+        if not isinstance(block, StorageBlock):
+            raise TlangBindingError(f"'{buffer_name}' is not a valid buffer block (Missing binding)", SourceLocation(module=self._name))
+        self._binding_cache[buffer_name] = binding = block.binding
+        return binding
+
     def bind_ssbo(
         self, buffer_name: str, buffer: Buffer, offset: int = 0, size: int = -1
     ) -> None:
-        """Bind `buffer` to `buffer_name` IMMEDIATELY, unlike `Kernel.bind_ssbo`.
+        """Bind `buffer` to `buffer_name` (a HANDLE) IMMEDIATELY, unlike `Kernel.bind_ssbo`.
 
         `Kernel` can defer its binds because every dispatch entry point re-asserts the kernel's
         full recorded set right before running -- there's a hook to do it at. A `Pipeline` has no
@@ -158,11 +180,7 @@ class Pipeline:
         from under it, and tlang currently has no mechanism to detect or prevent that -- only to
         keep kernels honest about it.
         """
-        if (binding := self._binding_cache.get(buffer_name, None)) is None:
-            block = self._mglo.get(buffer_name, None)
-            if not isinstance(block, StorageBlock):
-                raise TlangBindingError(f"'{buffer_name}' is not a valid buffer block (Missing binding)", SourceLocation(module=self._name))
-            self._binding_cache[buffer_name] = binding = block.binding
+        binding = self._resolve_ssbo_binding(buffer_name)
         # offset/size are keyword-only on moderngl <= 5.8.x; positional args raise TypeError there.
         buffer.bind_to_storage_buffer(binding, offset=offset, size=size)
         bump_ssbo_table_generation()

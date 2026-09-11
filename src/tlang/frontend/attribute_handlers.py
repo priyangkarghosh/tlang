@@ -352,7 +352,7 @@ class AttributeHandlers:
         name = args.get('name')
         if name is not None and not name.isidentifier():
             raise TlangAttributeError(
-                f"[buffer(name=...)]: '{name}' is not a valid GLSL block name -- give a valid identifier",
+                f"[buffer(name=...)]: '{name}' is not a valid handle -- give a valid identifier",
                 ctx.attr.location,
             )
         AttributeHandlers._declare_interface(ctx, InterfaceKind.BUFFER, {'layout': args['layout'], 'name': name})
@@ -468,8 +468,9 @@ SPECS: list[AttrSpec] = [
         ),
         handler=AttributeHandlers.buffer,
         summary="Declares an SSBO block from the following struct, or from a single declarator "
-                "('[buffer] vec2 x[];') whose block name is derived by upper-casing the member's "
-                "first character -- override with name='...' when that's wrong.",
+                "('[buffer] vec2 x[];'), which binds by the member's own name -- the emitted "
+                "GLSL block name is synthesised and never binds to anything. Override the "
+                "handle with name='...'.",
         example="[buffer(std430)]\nstruct Particles { vec4 pos[]; };\n[buffer] vec2 ptcPositions[];",
     ),
 

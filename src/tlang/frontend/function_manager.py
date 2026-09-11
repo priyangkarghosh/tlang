@@ -29,6 +29,18 @@ class InterfaceRef(NamedTuple):
     direction: str
     location: SourceLocation
 
+
+@dataclass(frozen=True, slots=True)
+class TopLevelDecl:
+    """One raw (non-`[buffer]`/`[uniforms]`-attribute) top-level declaration --
+    a `const` or a `buffer`/`uniform { ... }` block -- found outside every
+    function body. `ShaderManager` cross-references these by name across a
+    module's include closure the same way it already does for functions."""
+    kind: str    # 'const' | 'buffer' | 'uniform'
+    name: str
+    line: int    # 1-based
+
+
 # matches function declarations with opening brace
 FUNC_PATTERN = re.compile(r'''
     ^[ \t]*                          # leading indent only -- \s* would span into a
@@ -41,6 +53,91 @@ FUNC_PATTERN = re.compile(r'''
 
 # GLSL control-flow keywords, so `else if (cond) {` isn't mistaken for a function header.
 CONTROL_KEYWORDS: frozenset[str] = frozenset({'if', 'for', 'while', 'switch', 'else', 'do'})
+
+# raw `buffer Name { ... }` / `uniform Name { ... }` blocks -- anchored on the required
+# keyword literal so this never regresses build time the way an unanchored pattern did.
+# `[buffer(std430)]`/`[uniforms(...)]` attribute markers never match: those are followed
+# by '(', not a name then '{'.
+_BLOCK_RE = re.compile(r'\b(buffer|uniform)\s+([A-Za-z_]\w*)\s*\{')
+
+# start of a top-level `const` statement; the statement's end is found separately by
+# scanning forward for a bracket-depth-zero ';' (`_stmt_end`), since a const initializer
+# can itself contain '(', '[' or '{' (e.g. `float[](0.0, 1.0)`).
+_CONST_RE = re.compile(r'\bconst\b')
+
+# qualifiers recognised on a function parameter; anything else in the leading word run is
+# treated as (part of) the parameter's type, not a qualifier.
+_PARAM_QUALIFIER_WORDS = frozenset({
+    'in', 'out', 'inout', 'const', 'highp', 'mediump', 'lowp',
+    'precise', 'coherent', 'volatile', 'restrict', 'readonly', 'writeonly', 'patch',
+})
+
+
+def _split_top_level(s: str, sep: str) -> list[str]:
+    """Split `s` on `sep` at bracket-depth zero only, so a nested `(...)`/`[...]`/`{...}`
+    -- a default-array initializer, a function call inside a const expression -- never
+    gets split on its own internal separators."""
+    parts, depth, start = [], 0, 0
+    for i, c in enumerate(s):
+        if c in '([{': depth += 1
+        elif c in ')]}': depth -= 1
+        elif c == sep and depth == 0:
+            parts.append(s[start:i])
+            start = i + 1
+    parts.append(s[start:])
+    return parts
+
+
+def _stmt_end(mask: str, start: int) -> int | None:
+    """Index of the bracket-depth-zero ';' at/after `start`, or None if there isn't one."""
+    depth = 0
+    for i in range(start, len(mask)):
+        c = mask[i]
+        if c in '([{': depth += 1
+        elif c in ')]}': depth -= 1
+        elif c == ';' and depth <= 0: return i
+    return None
+
+
+def param_type_signature(params: str) -> tuple[str, ...] | None:
+    """Normalised parameter *type* list for one function's parameter text -- names and
+    whitespace dropped, so two overloads (different types, legal GLSL) read as different
+    keys while a genuine duplicate (same types, maybe different parameter names) collides.
+
+    tlang has no type system: this is textual, not resolved. Returns None when a
+    parameter's shape can't be read with confidence, so a duplicate-declaration check
+    built on top of this can stay silent rather than guess -- see utils.tlang's three
+    `hash` overloads, the false-positive class this guards against.
+    """
+    params = params.strip()
+    if not params: return ()
+
+    sigs: list[str] = []
+    for part in _split_top_level(params, ','):
+        part = part.strip()
+        if not part: return None
+
+        consumed = 0
+        while (qm := re.match(r'(\w+)\s+', part[consumed:])):
+            if qm.group(1) not in _PARAM_QUALIFIER_WORDS: break
+            consumed += qm.end()
+
+        if not (tm := re.match(r'([A-Za-z_]\w*)', part[consumed:])):
+            return None
+        type_name = tm.group(1)
+        tail = part[consumed + tm.end():].strip()
+
+        array = ''
+        if tail:
+            if (nm := re.match(r'[A-Za-z_]\w*\s*(\[[^\]]*\])?$', tail)):
+                array = nm.group(1) or ''
+            elif (am := re.match(r'(\[[^\]]*\])$', tail)):
+                array = am.group(1)
+            else:
+                return None  # unrecognised shape -- stay quiet rather than guess
+
+        sigs.append(re.sub(r'\s+', '', type_name + array))
+    return tuple(sigs)
 
 @dataclass(eq=False)
 class FunctionDef:
@@ -86,6 +183,10 @@ class FunctionList:
     # [varyings]/[uniforms]/[buffer] declarations for this module only (ShaderManager merges
     # in transitive dependencies).
     interfaces: InterfaceTable = field(default_factory=InterfaceTable)
+
+    # raw (non-attribute) top-level `const`/`buffer`/`uniform` block declarations found
+    # outside every function body, for this module only -- see TopLevelDecl.
+    decls: list[TopLevelDecl] = field(default_factory=list)
 
     def __post_init__(self):
         self.starts: list[int] = [fn.line_start for fn in self.items]
@@ -168,4 +269,44 @@ class FunctionManager:
 
             search_pos = func_end
 
-        return FunctionList(funcs, keyed_funcs)
+        result = FunctionList(funcs, keyed_funcs)
+        result.decls = FunctionManager._extract_top_level_decls(src, mask, result)
+        return result
+
+    @staticmethod
+    def _extract_top_level_decls(src: str, mask: str, funcs: FunctionList) -> list[TopLevelDecl]:
+        """Raw `const`/`buffer`/`uniform` block declarations outside every function body.
+        Runs on the same mask already used for header matching, so a lookalike inside a
+        comment or string never surfaces here either. `funcs.is_within` (built from the
+        function spans just extracted) is what keeps a local inside a function body --
+        e.g. a `const` loop bound, or a parameter's own `const` qualifier -- from being
+        mistaken for a module-scope declaration.
+        """
+        decls: list[TopLevelDecl] = []
+
+        for m in _BLOCK_RE.finditer(mask):
+            line = src[:m.start()].count('\n') + 1
+            if funcs.is_within(line): continue
+            decls.append(TopLevelDecl(kind=m.group(1), name=m.group(2), line=line))
+
+        pos = 0
+        while (m := _CONST_RE.search(mask, pos)):
+            pos = m.end()
+            line = src[:m.start()].count('\n') + 1
+            if funcs.is_within(line): continue
+
+            if (end := _stmt_end(mask, m.end())) is None: continue
+            stmt = mask[m.end():end]
+
+            if not (tm := re.match(r'\s*([A-Za-z_]\w*)\s+', stmt)): continue
+            decl_list_offset = m.end() + tm.end()
+
+            running = 0
+            for part in _split_top_level(stmt[tm.end():], ','):
+                if (nm := re.match(r'\s*([A-Za-z_]\w*)', part)):
+                    name_offset = decl_list_offset + running + nm.start(1)
+                    decl_line = src[:name_offset].count('\n') + 1
+                    decls.append(TopLevelDecl(kind='const', name=nm.group(1), line=decl_line))
+                running += len(part) + 1  # +1 accounts for the comma `_split_top_level` consumed
+
+        return decls

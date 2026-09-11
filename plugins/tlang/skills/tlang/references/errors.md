@@ -138,6 +138,33 @@ demo:5: interface 'PtcPositions' is declared twice in this module (first at demo
 demo:1: [buffer(name=...)]: '123bad' is not a valid GLSL block name -- give a valid identifier
 ```
 
+## Duplicate top-level declaration errors
+
+`ShaderManager` scans every module's merged `[include]` closure for same-named
+top-level functions, `const`s, and raw `buffer`/`uniform` blocks before that text is
+rendered or handed to a driver -- otherwise the collision surfaces only as the driver's
+own redefinition error, at a generated-GLSL line number, naming neither module. All
+duplicates in the tree are collected and reported together. GLSL overloading (same name,
+different parameter types) is legal and is never flagged -- only a same-name **and**
+same-parameter-type function counts as a duplicate.
+
+**Two included modules export the same function with the same parameter types:**
+```
+function 'scale(float)' is declared twice across the include closure (first at a:2, again at b:2)
+```
+
+**Two included modules declare the same `const`:**
+```
+const 'EPSILON' is declared twice across the include closure (first at a:1, again at b:1)
+```
+
+**Two included modules declare a raw `buffer`/`uniform` block with the same name**
+(not the `[buffer]`/`[uniforms]` attribute form -- that's caught separately, and
+earlier, by `InterfaceTable.add` above):
+```
+buffer block 'Config' is declared twice across the include closure (first at a:1, again at b:1)
+```
+
 ## `[program(...)]` errors
 
 **Compute entry point named as a raster stage:**

@@ -19,7 +19,7 @@ from moderngl import Buffer, Context, Program
 from tlang.frontend.function_manager import FunctionDef
 from tlang.runtime.kernel import Kernel
 from tlang.runtime.pipeline import Pipeline
-from tlang.frontend.interface_registry import InterfaceDecl
+from tlang.frontend.interface_registry import InterfaceDecl, InterfaceKind
 from tlang.compiler.shader_processor import ShaderProcessor
 from tlang.shader_source_line import ShaderSourceLine
 from tlang.shader_stages import ShaderStage
@@ -54,6 +54,16 @@ class Shader:
         self._pipelines: dict[str, Pipeline] = {}
         self._sources: dict[str, str] = {}
         self._interfaces: dict[str, InterfaceDecl] = {d.name: d for d in processor.resolved_interfaces}
+        # emitted GLSL block name -> HANDLE (InterfaceDecl.name), for every [buffer] interface.
+        # Identity for a struct-form block or raw GLSL (never in this map at all, so a lookup
+        # miss just falls back to the emitted name itself) -- only the [buffer] single-
+        # declarator shorthand's synthesised block name differs from its handle. `BindingRegistry`
+        # scans emitted GLSL, so its canon comes back keyed by emitted name; every canon handed
+        # to a `Kernel`/`Pipeline` below is re-keyed through `_to_handles` before construction,
+        # so `kernel.bindings`/`bind()`/`bind_ssbo`/`declared_blocks` only ever see handles.
+        self._handle_of: dict[str, str] = {
+            d.emitted_name: d.name for d in processor.resolved_interfaces if d.kind is InterfaceKind.BUFFER
+        }
         self._failures: list[Exception] = []
         self._declared_entries: set[str] = set()
         self._ok = True
@@ -100,14 +110,21 @@ class Shader:
 
     @property
     def declared_blocks(self) -> frozenset[str]:
-        """Every SSBO block name declared anywhere in this module -- the union of every kernel's
-        and pipeline's `bindings`. A tag a caller is about to hand to `BufferPool.alloc_temp`/
-        `persistent_buffer` can be checked against this to catch a typo that would otherwise just
-        create a buffer nothing ever binds."""
+        """Every SSBO block HANDLE declared anywhere in this module -- the union of every
+        kernel's and pipeline's `bindings`. A tag a caller is about to hand to
+        `BufferPool.alloc_temp`/`persistent_buffer` can be checked against this to catch a typo
+        that would otherwise just create a buffer nothing ever binds."""
         names: set[str] = set()
         for kernel in self._kernels.values(): names.update(kernel.bindings)
         for pipeline in self._pipelines.values(): names.update(pipeline.bindings)
         return frozenset(names)
+
+    def _to_handles(self, canon: Mapping[str, int]) -> dict[str, int]:
+        """Re-key an SSBO canon from `BindingRegistry` (keyed by the emitted GLSL block name)
+        onto tlang's own handles, via `self._handle_of` -- see its docstring. A `Kernel`/
+        `Pipeline` must never see the emitted name for a [buffer] shorthand block, only the
+        handle the author actually wrote."""
+        return {self._handle_of.get(emitted, emitted): binding for emitted, binding in canon.items()}
 
     @property
     def buffer_source(self) -> Mapping[str, Buffer] | None:
@@ -299,7 +316,7 @@ class Shader:
                 active_bindings = BindingRegistry.active_atomic_counter_bindings(shader)
                 counter_canon = {n: pos for n, pos in counter_canon.items() if pos[0] in active_bindings}
                 self._kernels[name] = Kernel(
-                    self._ctx, name, shader, bindings=canon,
+                    self._ctx, name, shader, bindings=self._to_handles(canon),
                     texture_units=texture_canon, image_units=image_canon,
                     atomic_counters=counter_canon,
                 )
@@ -351,7 +368,7 @@ class Shader:
                 counter_canon = {n: pos for n, pos in counter_canon.items() if pos[0] in active_bindings}
                 self._programs[prog_name] = program
                 self._pipelines[prog_name] = Pipeline(
-                    self._ctx, prog_name, program, bindings=canon,
+                    self._ctx, prog_name, program, bindings=self._to_handles(canon),
                     texture_units=texture_canon, image_units=image_canon,
                     atomic_counters=counter_canon,
                 )

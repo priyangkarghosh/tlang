@@ -120,11 +120,14 @@ class Kernel:
         # buffer source consulted by `bind()` for any required name not passed explicitly --
         # see the `source` property. `None` means bind() can only resolve explicit kwargs.
         self._buffer_source: Mapping[str, Buffer] | None = None
-        # the name -> binding map `BindingRegistry.allocate_artifact` decided for this kernel
-        # (the artifact's declared/required SSBO blocks, patched into the GLSL text as
-        # `binding = N`). This is the canon: static, driver-independent, and known before the
-        # program ever links. `_resolve_ssbo_binding` below prefers it over reflection, and
-        # `dispatch` treats its keys as the kernel's REQUIRED set (see `_assert_ssbo_bindings`).
+        # HANDLE -> binding map `BindingRegistry.allocate_artifact` decided for this kernel (the
+        # artifact's declared/required SSBO blocks, patched into the GLSL text as `binding = N`),
+        # re-keyed from the emitted GLSL block name onto tlang's own handle by
+        # `Shader._to_handles` before this constructor ever runs -- see `InterfaceDecl.name` vs
+        # `InterfaceDecl.emitted_name`. This is the canon: static, driver-independent, and known
+        # before the program ever links. `_resolve_ssbo_binding` below prefers it over
+        # reflection, and `dispatch` treats its keys as the kernel's REQUIRED set (see
+        # `_assert_ssbo_bindings`).
         self._bindings: dict[str, int] = dict(bindings) if bindings is not None else {}
 
         # name -> (buffer, offset, size) recorded by `bind_ssbo`/`bind_ssbos`/`bind`, NOT yet
@@ -186,7 +189,7 @@ class Kernel:
     def glo(self) -> int: return self._mglo.glo # gl object
 
     @property
-    def bindings(self) -> Mapping[str, int]: return self._bindings # name -> assigned SSBO binding
+    def bindings(self) -> Mapping[str, int]: return self._bindings # handle -> assigned SSBO binding
 
     @property
     def texture_units(self) -> Mapping[str, int]: return self._texture_units # name -> assigned texture unit

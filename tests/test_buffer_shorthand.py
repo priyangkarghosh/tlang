@@ -1,11 +1,14 @@
 # -------------------------------------------------------------
 # @file          test_buffer_shorthand.py
 # @description   Tests for the [buffer] single-declarator shorthand:
-#                `[buffer] Type name[];` desugars to the equivalent
-#                `[buffer(std430)] struct Name { Type name[]; };`, with
-#                the block name derived from the member (or overridden
-#                via name='...'). GL-free except the one @pytest.mark.gl
-#                test that proves the derived name is what Python binds by.
+#                `[buffer] Type name[];` desugars to a block whose HANDLE
+#                (what Python binds by -- kernel.bindings, bind(),
+#                bind_ssbo, BufferPool tags) is the member's own name (or
+#                a name='...' override), while the emitted GLSL block name
+#                is synthesised, distinct from the handle, and never binds
+#                to anything -- see interface_registry._synthesize_block_name.
+#                GL-free except the two @pytest.mark.gl tests that prove the
+#                handle is what Python actually binds by.
 # -------------------------------------------------------------
 
 import struct
@@ -26,21 +29,68 @@ def _text(proc: ShaderProcessor) -> str:
 
 
 # ---------------------------------------------------------------------------
-# the shorthand emits the same GLSL as the equivalent struct form -- on its
-# own line (`[buffer]\nvec2 x[];`) AND on the attribute's own line
-# (`[buffer] vec2 x[];`), which is the form the feature was actually
-# requested in. Both must produce identical output.
+# the handle is the member's own name -- never derived, never capitalised.
+# The emitted GLSL block name is a different, synthesised identifier: GLSL
+# requires a block's own name to differ from its member's, so the shorthand
+# can't legally emit `buffer ptcPositions { vec2 ptcPositions[]; }`.
 # ---------------------------------------------------------------------------
 
-def test_shorthand_emits_same_glsl_as_struct_form():
-    shorthand = _processor('demo', "[buffer]\nvec2 ptcPositions[];\n")
-    struct_form = _processor('demo', "[buffer(std430)]\nstruct PtcPositions { vec2 ptcPositions[]; };\n")
-    assert _text(shorthand) == _text(struct_form)
-    assert 'layout(std430) buffer PtcPositions {' in _text(shorthand)
-    assert 'vec2 ptcPositions[];' in _text(shorthand)
+def test_shorthand_handle_is_the_member_name():
+    proc = _processor('demo', "[buffer]\nvec2 ptcPositions[];\n")
+    decl = proc.interfaces.resolve('ptcPositions', None, proc.diagnostics)
+    assert decl.name == 'ptcPositions'
+    assert decl.members[0].name == 'ptcPositions'
+    assert 'PtcPositions' not in proc.interfaces
 
 
-def test_same_line_shorthand_emits_same_glsl_as_two_line_shorthand():
+def test_shorthand_emitted_block_name_is_not_the_member_name():
+    proc = _processor('demo', "[buffer]\nvec2 ptcPositions[];\n")
+    text = _text(proc)
+    decl = proc.interfaces.resolve('ptcPositions', None, proc.diagnostics)
+    # the illegal, member-shadowing form must never be emitted
+    assert 'buffer ptcPositions {' not in text
+    # the synthesised block name is distinct, and the member line is untouched
+    assert decl.emitted_name != decl.name
+    assert f'buffer {decl.emitted_name} {{' in text
+    assert 'vec2 ptcPositions[];' in text
+
+
+def test_shorthand_emitted_block_name_is_deterministic_across_two_builds():
+    src = "[buffer]\nvec2 ptcPositions[];\n"
+    first_proc = _processor('demo', src)
+    second_proc = _processor('demo', src)
+    first = first_proc.interfaces.resolve('ptcPositions', None, first_proc.diagnostics)
+    second = second_proc.interfaces.resolve('ptcPositions', None, second_proc.diagnostics)
+    assert first.emitted_name == second.emitted_name == 'ptcPositions__blk'
+
+
+def test_struct_form_emitted_name_equals_its_handle():
+    """The struct form is unchanged: the author names the block, so that name is both
+    the handle and the emitted GLSL identifier -- no synthesis happens here."""
+    proc = _processor('demo', "[buffer(std430)]\nstruct Particles { vec4 pos[]; };\n")
+    decl = proc.interfaces.resolve('Particles', None, proc.diagnostics)
+    assert decl.emitted_name == decl.name == 'Particles'
+
+
+def test_raw_glsl_buffer_block_is_untouched_by_the_interface_registry():
+    """Raw GLSL (`layout(std430) buffer X { ... };`, written directly, with no
+    [buffer(...)] attribute at all) never enters the interface table -- it passes
+    through verbatim, so its written name is unconditionally both what the driver
+    sees and what Python binds by. See test_gl_shader_build.py's BufA/Pinned/
+    AutoAssigned for the GL-level proof that `kernel.bindings` keys by it unchanged."""
+    proc = _processor('demo', "layout(std430) buffer RawBlock { uint data[]; };\nuniform float pad;\n")
+    assert 'RawBlock' not in proc.interfaces
+    assert 'layout(std430) buffer RawBlock {' in _text(proc)
+
+
+# ---------------------------------------------------------------------------
+# the shorthand emits its member exactly like the struct form would -- on its
+# own line (`[buffer]\nvec2 x[];`) AND on the attribute's own line
+# (`[buffer] vec2 x[];`), which is the form the feature was actually
+# requested in. Both must produce an identical member line and handle.
+# ---------------------------------------------------------------------------
+
+def test_same_line_shorthand_emits_same_member_line_as_two_line_shorthand():
     """Same desugared block either way -- the two-line form additionally
     leaves behind its usual '//<<ATTR ...>>//' marker comment on the
     attribute's own (now-separate) line, which the same-line form has no
@@ -48,43 +98,48 @@ def test_same_line_shorthand_emits_same_glsl_as_two_line_shorthand():
     full text verbatim."""
     same_line = _text(_processor('demo', "[buffer] vec2 ptcPositions[];\n"))
     two_line = _text(_processor('demo', "[buffer]\nvec2 ptcPositions[];\n"))
-    block = 'layout(std430) buffer PtcPositions {\n    vec2 ptcPositions[];\n};'
+    block = 'layout(std430) buffer ptcPositions__blk {\n    vec2 ptcPositions[];\n};'
     assert block in same_line
     assert block in two_line
 
 
-def test_same_line_name_derivation():
+def test_same_line_handle_is_member_name():
     proc = _processor('demo', "[buffer] vec4 grid[];\n")
-    decl = proc.interfaces.resolve('Grid', None, proc.diagnostics)
+    decl = proc.interfaces.resolve('grid', None, proc.diagnostics)
     assert decl.members[0].name == 'grid'
     assert decl.source_member == 'grid'
+    assert 'Grid' not in proc.interfaces
 
 
 def test_same_line_name_override():
     proc = _processor('demo', "[buffer(name='ElementCount')] uint numElements;\n")
     decl = proc.interfaces.resolve('ElementCount', None, proc.diagnostics)
     assert decl.members[0].name == 'numElements'
+    assert 'numElements' not in proc.interfaces
 
 
 def test_same_line_std140():
     proc = _processor('demo', "[buffer(std140)] ComputeDispatch dispatch[];\n")
     text = _text(proc)
-    assert 'layout(std140) buffer Dispatch {' in text
+    assert 'layout(std140) buffer dispatch__blk {' in text
     assert 'ComputeDispatch dispatch[];' in text
+    assert 'dispatch' in proc.interfaces
 
 
 def test_same_line_sized_array():
     proc = _processor('demo', "[buffer] vec4 x[16];\n")
     text = _text(proc)
-    assert 'layout(std430) buffer X {' in text
+    assert 'layout(std430) buffer x__blk {' in text
     assert 'vec4 x[16];' in text
+    assert 'x' in proc.interfaces
 
 
 def test_same_line_scalar():
     proc = _processor('demo', "[buffer] uint numElements;\n")
     text = _text(proc)
-    assert 'layout(std430) buffer NumElements {' in text
+    assert 'layout(std430) buffer numElements__blk {' in text
     assert 'uint numElements;' in text
+    assert 'numElements' in proc.interfaces
 
 
 def test_two_consecutive_same_line_declarations_do_not_bleed_into_each_other():
@@ -94,35 +149,36 @@ def test_two_consecutive_same_line_declarations_do_not_bleed_into_each_other():
     block, corrupting the line and letting the parse run on into the next
     physical line's attribute text."""
     proc = _processor('demo', "[buffer] uint data[];\n[buffer] vec2 pos[];\n")
-    assert {'Data', 'Pos'} == {d.name for d in proc.interfaces}
-    data = proc.interfaces.resolve('Data', None, proc.diagnostics)
-    pos = proc.interfaces.resolve('Pos', None, proc.diagnostics)
+    assert {'data', 'pos'} == {d.name for d in proc.interfaces}
+    data = proc.interfaces.resolve('data', None, proc.diagnostics)
+    pos = proc.interfaces.resolve('pos', None, proc.diagnostics)
     assert data.members[0].name == 'data' and data.members[0].array == '[]'
     assert pos.members[0].name == 'pos' and pos.members[0].array == '[]'
     text = _text(proc)
-    assert 'layout(std430) buffer Data {' in text
-    assert 'layout(std430) buffer Pos {' in text
+    assert 'layout(std430) buffer data__blk {' in text
+    assert 'layout(std430) buffer pos__blk {' in text
     assert 'uint data[];' in text
     assert 'vec2 pos[];' in text
 
 
-def test_same_line_duplicate_block_name_error_has_correct_line_and_names_member():
+def test_same_line_duplicate_handle_error_has_correct_line_and_names_member():
     """The same-line declarator's own errors must point at the physical
-    line it's actually written on, not line 1 of some internal buffer."""
+    line it's actually written on, not line 1 of some internal buffer.
+    The collision here is between the shorthand's handle ('ptcPositions',
+    the member's own name) and a struct form explicitly named the same."""
     src = (
         "uniform float pad1;\n"
         "uniform float pad2;\n"
         "[buffer] vec2 ptcPositions[];\n"
         "[buffer(std430)]\n"
-        "struct PtcPositions { vec4 other[]; };\n"
+        "struct ptcPositions { vec4 other[]; };\n"
     )
     with pytest.raises(TlangAttributeError) as exc_info:
         _processor('demo', src)
     msg = str(exc_info.value)
     assert 'demo:3' in msg  # the same-line shorthand's real line
-    assert 'PtcPositions' in msg
-    assert 'ptcPositions' in msg
-    assert 'derived from' in msg
+    assert "'ptcPositions'" in msg
+    assert 'shorthand' in msg
 
 
 def test_same_line_multiple_declarators_rejected_with_correct_line():
@@ -193,36 +249,53 @@ def test_multiline_struct_after_buffer_attribute_still_works():
 
 
 # ---------------------------------------------------------------------------
-# name derivation: upper-case the member's first character
+# the handle is the member's own name, unchanged -- no case transformation,
+# no derivation step at all
 # ---------------------------------------------------------------------------
 
-def test_name_derivation_lowercase_member():
+def test_handle_is_member_name_lowercase():
     proc = _processor('demo', "[buffer]\nvec4 grid[];\n")
-    assert 'Grid' in proc.interfaces
-    decl = proc.interfaces.resolve('Grid', None, proc.diagnostics)
+    assert 'grid' in proc.interfaces
+    assert 'Grid' not in proc.interfaces
+    decl = proc.interfaces.resolve('grid', None, proc.diagnostics)
     assert decl.kind is InterfaceKind.BUFFER
     assert decl.members[0].name == 'grid'
     assert decl.source_member == 'grid'
+    assert decl.emitted_name == 'grid__blk'
 
 
-def test_name_derivation_camel_case_member():
+def test_handle_is_member_name_camel_case():
     proc = _processor('demo', "[buffer]\nvec2 ptcPositions[];\n")
-    assert 'PtcPositions' in proc.interfaces
-    decl = proc.interfaces.resolve('PtcPositions', None, proc.diagnostics)
+    assert 'ptcPositions' in proc.interfaces
+    assert 'PtcPositions' not in proc.interfaces
+    decl = proc.interfaces.resolve('ptcPositions', None, proc.diagnostics)
     assert decl.members[0].name == 'ptcPositions'
 
 
 # ---------------------------------------------------------------------------
-# name= override
+# name= override: makes the given name the HANDLE. No longer mandatory to
+# defeat a capitalisation collision (there is none any more) -- it's purely
+# for when a different Python-side name than the member's own is wanted.
 # ---------------------------------------------------------------------------
 
 def test_name_override_via_name_kwarg():
     proc = _processor('demo', "[buffer(name='ElementCount')]\nuint numElements;\n")
     assert 'ElementCount' in proc.interfaces
-    assert 'NumElements' not in proc.interfaces
+    assert 'numElements' not in proc.interfaces
     decl = proc.interfaces.resolve('ElementCount', None, proc.diagnostics)
     assert decl.members[0].name == 'numElements'
     assert decl.source_member == 'numElements'
+
+
+def test_name_override_block_name_is_still_synthesized_from_the_member():
+    """The emitted GLSL block name is always synthesised from the member, regardless
+    of a name='...' override -- the override only ever changes the Python-side handle."""
+    proc = _processor('demo', "[buffer(name='ElementCount')]\nuint numElements;\n")
+    decl = proc.interfaces.resolve('ElementCount', None, proc.diagnostics)
+    assert decl.emitted_name == 'numElements__blk'
+    text = _text(proc)
+    assert 'buffer numElements__blk {' in text
+    assert 'ElementCount' not in text  # the handle never appears in emitted GLSL
 
 
 def test_invalid_name_override_rejected():
@@ -237,23 +310,23 @@ def test_name_override_with_a_space_is_rejected():
     assert 'not valid' in str(exc_info.value)
 
 
-def test_empty_name_override_falls_back_to_derivation():
+def test_empty_name_override_falls_back_to_member_name():
     """`name=''` is indistinguishable from omitting the argument -- the
     attribute-string parser drops empty values before they ever reach a
-    Param -- so it must fall back to the derived name rather than silently
-    binding an empty block name."""
+    Param -- so it must fall back to the member's own name rather than
+    silently binding an empty handle."""
     proc = _processor('demo', "[buffer(name='')]\nuint numElements;\n")
-    assert 'NumElements' in proc.interfaces
+    assert 'numElements' in proc.interfaces
     assert '' not in proc.interfaces
 
 
-def test_registry_level_guard_rejects_an_explicit_empty_block_name():
+def test_registry_level_guard_rejects_an_explicit_empty_handle_override():
     """Defense in depth at the `interface_registry` layer itself, for any
     caller that supplies `block_name=''` directly (not reachable through
     `[buffer(name='')]`, which the attribute parser normalises away above)."""
     with pytest.raises(TlangAttributeError) as exc_info:
         parse_declarator_at("uint n;", 0, 'demo', InterfaceKind.BUFFER, layout='std430', block_name='')
-    assert 'not a valid block name' in str(exc_info.value)
+    assert 'not a valid handle' in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +336,7 @@ def test_registry_level_guard_rejects_an_explicit_empty_block_name():
 def test_std140_shorthand():
     proc = _processor('demo', "[buffer(std140)]\nComputeDispatch dispatch[];\n")
     text = _text(proc)
-    assert 'layout(std140) buffer Dispatch {' in text
+    assert 'layout(std140) buffer dispatch__blk {' in text
     assert 'ComputeDispatch dispatch[];' in text
 
 
@@ -275,14 +348,14 @@ def test_std140_shorthand():
 def test_sized_array_shorthand():
     proc = _processor('demo', "[buffer]\nvec4 x[16];\n")
     text = _text(proc)
-    assert 'layout(std430) buffer X {' in text
+    assert 'layout(std430) buffer x__blk {' in text
     assert 'vec4 x[16];' in text
 
 
 def test_scalar_shorthand():
     proc = _processor('demo', "[buffer]\nuint numElements;\n")
     text = _text(proc)
-    assert 'layout(std430) buffer NumElements {' in text
+    assert 'layout(std430) buffer numElements__blk {' in text
     assert 'uint numElements;' in text
 
 
@@ -336,30 +409,33 @@ def test_constant_sized_array_shorthand():
     proc = _processor('demo', "[buffer]\nvec4 x[{{ N }}];\n")
     text = _text(proc)
     assert 'vec4 x[{{ N }}];' in text
-    assert 'layout(std430) buffer X {' in text
+    assert 'layout(std430) buffer x__blk {' in text
 
 
 # ---------------------------------------------------------------------------
-# duplicate-block-name diagnostic: must name both the derived block name
-# and the member it came from, since the block name never appears
-# literally in the shorthand's own source line
+# a shorthand's handle colliding with another module's handle across
+# [include(...)] must still report a usable error naming both locations --
+# reflection-driven binding would otherwise just silently misassign
 # ---------------------------------------------------------------------------
 
-def test_duplicate_block_name_error_names_derived_name_and_member():
-    src = (
-        "[buffer]\nvec2 ptcPositions[];\n\n"
-        "[buffer(std430)]\nstruct PtcPositions { vec4 other[]; };\n"
-    )
+def test_shorthand_handle_colliding_with_an_included_modules_handle_reports_a_usable_error(make_shader_dir):
+    d = make_shader_dir({
+        'base.tlang': "[buffer(std430)]\nstruct ptcPositions { vec4 other[]; };\n",
+        'demo.tlang': "[include(base)]\n[buffer] vec2 ptcPositions[];\n",
+    })
+    from tlang import ShaderManager
+
     with pytest.raises(TlangAttributeError) as exc_info:
-        _processor('demo', src)
+        ShaderManager(ctx=None, version='430 core', dir=str(d), strict=True)
     msg = str(exc_info.value)
-    assert 'PtcPositions' in msg
     assert 'ptcPositions' in msg
-    assert 'derived from' in msg
+    assert 'base' in msg
+    assert 'demo' in msg
 
 
 # ---------------------------------------------------------------------------
-# GL: proves the derived name is what Python actually binds by
+# GL: proves the handle -- not any derived/synthesised name -- is what
+# Python actually binds by, end to end through a real dispatch
 # ---------------------------------------------------------------------------
 
 BUFFER_SHORTHAND_SRC = """\
@@ -375,7 +451,7 @@ void cs_go() {{
 
 
 @pytest.mark.gl
-def test_gl_shorthand_buffer_binds_by_derived_name_and_dispatches(gl_ctx, make_shader_dir):
+def test_gl_shorthand_buffer_binds_by_handle_and_dispatches(gl_ctx, make_shader_dir):
     d = make_shader_dir({'demo.tlang': BUFFER_SHORTHAND_SRC.format()})
     from tlang import ShaderManager
 
@@ -383,10 +459,11 @@ def test_gl_shorthand_buffer_binds_by_derived_name_and_dispatches(gl_ctx, make_s
     sh = sm.get_shader('demo')
     kernel = sh.get_kernel('cs_go')
 
-    assert 'Values' in kernel.bindings
+    assert 'values' in kernel.bindings
+    assert 'Values' not in kernel.bindings
 
     data = gl_ctx.buffer(struct.pack('f', 21.0))
-    kernel.bind_ssbo('Values', data)
+    kernel.bind_ssbo('values', data)
     kernel.dispatch(1, 1, 1)
 
     (result,) = struct.unpack('f', data.read())
@@ -407,10 +484,10 @@ void cs_go() {{
 
 
 @pytest.mark.gl
-def test_gl_same_line_shorthand_buffer_binds_by_derived_name_and_dispatches(gl_ctx, make_shader_dir):
+def test_gl_same_line_shorthand_buffer_binds_by_handle_and_dispatches(gl_ctx, make_shader_dir):
     """The syntax the feature was actually requested in --
     `[buffer] float values[];` on one line -- must also build, bind by the
-    derived name, dispatch, and read back correctly."""
+    handle, dispatch, and read back correctly."""
     d = make_shader_dir({'demo.tlang': SAME_LINE_BUFFER_SHORTHAND_SRC.format()})
     from tlang import ShaderManager
 
@@ -418,10 +495,11 @@ def test_gl_same_line_shorthand_buffer_binds_by_derived_name_and_dispatches(gl_c
     sh = sm.get_shader('demo')
     kernel = sh.get_kernel('cs_go')
 
-    assert 'Values' in kernel.bindings
+    assert 'values' in kernel.bindings
+    assert 'Values' not in kernel.bindings
 
     data = gl_ctx.buffer(struct.pack('f', 21.0))
-    kernel.bind_ssbo('Values', data)
+    kernel.bind_ssbo('values', data)
     kernel.dispatch(1, 1, 1)
 
     (result,) = struct.unpack('f', data.read())

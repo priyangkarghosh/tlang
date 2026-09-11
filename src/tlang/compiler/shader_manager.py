@@ -19,6 +19,7 @@ from typing import Mapping
 from moderngl import Buffer, Context
 from tlang.compiler.dependency_manager import DependencyManager
 from tlang.errors import SourceLocation, TlangAttributeError, TlangBuildError, TlangDependencyError
+from tlang.frontend.function_manager import param_type_signature
 from tlang.frontend.interface_registry import InterfaceDecl, InterfaceTable
 from tlang.compiler.shader import Shader
 from tlang.compiler.shader_processor import ShaderProcessor
@@ -28,6 +29,74 @@ def _lookup(table: InterfaceTable, name: str) -> InterfaceDecl | None:
     for decl in table:
         if decl.name == name: return decl
     return None
+
+
+def _check_duplicate_declarations(
+    processors: dict[str, ShaderProcessor], dm: DependencyManager, strict: bool,
+) -> None:
+    """Same-named top-level declarations -- plain exported functions, `const`s, raw
+    `buffer`/`uniform` blocks -- collide the instant two included modules' text lands in
+    the same translation unit; the driver reports that as a redefinition at a
+    generated-GLSL line number, not in tlang's own terms. This runs over each module's
+    MERGED include closure, before any of that text is rendered or handed to a driver.
+
+    Only a plain (no [shader(...)] stage) *exported* function can actually appear in a
+    dependent's merged module text (see `ShaderProcessor._create_module` / T15) -- a
+    non-exported helper never leaves its own file, so it can't collide with anything
+    outside it. A `const`/raw block, by contrast, is always part of that shared text.
+
+    GLSL overloading (same name, different parameter types) is legal and used for real
+    (utils.tlang's three `hash` overloads) -- see `param_type_signature`'s own docstring
+    for why an unreadable signature is skipped rather than guessed at.
+
+    `dm.resolve_dependencies` already dedupes a module's transitive closure with a
+    visited set, so a diamond include graph lists each shared dependency once; nothing
+    here needs to guard against comparing a module's declarations against themselves.
+
+    Collects every duplicate across the whole tree before raising/logging once, so one
+    collision never hides the rest -- consistent with `ShaderProcessor._process_global_attrs`.
+    """
+    problems: list[str] = []
+    reported: set[tuple] = set()
+
+    def _report(kind: str, ident: str, loc_a: SourceLocation, loc_b: SourceLocation) -> None:
+        a, b = sorted((loc_a, loc_b), key=lambda l: (l.module or '', l.line or 0))
+        key = (kind, ident, a.module, a.line, b.module, b.line)
+        if key in reported: return
+        reported.add(key)
+        problems.append(f"{kind} '{ident}' is declared twice across the include closure (first at {a}, again at {b})")
+
+    for name in processors:
+        funcs_seen: dict[tuple[str, tuple[str, ...]], SourceLocation] = {}
+        consts_seen: dict[str, SourceLocation] = {}
+        blocks_seen: dict[str, SourceLocation] = {}
+
+        for dep in dm.resolve_dependencies(name):
+            process = processors[dep]
+
+            for fn in process.funcs.items:
+                if fn.stage is not None or not fn.exported: continue
+                if (sig := param_type_signature(fn.params)) is None: continue  # unreadable -- stay quiet
+                key = (fn.name, sig)
+                loc = SourceLocation(dep, fn.line_start)
+                if (prev := funcs_seen.get(key)) is not None:
+                    _report('function', f"{fn.name}({', '.join(sig)})", prev, loc)
+                else:
+                    funcs_seen[key] = loc
+
+            for decl in process.funcs.decls:
+                seen = consts_seen if decl.kind == 'const' else blocks_seen
+                label = 'const' if decl.kind == 'const' else f'{decl.kind} block'
+                loc = SourceLocation(dep, decl.line)
+                if (prev := seen.get(decl.name)) is not None:
+                    _report(label, decl.name, prev, loc)
+                else:
+                    seen[decl.name] = loc
+
+    if problems:
+        message = '\n'.join(problems)
+        if strict: raise TlangAttributeError(message)
+        for line in problems: logger.warning("%s (continuing: strict=False)", line)
 
 
 FILE_EXT = '.tlang'
@@ -95,6 +164,11 @@ class ShaderManager:
             message = '\n'.join(iface_problems)
             if self._strict: raise TlangAttributeError(message)
             for line in iface_problems: logger.warning("%s (continuing: strict=False)", line)
+
+        # Same-named top-level functions/consts/raw buffer-uniform blocks across a module's
+        # merged include closure -- a plain GLSL redefinition, not an interface conflict --
+        # also has to be caught before this text is rendered or handed to a driver.
+        _check_duplicate_declarations(processors, dm, self._strict)
 
         # `dm.build_all()` only renders module-scope text; function bodies were already popped
         # out into `FunctionDef.line_body`/`.config` and never see that substitution, so patch

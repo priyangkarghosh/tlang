@@ -42,30 +42,53 @@ until a stage brings it in with `[uses(...)]`.
 ## `[buffer]` single-declarator shorthand
 
 The overwhelming majority of real SSBO blocks are one member — usually a single unsized
-array. Writing the block's name twice (once as the struct name, once as the member) for
-that case is pure ceremony, so `[buffer]` also accepts a single declarator directly,
-in place of the struct:
+array. GLSL requires a block's own name to differ from its member's (`buffer ptcPositions
+{ vec2 ptcPositions[]; }` fails to compile: `undefined variable "ptcPositions"`, the block
+name shadows the member), so writing the block out by hand means inventing a second name
+purely to satisfy the compiler. `[buffer]` closes that gap: it also accepts a single
+declarator directly, in place of the struct, and the block name that GLSL requires becomes
+tlang's business, not yours:
 
 ```glsl
-[buffer]              vec2 ptcPositions[];   // => layout(std430) buffer PtcPositions { vec2 ptcPositions[]; };
+[buffer]              vec2 ptcPositions[];   // -> kernel.bind(ptcPositions=buf)
 [buffer(std140)]      ComputeDispatch dispatch[];
 [buffer(name='ElementCount')] uint numElements;
 ```
 
 Both forms work — the declarator on its own line right after `[buffer]` (mirroring the
 struct form), or sharing the attribute's own line, `[buffer] vec2 ptcPositions[];`, which
-is the natural way to write it. Either way it desugars to exactly the struct form would:
-`layout(std430) buffer PtcPositions { vec2 ptcPositions[]; };`.
+is the natural way to write it.
 
-**Block name derivation:** the block name is the member's name with its first character
-upper-cased — `ptcPositions` -> `PtcPositions`, `grid` -> `Grid`, `dispatch` -> `Dispatch`.
-This is right most of the time, but not always (`ElementCount { uint numElements; }` would
-derive to `NumElements`), so `[buffer(name='...')]` overrides it — as a keyword, since
-positional arg 0 is `layout` (`[buffer(std430)]`):
+**The name you write is the name you bind by — nothing else.** Every declaration form has
+exactly one name that is both the Python-side handle (what `kernel.bindings`/`bind()`/
+`bind_ssbo()`/`BufferPool` tags key by) and the emitted GLSL identifier, *except* this one
+shorthand, where the member's name can't also be the block's:
+
+| form | handle (what Python binds by) | emitted block name |
+|---|---|---|
+| `[buffer] vec2 ptcPositions[];` | `ptcPositions` (the member) | synthesised |
+| `[buffer] struct Config { uint a; uint b; };` | `Config` (the struct name) | `Config` |
+| `layout(std430) buffer X { ... };` (raw GLSL) | `X` | `X` |
+
+For the shorthand, the handle is the member's own name, unchanged — `ptcPositions` stays
+`ptcPositions`, never `PtcPositions`. The block GLSL actually needs is synthesised
+deterministically from the member name (`ptcPositions` -> `ptcPositions__blk`) so builds
+are reproducible, generated-GLSL diffs stay clean, and a driver error mentioning the block
+is still greppable back to its source. That synthesised name is purely a GLSL-legality
+artifact: it never appears on the Python side, and nothing ever binds by it.
+
+`[buffer(name='...')]` overrides the *handle* — as a keyword, since positional arg 0 is
+`layout` (`[buffer(std430)]`):
 
 ```glsl
-[buffer(name='ElementCount')] uint numElements;
+[buffer(name='ElementCount')] uint numElements;   // handle: 'ElementCount'
 ```
+
+Since the block name is always synthesised now, `name=...` is no longer needed to defeat a
+would-be shadow collision — `ElementCount { uint numElements; }` and `Dispatch {
+ComputeDispatch computeDispatch[]; }` need no override at all, `numElements`/
+`computeDispatch` bind by their own names. Reach for `name=...` only when you actually want
+a different Python-side handle than the member's name.
 
 **Only `[buffer]`** gets this shorthand — `[varyings]`/`[uniforms]` always take the struct
 form, since a bare varying/uniform declarator has no single obviously-correct desugaring
