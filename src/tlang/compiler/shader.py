@@ -9,13 +9,13 @@
 import logging
 
 from tlang.compiler.binding_registry import BindingRegistry
-from tlang.errors import SourceLocation, TlangAttributeError, TlangBindingError, TlangCompileError, TlangLinkError
+from tlang.errors import SourceLocation, TlangAttributeError, TlangBindingError, TlangCompileError, TlangError, TlangLinkError
 logger = logging.getLogger(__name__)
 
 import time
 from typing import Mapping
 import regex as re
-from moderngl import Context, Program
+from moderngl import Buffer, Context, Program
 from tlang.frontend.function_manager import FunctionDef
 from tlang.runtime.kernel import Kernel
 from tlang.runtime.pipeline import Pipeline
@@ -36,18 +36,18 @@ class Shader:
     def __init__(
         self, ctx: Context, name: str, version: str, module: str, processor: ShaderProcessor,
         pref_rank: dict[str, int] | None = None, strict: bool = True,
-        dep_plain_funcs: dict[str, str] | None = None,
+        dep_plain_funcs: dict[str, str] | None = None, keep_sources: bool = False,
     ) -> None:
         self._ctx = ctx
         self._name = name
         self._version = version
         self._strict = strict  # raise TlangCompileError/TlangLinkError instead of logging and continuing
-
-        # name -> module it's declared in, for every module-scope ([shader]-less) function in
-        # this module's [include] dependency closure (this module itself excluded -- that's
-        # `processor.funcs.items`, checked directly). Used only by the T15 diagnostic below to
-        # tell "genuinely undefined" apart from "defined, just never exported/emitted".
-        self._dep_plain_funcs: dict[str, str] = dep_plain_funcs or {}
+        # False (default): a successfully compiled/linked entry point's generated GLSL is
+        # dropped once its artifact is built and its bindings verified -- nothing downstream
+        # needs the text once the driver has compiled it. A failed entry point's source is
+        # always kept regardless of this flag (see `_build`), since that's exactly when
+        # someone needs to read it.
+        self._keep_sources = keep_sources
 
         self._kernels: dict[str, Kernel] = {}
         self._programs: dict[str, Program] = {}
@@ -55,8 +55,13 @@ class Shader:
         self._sources: dict[str, str] = {}
         self._interfaces: dict[str, InterfaceDecl] = {d.name: d for d in processor.resolved_interfaces}
         self._failures: list[Exception] = []
+        self._declared_entries: set[str] = set()
         self._ok = True
-        self._build(module, processor, pref_rank or {})
+        # buffer source shared by every kernel/pipeline in this module -- see the `source`
+        # property. Kept here (rather than only pushed out) so setting it after construction
+        # still reaches kernels/pipelines built by `_build` below.
+        self._buffer_source: Mapping[str, Buffer] | None = None
+        self._build(module, processor, pref_rank or {}, dep_plain_funcs or {})
 
     @property
     def ok(self) -> bool:
@@ -94,8 +99,34 @@ class Shader:
         return self._interfaces
 
     @property
+    def declared_blocks(self) -> frozenset[str]:
+        """Every SSBO block name declared anywhere in this module -- the union of every kernel's
+        and pipeline's `bindings`. A tag a caller is about to hand to `BufferPool.alloc_temp`/
+        `persistent_buffer` can be checked against this to catch a typo that would otherwise just
+        create a buffer nothing ever binds."""
+        names: set[str] = set()
+        for kernel in self._kernels.values(): names.update(kernel.bindings)
+        for pipeline in self._pipelines.values(): names.update(pipeline.bindings)
+        return frozenset(names)
+
+    @property
+    def buffer_source(self) -> Mapping[str, Buffer] | None:
+        """The buffer source (`Kernel.buffer_source`/`Pipeline.buffer_source`) shared by every kernel and
+        pipeline in this module. Setting it here reaches all of them in one call, rather than
+        setting `.buffer_source` on each individually."""
+        return self._buffer_source
+
+    @buffer_source.setter
+    def buffer_source(self, value: Mapping[str, Buffer] | None) -> None:
+        self._buffer_source = value
+        for kernel in self._kernels.values(): kernel.buffer_source = value
+        for pipeline in self._pipelines.values(): pipeline.buffer_source = value
+
+    @property
     def sources(self) -> dict[str, str]:
-        """Read-only map of entry-point name -> the exact generated GLSL handed to the driver."""
+        """Read-only map of entry-point name -> the exact generated GLSL handed to the driver,
+        for whichever entry points actually retained their source: every one of them under
+        `keep_sources=True`, only the failed ones otherwise."""
         return self._sources
 
     def get_kernel(self, name: str) -> Kernel:
@@ -108,7 +139,18 @@ class Shader:
         return self._pipelines[name]
 
     def get_source(self, name: str) -> str:
-        """The generated GLSL for entry point `name` (compiled successfully or not)."""
+        """The generated GLSL for entry point `name`. Always available for a failed entry
+        point, or for any entry point when this `Shader` was built with `keep_sources=True`;
+        otherwise raises `TlangError` naming `name` -- a successfully compiled entry point's
+        source is dropped by default once nothing needs it anymore."""
+        if name not in self._sources:
+            if name in self._declared_entries:
+                raise TlangError(
+                    f"'{name}': source was not retained (built with keep_sources=False) -- "
+                    f"rebuild the ShaderManager/Shader with keep_sources=True to inspect it.",
+                    SourceLocation(module=self._name),
+                )
+            raise TlangError(f"'{name}' is not a declared entry point of '{self._name}'", SourceLocation(module=self._name))
         return self._sources[name]
 
     @staticmethod
@@ -122,7 +164,9 @@ class Shader:
         ret = r'\s+'.join([re.escape(w) for w in ret_type.split()])
         return re.compile(rf'\b{ret}\s+{re.escape(name)}\s*\(', re.MULTILINE)
 
-    def _raise_missing_export(self, func: FunctionDef, missing: set[str], process: ShaderProcessor) -> None:
+    def _raise_missing_export(
+        self, func: FunctionDef, missing: set[str], process: ShaderProcessor, dep_plain_funcs: dict[str, str],
+    ) -> None:
         """Raises for the first `missing` name (sorted for determinism) that resolves to a
         real module-scope function -- same file or an [include]d one -- so T15's raw driver
         error ("undefined variable") gets a tlang diagnostic naming the fix instead. A name
@@ -148,7 +192,7 @@ class Shader:
                     SourceLocation(self._name, helper.line_start),
                 )
 
-            if (owner := self._dep_plain_funcs.get(name)) is not None:
+            if (owner := dep_plain_funcs.get(name)) is not None:
                 raise TlangAttributeError(
                     f"'{func.name}' calls '{name}', a module-scope function defined in included "
                     f"module '{owner}' but never exported, so it was never emitted into this "
@@ -170,7 +214,10 @@ class Shader:
                 return SourceLocation(m.group('colon_module'), int(m.group('colon_line')))
         return SourceLocation(fallback_module)
 
-    def _build(self, module: str, process: ShaderProcessor, pref_rank: dict[str, int]):
+    def _build(
+        self, module: str, process: ShaderProcessor, pref_rank: dict[str, int],
+        dep_plain_funcs: dict[str, str],
+    ):
         t0 = time.perf_counter()
         logger.info("Starting build for %s...", self._name)
 
@@ -205,7 +252,7 @@ class Shader:
             # sites are gone; a reachable caller's aren't, but the check is cheap enough
             # to just always run here rather than depend on that distinction.
             if (missing := BindingRegistry.find_missing_export_calls(src)):
-                self._raise_missing_export(func, missing, process)
+                self._raise_missing_export(func, missing, process, dep_plain_funcs)
 
             # strip functions unreachable from `main` -- must run before the block DCE below
             # so it only sees blocks text `main` can actually reach.
@@ -216,11 +263,17 @@ class Shader:
 
             stage_of[func.name] = func.stage
             dced[func.name] = src
+            self._declared_entries.add(func.name)
 
             # Provisional, no bindings assigned; overwritten below once an artifact's bindings
-            # are known. A stage used by neither a kernel nor a program keeps this, so
-            # get_source/.sources always has something for every declared entry point.
+            # are known (or retained as-is, for an entry point neither a kernel nor a program
+            # ever attempts). Pruned at the end of `_build` for anything that isn't a failure,
+            # unless `keep_sources` was requested.
             self._sources[func.name] = src
+
+        # Every entry point that hit an exception below -- its source stays in `self._sources`
+        # regardless of `keep_sources`, since a failure is exactly when the text is needed.
+        failed_entries: set[str] = set()
 
         # Pass 2: compute kernels -- each is its own artifact.
         for name, stage in stage_of.items():
@@ -232,14 +285,22 @@ class Shader:
                     self._ctx, name, {ShaderStage.COMP: dced[name]}, pref_rank
                 )
                 src = self._sources[name] = patched[ShaderStage.COMP]
+                texture_canon, image_canon = BindingRegistry.allocate_opaque_units(
+                    self._ctx, name, {ShaderStage.COMP: src}
+                )
 
                 shader = self._ctx.compute_shader(src)
                 BindingRegistry.verify_link(shader, canon, name, uniform_canon)
-                self._kernels[name] = Kernel(self._ctx, name, shader, bindings=canon)
+                BindingRegistry.assign_opaque_units(shader, texture_canon, image_canon)
+                self._kernels[name] = Kernel(
+                    self._ctx, name, shader, bindings=canon,
+                    texture_units=texture_canon, image_units=image_canon,
+                )
 
             except TlangBindingError as e:
                 logger.error(str(e))
                 self._failures.append(e)
+                failed_entries.add(name)
                 if self._strict: raise
 
             except Exception as e:
@@ -250,6 +311,7 @@ class Shader:
                     stage=str(stage), entry_point=name, source=dced[name],
                 )
                 self._failures.append(err)
+                failed_entries.add(name)
                 if self._strict: raise err from e
 
         # Pass 3: programs -- every stage of one [program(...)] is one
@@ -266,6 +328,7 @@ class Shader:
 
                 patched, canon, uniform_canon = BindingRegistry.allocate_artifact(self._ctx, prog_name, stage_srcs, pref_rank)
                 for stage, entry in entries.items(): self._sources[entry] = patched[stage]
+                texture_canon, image_canon = BindingRegistry.allocate_opaque_units(self._ctx, prog_name, patched)
 
                 program = self._ctx.program(
                     vertex_shader=patched.get(ShaderStage.VERT),
@@ -275,12 +338,17 @@ class Shader:
                     tess_evaluation_shader=patched.get(ShaderStage.TESE),
                 )
                 BindingRegistry.verify_link(program, canon, prog_name, uniform_canon)
+                BindingRegistry.assign_opaque_units(program, texture_canon, image_canon)
                 self._programs[prog_name] = program
-                self._pipelines[prog_name] = Pipeline(self._ctx, prog_name, program, bindings=canon)
+                self._pipelines[prog_name] = Pipeline(
+                    self._ctx, prog_name, program, bindings=canon,
+                    texture_units=texture_canon, image_units=image_canon,
+                )
 
             except (TlangLinkError, TlangBindingError) as e:
                 logger.error(str(e))
                 self._failures.append(e)
+                failed_entries.update(fn.name for fn in pdef.stages.values())
                 if self._strict: raise
 
             except Exception as e:
@@ -290,6 +358,7 @@ class Shader:
                     Shader._parse_error_location(str(e), self._name),
                 )
                 self._failures.append(err)
+                failed_entries.update(fn.name for fn in pdef.stages.values())
                 if self._strict: raise err from e
 
         # A declared entry point is "ok" when it produced a kernel (compute) or belongs to a
@@ -308,6 +377,14 @@ class Shader:
             return progs is None or any(p in self._programs for p in progs)
 
         self._ok = all(_entry_ok(name, stage) for name, stage in stage_of.items())
+
+        # Drop every entry point's source that isn't a failure -- a compiled kernel or a
+        # linked program's stage no longer needs its generated GLSL text once the artifact
+        # exists and its bindings are verified. `keep_sources=True` opts out entirely; a
+        # failed entry point (in `failed_entries`) is never dropped either way.
+        if not self._keep_sources:
+            for name in list(self._sources):
+                if name not in failed_entries: del self._sources[name]
 
         t1 = time.perf_counter()
         logger.info(

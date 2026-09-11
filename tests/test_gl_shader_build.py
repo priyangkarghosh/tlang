@@ -108,7 +108,7 @@ def main_shader(gl_ctx, tmp_path_factory):
     (d / 'lib.tlang').write_text(LIB_SRC, encoding='utf-8')
     (d / 'main.tlang').write_text(MAIN_SRC, encoding='utf-8')
 
-    sm = ShaderManager(ctx=gl_ctx, version='430 core', dir=str(d), constants={'BLOCK_SIZE': 4})
+    sm = ShaderManager(ctx=gl_ctx, version='430 core', dir=str(d), constants={'BLOCK_SIZE': 4}, keep_sources=True)
     shader = sm.get_shader('main')
     assert shader is not None
     return shader

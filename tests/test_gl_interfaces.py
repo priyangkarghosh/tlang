@@ -44,7 +44,7 @@ def test_varyings_and_uses_link_a_real_program_with_matching_locations(gl_ctx, m
     d = make_shader_dir({'demo.tlang': VARYINGS_SRC.format()})
     from tlang import ShaderManager
 
-    sm = ShaderManager(ctx=gl_ctx, version='430 core', dir=str(d), strict=True)
+    sm = ShaderManager(ctx=gl_ctx, version='430 core', dir=str(d), strict=True, keep_sources=True)
     sh = sm.get_shader('demo')
     assert sh.get_program('default') is not None
 
@@ -153,7 +153,7 @@ def test_constant_in_emitted_member_array_suffix_is_rendered(gl_ctx, make_shader
     d = make_shader_dir({'demo.tlang': CONST_ARRAY_SRC.format()})
     from tlang import ShaderManager
 
-    sm = ShaderManager(ctx=gl_ctx, version='430 core', dir=str(d), strict=True, constants={'N': 4})
+    sm = ShaderManager(ctx=gl_ctx, version='430 core', dir=str(d), strict=True, constants={'N': 4}, keep_sources=True)
     sh = sm.get_shader('demo')
 
     vs_source = sh.get_source('vs_main')

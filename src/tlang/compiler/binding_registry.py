@@ -9,7 +9,7 @@
 
 import logging
 from collections import defaultdict
-from moderngl import ComputeShader, Context, Program, StorageBlock, UniformBlock
+from moderngl import ComputeShader, Context, Program, StorageBlock, Uniform, UniformBlock
 import regex as re
 
 from tlang.errors import SourceLocation, TlangBindingError
@@ -49,10 +49,15 @@ STAGE_LIMIT_KEYS: dict[str, dict[ShaderStage, str]] = {
 MAX_POOL_KEY: dict[str, str] = {
     'buffer': 'GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS',
     'uniform': 'GL_MAX_UNIFORM_BUFFER_BINDINGS',
+    # texture and image units are their own separate pools too (verified on an RTX 3090 / GL
+    # 4.6 / moderngl 5.12: GL_MAX_TEXTURE_IMAGE_UNITS=32; GL_MAX_IMAGE_UNITS is not reported by
+    # `ctx.info` at all on that driver, so it always takes the fallback path below).
+    'texture': 'GL_MAX_TEXTURE_IMAGE_UNITS',
+    'image': 'GL_MAX_IMAGE_UNITS',
 }
 
 # Short noun used in diagnostics for each pool, e.g. "SSBO block" / "uniform block".
-BLOCK_NOUN: dict[str, str] = {'buffer': 'SSBO', 'uniform': 'uniform'}
+BLOCK_NOUN: dict[str, str] = {'buffer': 'SSBO', 'uniform': 'uniform', 'texture': 'sampler', 'image': 'image'}
 
 # Conservative guess used only when the driver reports no per-stage limit.
 # `_stage_limit` logs whenever it applies, so it is never silent.
@@ -83,6 +88,66 @@ BLOCK_PATTERN: dict[str, re.Pattern] = {
 }
 
 BINDING_PATTERN = re.compile(r"\bbinding\s*=\s*(\d+)\b")
+
+# -----------------------------------------------------------------
+# sampler / image uniform discovery -- same "scan, not new syntax" deal as the block pattern
+# above: raw GLSL (`uniform sampler2D tex;`, `layout(rgba8, binding = N) uniform image2D img;`)
+# keeps working exactly as today. Unlike buffer/uniform blocks, GL reflects both sampler and
+# image uniforms as a plain `Uniform` with a writable `.value` that IS the unit index, so this
+# pool is never patched into the GLSL text -- see `assign_opaque_units`, which assigns purely
+# through post-link reflection instead of `_patch_bindings`.
+# -----------------------------------------------------------------
+
+_OPAQUE_DIMS = ('1D', '2D', '3D', 'Cube', '1DArray', '2DArray', 'CubeArray', '2DMS', '2DMSArray', 'Buffer', '2DRect')
+_SHADOW_DIMS = ('1D', '2D', 'Cube', '1DArray', '2DArray', 'CubeArray', '2DRect')
+
+
+def _type_alternation(*names: str) -> str:
+    # Longest-first is only a minor efficiency nicety here, not a correctness requirement: the
+    # pattern below demands a `\s+` boundary right after the type name, so e.g. "sampler2D"
+    # can never falsely consume the front of "sampler2DArray" and stop there.
+    return '|'.join(sorted(set(names), key=len, reverse=True))
+
+
+SAMPLER_TYPE_ALT = _type_alternation(
+    *(f'{prefix}sampler{dim}' for prefix in ('', 'i', 'u') for dim in _OPAQUE_DIMS),
+    *(f'sampler{dim}Shadow' for dim in _SHADOW_DIMS),
+)
+IMAGE_TYPE_ALT = _type_alternation(
+    *(f'{prefix}image{dim}' for prefix in ('', 'i', 'u') for dim in _OPAQUE_DIMS),
+)
+
+# kind -> alternation of every GLSL opaque type name that pool covers.
+OPAQUE_TYPE_ALT: dict[str, str] = {'texture': SAMPLER_TYPE_ALT, 'image': IMAGE_TYPE_ALT}
+
+
+def _opaque_uniform_pattern(type_alt: str) -> re.Pattern:
+    """Declaration regex for one opaque-uniform pool, capturing (layout args, type, name).
+
+    `layout(...)` is optional (most declarations have none -- every sampler/image defaults to
+    unit 0 until this module assigns one). Memory qualifiers (`readonly`, `coherent`, ...) may
+    appear on either side of `uniform` -- GLSL accepts both orderings for images -- so both are
+    matched, harmlessly permissive for samplers (which never carry one). No block braces here,
+    unlike `_block_layout_pattern`: these are plain statement declarations.
+    """
+    return re.compile(
+        rf"\buniform\s+(?:{BUFFER_QUALIFIER}\s+)*({type_alt})\s+(\w+)\s*(?:\[[^\]]*\])?\s*;",
+        re.MULTILINE,
+    )
+
+
+# An optional `layout(...)` (plus any memory qualifiers) sitting immediately before a
+# declaration. Applied only at the few offsets `OPAQUE_PATTERN` already matched, never
+# scanned across the whole unit: as an unanchored prefix it made the engine retry a
+# nondeterministic optional group at every character, costing 54 ms per findall.
+OPAQUE_PREFIX_PATTERN = re.compile(
+    rf"layout\s*\(\s*([^)]*)\s*\)\s*(?:{BUFFER_QUALIFIER}\s+)*$"
+)
+
+
+OPAQUE_PATTERN: dict[str, re.Pattern] = {
+    kind: _opaque_uniform_pattern(type_alt) for kind, type_alt in OPAQUE_TYPE_ALT.items()
+}
 
 # Optional instance name (and array suffix) between a block's '}' and its ';'.
 INSTANCE_TAIL_PATTERN = re.compile(r"\s*(\w+)?(?:\s*\[[^\]]*\])?\s*;")
@@ -245,6 +310,124 @@ class BindingRegistry():
                 )
 
         return canon
+
+    @staticmethod
+    def _allocate_opaque_canon(
+        ctx: Context, artifact: str, stage_sources: dict[ShaderStage, str], kind: str,
+    ) -> dict[str, int]:
+        """Assign units for every live sampler/image uniform across `stage_sources`, from one
+        pool ('texture' or 'image').
+
+        Mirrors `_allocate_canon`'s pin/conflict/exhaustion policy exactly, minus the per-stage
+        count check: GLSL has no per-stage cap on the number of sampler/image *declarations*
+        analogous to `GL_MAX_*_SHADER_STORAGE_BLOCKS` -- the driver's own per-stage texture/image
+        unit limits gate actual *usage*, not declaration count, and are enforced by the linker
+        itself, so there is nothing extra worth checking here.
+        """
+        pattern = OPAQUE_PATTERN[kind]
+        noun = BLOCK_NOUN[kind]
+        max_pool, pool_source = BindingRegistry._max_pool(ctx, kind)
+
+        live: set[str] = set()
+        explicit: dict[str, int] = {}
+        for src in stage_sources.values():
+            masked = BindingRegistry._mask(src)
+            for match in pattern.finditer(masked):
+                name = match.group(2)
+                live.add(name)
+                prefix = OPAQUE_PREFIX_PATTERN.search(masked, 0, match.start())
+                if not prefix or not (m := BINDING_PATTERN.search(prefix.group(1))): continue
+
+                unit = int(m.group(1))
+                if unit >= max_pool:
+                    raise TlangBindingError(
+                        f"Artifact '{artifact}': binding {unit} on {noun} '{name}' exceeds the "
+                        f"driver's unit ceiling ({max_pool}, from {pool_source})",
+                        SourceLocation(artifact),
+                    )
+
+                prev = explicit.setdefault(name, unit)
+                if prev != unit:
+                    raise TlangBindingError(
+                        f"Artifact '{artifact}': {noun} '{name}' has conflicting explicit "
+                        f"bindings ({prev} vs {unit}) across its stages",
+                        SourceLocation(artifact),
+                    )
+
+        # Two different samplers/images pinned to the same unit would silently alias, exactly
+        # the hazard this whole feature exists to close -- refuse it outright.
+        owner_of: dict[int, str] = {}
+        for name, unit in explicit.items():
+            if (owner := owner_of.get(unit)) is not None and owner != name:
+                raise TlangBindingError(
+                    f"Artifact '{artifact}': {noun}s '{owner}' and '{name}' are both explicitly "
+                    f"bound to unit {unit}",
+                    SourceLocation(artifact),
+                )
+            owner_of[unit] = name
+
+        # Auto-assign every live, unpinned name to the lowest free unit, deterministically
+        # (alphabetically -- there is no cross-module preference ranking for this pool).
+        canon: dict[str, int] = dict(explicit)
+        reserved = set(explicit.values())
+        remaining = sorted(n for n in live if n not in canon)
+
+        slot = 0
+        for name in remaining:
+            while slot in reserved: slot += 1
+            if slot >= max_pool:
+                raise TlangBindingError(
+                    f"Artifact '{artifact}': out of {noun} units while assigning '{name}' "
+                    f"(unit ceiling {max_pool}, from {pool_source})",
+                    SourceLocation(artifact),
+                )
+            canon[name] = slot
+            reserved.add(slot)
+            slot += 1
+
+        return canon
+
+    @staticmethod
+    def allocate_opaque_units(
+        ctx: Context, artifact: str, stage_sources: dict[ShaderStage, str],
+    ) -> tuple[dict[str, int], dict[str, int]]:
+        """Assign texture and image units for every sampler/image uniform declared across
+        `stage_sources` -- the sampler/image counterpart of `allocate_artifact`.
+
+        Texture units and image units are two independent GL pools (not merged, exactly like
+        the SSBO/UBO split `allocate_artifact` already keeps), so each gets its own call into
+        `_allocate_opaque_canon`. Nothing here is patched into the GLSL text -- see
+        `assign_opaque_units`, called once the artifact has actually linked. Raises
+        `TlangBindingError` on a pin conflict, a pin past the unit ceiling, or an exhausted pool.
+        """
+        texture_canon = BindingRegistry._allocate_opaque_canon(ctx, artifact, stage_sources, 'texture')
+        image_canon = BindingRegistry._allocate_opaque_canon(ctx, artifact, stage_sources, 'image')
+        return texture_canon, image_canon
+
+    @staticmethod
+    def assign_opaque_units(
+        linked: ComputeShader | Program, texture_canon: dict[str, int], image_canon: dict[str, int],
+    ) -> None:
+        """Push each canon's unit into the linked artifact's reflected uniform, post-link.
+
+        Sampler and image uniforms both reflect as a plain `moderngl.Uniform` (not a distinct
+        type the way storage/uniform blocks do) with a writable `.value` that IS the texture/
+        image unit -- verified: three separate sampler/image uniforms with no explicit binding
+        all reported `value = 0`, i.e. silently colliding. Setting `.value` here is what this
+        whole mechanism exists to automate instead.
+
+        GL strips an inactive (declared but never referenced) uniform from reflection entirely.
+        Such a name is PRUNED from its canon here, so what survives means "opaque uniforms this
+        artifact actually uses" rather than "names the text declared". The distinction is the
+        one `remove_dead_functions` draws for blocks: a set that over-approximates makes an
+        unbound-at-dispatch check fire on artifacts that never had a bug, which trains people
+        to suppress it. The driver's own reflection is authoritative here, so the narrow set
+        is free.
+        """
+        for canon in (texture_canon, image_canon):
+            reflected = {n: u for n in list(canon) if isinstance(u := linked.get(n, None), Uniform)}
+            for name in [n for n in canon if n not in reflected]: del canon[name]
+            for name, unit in canon.items(): reflected[name].value = unit
 
     @staticmethod
     def _patch_bindings(src: str, keyword: str, canon: dict[str, int]) -> str:

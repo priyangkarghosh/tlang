@@ -3,12 +3,14 @@
 # @author        Priyangkar Ghosh
 # @created       2025-09-03
 # @description   Segregated-free-list pool of reusable transient GL buffers, plus a
-#                named persistent buffer registry.
+#                named persistent buffer registry. Both namespaces share one tag space,
+#                so the pool itself doubles as a name -> Buffer map a Kernel/Pipeline can
+#                bind straight from.
 # @license       MIT
 # -------------------------------------------------------------
 
 import logging
-from collections.abc import Generator
+from collections.abc import Generator, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -49,13 +51,14 @@ class TempHandle:
     liveness (not the GL object name, which GL can recycle after release), so any access after
     `free_temp` raises `TlangError` instead of silently touching a buffer handed to someone else.
     """
-    __slots__ = ('_buffer', '_size_class', '_requested_size', '_alive')
+    __slots__ = ('_buffer', '_size_class', '_requested_size', '_alive', '_tag')
 
-    def __init__(self, buffer: Buffer, size_class: int, requested_size: int) -> None:
+    def __init__(self, buffer: Buffer, size_class: int, requested_size: int, tag: str | None = None) -> None:
         self._buffer = buffer
         self._size_class = size_class
         self._requested_size = requested_size
         self._alive = True
+        self._tag = tag
 
     def _kill(self) -> Buffer:
         if not self._alive: raise TlangError("Buffer handle already freed (double free)")
@@ -74,6 +77,10 @@ class TempHandle:
     def requested_size(self) -> int:
         return self._requested_size
 
+    @property
+    def tag(self) -> str | None:
+        return self._tag
+
     def __getattr__(self, item: str):
         if not self._alive:
             raise TlangError(f"Use of buffer handle after free: '{item}' accessed on a freed temp buffer")
@@ -81,10 +88,11 @@ class TempHandle:
 
     def __repr__(self) -> str:
         state = 'alive' if self._alive else 'freed'
-        return f'<TempHandle size_class={self._size_class} requested={self._requested_size} {state}>'
+        tagged = f" tag='{self._tag}'" if self._tag else ''
+        return f'<TempHandle size_class={self._size_class} requested={self._requested_size}{tagged} {state}>'
 
 
-class BufferPool:
+class BufferPool(Mapping[str, Buffer]):
     """Two independent responsibilities in one object, sharing only the `Context` and `clear()`.
 
     1. **Persistent registry** (`persistent_buffer`) -- buffers named once, created lazily, and
@@ -95,6 +103,12 @@ class BufferPool:
     No buffer ever moves between the two. Transient buffers are kept in per-power-of-two-size
     free lists, so acquire/release are O(1) and a request is only ever satisfied by a buffer of
     its own size class -- never a larger one. `trim()` bounds the resulting per-class memory cost.
+
+    Every persistent buffer's name, and every temporary's `tag` (see `alloc_temp`), lives in one
+    shared namespace: the pool itself implements `Mapping[str, Buffer]`, so `pool['SomeTag']`
+    resolves whichever kind of buffer registered that name, and a `Kernel`/`Pipeline` can be
+    given the pool directly as a buffer source (see `Kernel.source`). A tag freed via `free_temp`
+    stops resolving; a name can't be reused while its current buffer is still live.
     """
 
     def __init__(self, ctx: Context, min_size: int = 256, *, debug_poison: bool = False) -> None:
@@ -109,6 +123,7 @@ class BufferPool:
         self._free: dict[int, list[Buffer]] = {}          # size class -> idle buffers
         self._checked_out: dict[int, TempHandle] = {}      # id(buffer) -> live handle
         self._frame_stack: list[list[TempHandle]] = []     # open `frame()` scopes, innermost last
+        self._tags: dict[str, TempHandle] = {}             # tag -> live tagged temporary
 
         # --- metrics ---
         self._bytes_pooled = 0
@@ -116,6 +131,35 @@ class BufferPool:
         self._high_water_mark = 0
         self._hits = 0
         self._misses = 0
+
+    # ------------------------------------------------------------------
+    # Mapping[str, Buffer] -- persistent names and live temp tags share one namespace
+    # ------------------------------------------------------------------
+
+    def __getitem__(self, name: str) -> Buffer:
+        if (buf := self._persistent.get(name)) is not None: return buf
+        if (handle := self._tags.get(name)) is not None: return handle
+        raise KeyError(name)
+
+    def __contains__(self, name: object) -> bool:
+        return name in self._persistent or name in self._tags
+
+    def __iter__(self) -> Iterator[str]:
+        yield from self._persistent
+        yield from self._tags
+
+    def __len__(self) -> int:
+        return len(self._persistent) + len(self._tags)
+
+    def _claim_name(self, name: str, kind: str) -> None:
+        """Raise if `name` is already live in the other half of the shared namespace.
+        `kind` is what the CALLER is about to register ('persistent buffer' or 'tagged temp'),
+        used to name both the request and whatever already holds the name in the error.
+        """
+        if name in self._persistent:
+            raise TlangError(f"Cannot register {kind} '{name}': a persistent buffer '{name}' already exists")
+        if name in self._tags:
+            raise TlangError(f"Cannot register {kind} '{name}': a temporary is already tagged '{name}'")
 
     def _align(self, size: int) -> int:
         # Round up to the next power of two, floored at `_min_size` (requires `_min_size >= 1`).
@@ -127,8 +171,15 @@ class BufferPool:
     # ------------------------------------------------------------------
 
     def persistent_buffer(self, name: str, contents: bytes | None = None, size: int | None = None, dynamic: bool = True) -> Buffer:
-        """Return the named persistent buffer, creating it on first call. Only `clear()` releases it."""
+        """Return the named persistent buffer, creating it on first call. Only `clear()` releases it.
+
+        `name` doubles as this buffer's entry in the pool's `Mapping` -- `pool[name]` resolves it
+        once created. Calling again with the same `name` is idempotent (returns the existing
+        buffer); registering it while a live temporary already holds that tag raises `TlangError`
+        naming both.
+        """
         if (ret := self._persistent.get(name)) is not None: return ret
+        self._claim_name(name, 'persistent buffer')
         if contents is not None: buf = self._ctx.buffer(data=contents, dynamic=dynamic)
         elif size is not None: buf = self._ctx.buffer(reserve=size, dynamic=dynamic)
         else: raise TlangError("No buffer size or content was provided")
@@ -141,13 +192,19 @@ class BufferPool:
     # Transient pool
     # ------------------------------------------------------------------
 
-    def alloc_temp(self, size: int, *, zero: bool = False) -> TempHandle:
+    def alloc_temp(self, size: int, *, zero: bool = False, tag: str | None = None) -> TempHandle:
         """Check out a scratch buffer of at least `size` bytes.
 
         Recycled memory is undefined unless `zero=True` is passed. With `debug_poison=True`,
         buffers are stamped with `0xCD` when returned to the pool (see `free_temp`), so stale
         reads are an obvious sentinel rather than plausible garbage. Requests are only ever
         satisfied from their own power-of-two size class, never a larger one.
+
+        `tag`, if given, registers this handle under that name in the pool's `Mapping` -- some
+        other stage can then bind straight from the pool by name instead of being handed the
+        handle directly. Raises `TlangError` if `tag` is already live (persistent or tagged
+        temp); `free_temp` unregisters it, after which the name resolves to nothing until
+        re-tagged.
         """
         aligned = self._align(size)
         bucket = self._free.get(aligned)
@@ -163,23 +220,32 @@ class BufferPool:
 
         if zero: clear_buffer(buf)
 
-        handle = TempHandle(buf, aligned, size)
+        if tag is not None: self._claim_name(tag, 'tagged temp')
+
+        handle = TempHandle(buf, aligned, size, tag)
         self._checked_out[id(buf)] = handle
         self._bytes_checked_out += aligned
         self._high_water_mark = max(self._high_water_mark, self._bytes_pooled + self._bytes_checked_out)
         if self._frame_stack: self._frame_stack[-1].append(handle)
+        if tag is not None: self._tags[tag] = handle
         return handle
 
     def free_temp(self, handle: TempHandle) -> None:
         """Return a checked-out buffer to its size class's free list.
 
         `handle` must be a live `TempHandle` from this pool's `alloc_temp`; freeing it twice, or
-        touching it afterwards, raises `TlangError`.
+        touching it afterwards, raises `TlangError`. If `handle` was tagged, its tag is
+        unregistered here, before the buffer is even returned to the free list -- the name stops
+        resolving immediately, rather than continuing to point at memory someone else can now
+        reuse.
         """
         if not isinstance(handle, TempHandle): raise TlangError(f"free_temp expects a TempHandle, got {type(handle).__name__}")
+        tag = handle.tag
         buf = handle._kill()
         if self._checked_out.pop(id(buf), None) is None:
             raise TlangError("Buffer handle was not tracked as checked out by this pool")
+
+        if tag is not None: self._tags.pop(tag, None)
 
         self._bytes_checked_out -= handle.size_class
         if self.debug_poison: clear_buffer(buf, _POISON_BYTE)
@@ -188,9 +254,9 @@ class BufferPool:
         logger.debug(f"Returned buffer of size {handle.size_class} to pool")
 
     @contextmanager
-    def temp(self, size: int, *, zero: bool = False) -> Generator[TempHandle]:
-        """`with pool.temp(size) as buf: ...` -- always freed, even on exception."""
-        handle = self.alloc_temp(size, zero=zero)
+    def temp(self, size: int, *, zero: bool = False, tag: str | None = None) -> Generator[TempHandle]:
+        """`with pool.temp(size) as buf: ...` -- always freed (and untagged), even on exception."""
+        handle = self.alloc_temp(size, zero=zero, tag=tag)
         try:
             yield handle
         finally:
@@ -261,6 +327,7 @@ class BufferPool:
         self._free.clear()
         self._checked_out.clear()
         self._frame_stack.clear()
+        self._tags.clear()
         self._bytes_pooled = 0
         self._bytes_checked_out = 0
         # high_water_mark / hits / misses intentionally survive `clear()` -- historical.

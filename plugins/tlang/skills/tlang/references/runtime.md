@@ -9,6 +9,7 @@ sm = ShaderManager(
     dir='shaders',         # see path resolution below
     constants={'BLOCK_SIZE': 256},
     strict=True,           # default: raise on any build failure
+    keep_sources=False,    # default: drop a successful entry point's generated GLSL
 )
 ```
 
@@ -29,6 +30,15 @@ and then a single error is raised at the end. If exactly one module failed, its 
 exception is re-raised unchanged; if several did, a `TlangBuildError` names every one
 of them, with `.failures` mapping module -> its errors. `False`: failures are logged
 and collected, and the build continues.
+
+**`keep_sources`.** `False` (default): once an entry point's kernel has compiled (or its
+program has linked) and its bindings are verified, its generated GLSL text is dropped --
+nothing needs it in memory once the driver has it. A **failed** entry point's source is
+always kept regardless of this flag, since that's exactly when someone needs to read it
+(and `TlangCompileError.source`/`TlangLinkError` already carry it independently). `True`
+retains every entry point's source, unconditionally -- today's behaviour before this flag
+existed; use it when you actually intend to inspect `shader.sources`/`get_source(...)`
+for successful builds (e.g. dumping generated GLSL for debugging).
 
 **A failed module is not silently usable.** `get_shader(name)` returns `None` for a
 module that built but did not fully compile, so the cheap check is also the correct
@@ -58,17 +68,24 @@ shader.kernels              # dict[str, Kernel] -- compute entry points
 shader.programs             # dict[str, moderngl.Program] -- raw linked programs
 shader.pipelines            # dict[str, Pipeline] -- name-keyed wrapper, prefer this
 shader.interfaces           # Mapping[str, InterfaceDecl] -- this module + its includes
-shader.sources              # dict[str, str] -- entry point name -> generated GLSL
+shader.sources              # dict[str, str] -- entry point name -> generated GLSL,
+                             # for only what was actually retained (see keep_sources)
 
 shader.get_kernel('cs_go')        # -> Kernel        (KeyError if absent)
 shader.get_program('default')     # -> moderngl.Program (KeyError if absent)
 shader.get_pipeline('default')    # -> Pipeline      (KeyError if absent)
-shader.get_source('cs_go')        # generated GLSL for any entry point, success or not
+shader.get_source('cs_go')        # generated GLSL -- always for a failed entry point,
+                                   # or any entry point when built with keep_sources=True
 ```
 
 `get_kernel`/`get_program`/`get_pipeline` raise `KeyError` for an unknown name
 (unlike `ShaderManager.get_shader`, which returns `None`) — once a `Shader` exists,
 a missing kernel/program signals a real bug, not an expected absence.
+
+`get_source(name)` raises `TlangError` (not `KeyError`, not `None`) for a *successfully
+compiled* entry point whose source was dropped under the default `keep_sources=False` --
+the message names the entry point and tells you to rebuild with `keep_sources=True`. A
+failed entry point's source is always there to read, regardless of the flag.
 
 ## Kernel and Pipeline
 

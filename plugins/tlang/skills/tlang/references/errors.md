@@ -21,11 +21,19 @@ from tlang.errors import (
 | `TlangCompileError` | a stage failed to compile — carries `.stage`, `.entry_point`, `.source` |
 | `TlangLinkError` | a `[program(...)]` failed to link |
 | `TlangBuildError` | more than one module in the tree failed — `.failures` maps module -> its errors |
-| `TlangError` (base) | `BufferPool`/`TempHandle` misuse (use-after-free, double-free, bad size) |
+| `TlangError` (base) | `BufferPool`/`TempHandle` misuse (use-after-free, double-free, bad size), `Shader.get_source(...)` on a source that was dropped (`keep_sources=False`) |
 
-`get_source(...)` / `e.source` always has the exact GLSL handed to the driver, with
-tlang's `#line` directives intact, so a driver message's line number points back at
-your `.tlang` file.
+`e.source` (on `TlangCompileError`) always has the exact GLSL handed to the driver, with
+tlang's `#line` directives intact, so a driver message's line number points back at your
+`.tlang` file. `Shader.get_source(...)` has it too for a *failed* entry point, always --
+but for a *successfully* compiled one only when the `ShaderManager`/`Shader` was built
+with `keep_sources=True` (default `False`: a successful entry point's source is dropped
+once nothing needs it anymore). Calling `get_source(...)` on a dropped entry point raises
+`TlangError` naming it, not `KeyError` and not `None`:
+
+```
+demo: 'cs_go': source was not retained (built with keep_sources=False) -- rebuild the ShaderManager/Shader with keep_sources=True to inspect it.
+```
 
 ## Attribute and syntax errors
 

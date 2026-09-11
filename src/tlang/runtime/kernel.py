@@ -6,13 +6,14 @@
 # @license       MIT
 # -------------------------------------------------------------
 
+import difflib
 import logging
 import time
 from collections.abc import Mapping
 from typing import Any
 from moderngl import (
     SHADER_STORAGE_BARRIER_BIT, Buffer, ComputeShader,
-    Context, StorageBlock, Uniform, UniformBlock
+    Context, StorageBlock, Texture, Uniform, UniformBlock
 )
 from OpenGL.GL import (
     glBindBufferRange, GL_ATOMIC_COUNTER_BUFFER,
@@ -51,19 +52,53 @@ def bump_ssbo_table_generation() -> int:
     return _ssbo_table_generation
 
 
+# Same generation-counter discipline as `_ssbo_table_generation` above, one counter per GL
+# binding table: texture units (`Texture.use`) and image units (`Texture.bind_to_image`) are
+# separate process-global tables from each other AND from the SSBO one, so each gets its own
+# counter -- sharing one across unrelated tables would make a write to one silently mask a stale
+# read from another.
+_texture_table_generation = 0
+_image_table_generation = 0
+
+
+def bump_texture_table_generation() -> int:
+    """Record one write to GL's global texture-unit binding table (`Texture.use`) and return the
+    new generation. See `bump_ssbo_table_generation` -- same discipline, separate table."""
+    global _texture_table_generation
+    _texture_table_generation += 1
+    return _texture_table_generation
+
+
+def bump_image_table_generation() -> int:
+    """Record one write to GL's global image-unit binding table (`Texture.bind_to_image`) and
+    return the new generation. See `bump_ssbo_table_generation` -- same discipline, separate
+    table."""
+    global _image_table_generation
+    _image_table_generation += 1
+    return _image_table_generation
+
+
 class Kernel:
     __slots__ = (
         '_ctx', '_name', '_mglo', '_uniform_cache', '_binding_cache', '_bindings', '_ubo_cache',
-        '_ssbo_bindings', '_bound_generation',
+        '_ssbo_bindings', '_bound_generation', '_buffer_source',
+        '_texture_units', '_image_units', '_texture_bindings', '_image_bindings',
+        '_bound_texture_generation', '_bound_image_generation',
     )
 
-    def __init__(self, ctx: Context, name: str, shader: ComputeShader, bindings: Mapping[str, int] | None = None):
+    def __init__(
+        self, ctx: Context, name: str, shader: ComputeShader, bindings: Mapping[str, int] | None = None,
+        texture_units: Mapping[str, int] | None = None, image_units: Mapping[str, int] | None = None,
+    ):
         self._ctx = ctx
         self._name = name
         self._mglo = shader
         self._uniform_cache: dict[str, Any] = {}
         self._binding_cache: dict[str, int] = {}
         self._ubo_cache: dict[str, int] = {}
+        # buffer source consulted by `bind()` for any required name not passed explicitly --
+        # see the `source` property. `None` means bind() can only resolve explicit kwargs.
+        self._buffer_source: Mapping[str, Buffer] | None = None
         # the name -> binding map `BindingRegistry.allocate_artifact` decided for this kernel
         # (the artifact's declared/required SSBO blocks, patched into the GLSL text as
         # `binding = N`). This is the canon: static, driver-independent, and known before the
@@ -79,6 +114,23 @@ class Kernel:
         # asserted", which always forces a rebind on the first dispatch.
         self._bound_generation: int = -1
 
+        # name -> assigned texture/image unit, the sampler/image counterpart of `_bindings` --
+        # every sampler/image uniform this artifact declares, decided by
+        # `BindingRegistry.allocate_opaque_units` before the program ever links. Two separate
+        # pools, exactly like SSBO vs UBO above.
+        self._texture_units: dict[str, int] = dict(texture_units) if texture_units is not None else {}
+        self._image_units: dict[str, int] = dict(image_units) if image_units is not None else {}
+
+        # name -> Texture / (Texture, read, write, level, format) recorded by `bind_texture`/
+        # `bind_image`, NOT yet written to GL -- same deferred-until-dispatch discipline as
+        # `_ssbo_bindings`, asserted by `_assert_texture_bindings`/`_assert_image_bindings`.
+        self._texture_bindings: dict[str, Texture] = {}
+        self._image_bindings: dict[str, tuple[Texture, bool, bool, int, int]] = {}
+        # generation counters as of this kernel's last full assert of each table; -1 means
+        # "never asserted", same convention as `_bound_generation`.
+        self._bound_texture_generation: int = -1
+        self._bound_image_generation: int = -1
+
     @property
     def ctx(self): return self._ctx # mgl context
 
@@ -93,6 +145,23 @@ class Kernel:
 
     @property
     def bindings(self) -> Mapping[str, int]: return self._bindings # name -> assigned SSBO binding
+
+    @property
+    def texture_units(self) -> Mapping[str, int]: return self._texture_units # name -> assigned texture unit
+
+    @property
+    def image_units(self) -> Mapping[str, int]: return self._image_units # name -> assigned image unit
+
+    @property
+    def buffer_source(self) -> Mapping[str, Buffer] | None:
+        """The `Mapping[str, Buffer]` -- a `BufferPool`, a plain dict, anything -- that `bind()`
+        draws unnamed required blocks from. Read fresh on every `bind()` call, never cached, so a
+        live mapping (temporaries appearing and disappearing between frames) works naturally."""
+        return self._buffer_source
+
+    @buffer_source.setter
+    def buffer_source(self, value: Mapping[str, Buffer] | None) -> None:
+        self._buffer_source = value
 
     @property
     def uniform_blocks(self) -> Mapping[str, int]:
@@ -119,6 +188,8 @@ class Kernel:
         allow_unbound: frozenset[str] | set[str] = frozenset(),
     ) -> None:
         self._assert_ssbo_bindings(allow_unbound)
+        self._assert_texture_bindings(allow_unbound)
+        self._assert_image_bindings(allow_unbound)
         self._mglo.run(group_x, group_y, group_z)
         if barrier: self._ctx.memory_barrier(barrier_bits)
 
@@ -131,6 +202,8 @@ class Kernel:
         allow_unbound: frozenset[str] | set[str] = frozenset(),
     ) -> None:
         self._assert_ssbo_bindings(allow_unbound)
+        self._assert_texture_bindings(allow_unbound)
+        self._assert_image_bindings(allow_unbound)
         glUseProgram(self.glo)
         glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, buffer.glo)
         glDispatchComputeIndirect(offset)
@@ -208,30 +281,54 @@ class Kernel:
         # other kernel/pipeline has touched the global table in the meantime.
         self._bound_generation = -1
 
-    def bind(self, **available: Buffer | tuple[Buffer, int, int]) -> None:
+    def bind(self, **explicit: Buffer | tuple[Buffer, int, int]) -> None:
         """Bind exactly this kernel's REQUIRED set (`self.bindings`, the artifact's declared SSBO
-        blocks) by name out of `available`.
+        blocks) by name, drawn from `explicit` first and then from `self.buffer_source` (see the
+        `source` property).
 
-        Names in `available` that this artifact does not declare are silently ignored -- this is
-        what lets one caller pass a single superset dict of buffers across every kernel in a
-        pipeline:
+        Called with no arguments, every required block is resolved from `self.buffer_source` alone:
+
+            kernel.buffer_source = pool          # once, e.g. when the module is set up
+            kernel.bind()                 # every dispatch
+            kernel.dispatch(groups)
+
+        Called with kwargs (the original form), those override `self.buffer_source` for this call only;
+        names that this artifact does not declare are silently ignored -- this is what lets one
+        caller pass a single superset dict of buffers across every kernel in a pipeline:
 
             kernel.bind(**self._buffers)
             kernel.dispatch(groups)
 
-        A required name absent from `available` raises `TlangBindingError` naming it. Accepts the
-        same value shapes as `bind_ssbos`: a bare `Buffer`, or `(Buffer, offset, size)`.
+        A required name resolved from neither raises `TlangBindingError`. The message names
+        whether the miss is "not in the provided buffers" (an incomplete `explicit` and no
+        source) or "not found in the bound buffer source" (fell through to `self.buffer_source` and it
+        doesn't have it either) -- the two mean different fixes. Accepts the same value shapes as
+        `bind_ssbos`: a bare `Buffer`, or `(Buffer, offset, size)`.
         """
         for buffer_name in self._bindings:
-            if buffer_name not in available:
+            if buffer_name in explicit:
+                value = explicit[buffer_name]
+            elif self._buffer_source is not None:
+                if buffer_name not in self._buffer_source:
+                    raise TlangBindingError(
+                        f"Kernel '{self._name}' requires buffer '{buffer_name}' but it was not "
+                        f"found in the bound buffer source.{self._suggest_from_source(buffer_name)}",
+                        SourceLocation(module=self._name),
+                    )
+                value = self._buffer_source[buffer_name]
+            else:
                 raise TlangBindingError(
                     f"Kernel '{self._name}' requires buffer '{buffer_name}' but it was not in the "
                     f"provided buffers",
                     SourceLocation(module=self._name),
                 )
-            value = available[buffer_name]
             if isinstance(value, tuple): self.bind_ssbo(buffer_name, *value)
             else: self.bind_ssbo(buffer_name, value)
+
+    def _suggest_from_source(self, name: str) -> str:
+        if self._buffer_source is None: return ''
+        matches = difflib.get_close_matches(name, sorted(self._buffer_source), n=1)
+        return f" Did you mean '{matches[0]}'?" if matches else ''
 
     def bind_ubos(self, **buffers: Buffer | tuple[Buffer, int, int]) -> None:
         loc = self.bind_ubo
@@ -250,6 +347,43 @@ class Kernel:
                 )
             self._ubo_cache[block_name] = binding = block.binding
         buffer.bind_to_uniform_block(binding, offset=offset, size=size)
+
+    def bind_textures(self, **textures: Texture) -> None:
+        loc = self.bind_texture
+        for k, v in textures.items(): loc(k, v)
+
+    def bind_texture(self, name: str, texture: Texture) -> None:
+        """Record that `name` should be bound to `texture`'s texture unit on this kernel. Like
+        `bind_ssbo`, this does NOT touch GL's (also process-global) texture-unit table
+        immediately -- the actual `Texture.use(unit)` call is deferred to the next
+        `dispatch`/`dispatch_indirect`/`dispatch_timed`, which re-asserts this kernel's entire
+        recorded texture set right before running. See `bind_ssbo`'s docstring for why deferring
+        matters: an immediate bind here could otherwise be silently overwritten by an unrelated
+        kernel's dispatch before this one ever runs.
+
+        `name` is validated immediately against `self.texture_units` -- a name this artifact
+        does not declare at all is a typo, and raises `TlangBindingError` right here.
+        """
+        self._resolve_texture_unit(name)  # validate now; raises TlangBindingError on typo
+        self._texture_bindings[name] = texture
+        self._bound_texture_generation = -1  # force a re-assert on this kernel's next dispatch
+
+    def bind_images(self, **images: Texture | tuple[Texture, bool, bool, int, int]) -> None:
+        loc = self.bind_image
+        for k, v in images.items(): loc(k, *v) if isinstance(v, tuple) else loc(k, v)
+
+    def bind_image(
+        self, name: str, image: Texture, read: bool = True, write: bool = True,
+        level: int = 0, format: int = 0,
+    ) -> None:
+        """Record that `name` should be bound to `image`'s image unit on this kernel, via
+        `Texture.bind_to_image(unit, read=read, write=write, level=level, format=format)` at the
+        next dispatch. Same deferred-binding discipline as `bind_texture`/`bind_ssbo` -- see
+        `bind_ssbo`'s docstring -- and the same immediate typo check on `name`.
+        """
+        self._resolve_image_unit(name)  # validate now; raises TlangBindingError on typo
+        self._image_bindings[name] = (image, read, write, level, format)
+        self._bound_image_generation = -1  # force a re-assert on this kernel's next dispatch
 
     def bind_atomic_counter(
         self, binding: int, buffer: Buffer, offset: int = 0
@@ -330,3 +464,80 @@ class Kernel:
 
         generation = bump_ssbo_table_generation() if self._ssbo_bindings else _ssbo_table_generation
         self._bound_generation = generation
+
+    def _resolve_texture_unit(self, name: str) -> int:
+        """Resolve `name`'s GL texture unit from the static canon (`self._texture_units`,
+        decided by `BindingRegistry.allocate_opaque_units` before the program ever links).
+        Raises `TlangBindingError` if `name` isn't a declared sampler uniform -- that's a typo.
+        """
+        if (unit := self._texture_units.get(name)) is not None:
+            return unit
+        raise TlangBindingError(f"'{name}' is not a declared texture (sampler) uniform", SourceLocation(module=self._name))
+
+    def _resolve_image_unit(self, name: str) -> int:
+        """Image counterpart of `_resolve_texture_unit`, resolved from `self._image_units`."""
+        if (unit := self._image_units.get(name)) is not None:
+            return unit
+        raise TlangBindingError(f"'{name}' is not a declared image uniform", SourceLocation(module=self._name))
+
+    def _assert_texture_bindings(self, allow_unbound: frozenset[str] | set[str] = frozenset()) -> None:
+        """Texture-unit counterpart of `_assert_ssbo_bindings` -- same three jobs, same
+        generation-counter fast path, against the separate texture-unit table/counter."""
+        missing = [
+            name for name in self._texture_units
+            if name not in self._texture_bindings and name not in allow_unbound
+        ]
+        if missing:
+            raise TlangBindingError(
+                f"Kernel '{self._name}' dispatched with required texture(s) never bound: "
+                f"{', '.join(sorted(missing))} (bind them first, or pass allow_unbound={{...}})",
+                SourceLocation(module=self._name),
+            )
+
+        for name, texture in self._texture_bindings.items():
+            if not getattr(texture, 'alive', True):
+                raise TlangBindingError(
+                    f"Kernel '{self._name}': texture bound to '{name}' has been freed -- "
+                    f"re-bind before dispatching",
+                    SourceLocation(module=self._name),
+                )
+
+        if self._bound_texture_generation == _texture_table_generation:
+            return  # nothing else has touched the global texture-unit table since our last assert
+
+        for name, texture in self._texture_bindings.items():
+            texture.use(self._resolve_texture_unit(name))
+
+        generation = bump_texture_table_generation() if self._texture_bindings else _texture_table_generation
+        self._bound_texture_generation = generation
+
+    def _assert_image_bindings(self, allow_unbound: frozenset[str] | set[str] = frozenset()) -> None:
+        """Image-unit counterpart of `_assert_ssbo_bindings` -- same three jobs, same
+        generation-counter fast path, against the separate image-unit table/counter."""
+        missing = [
+            name for name in self._image_units
+            if name not in self._image_bindings and name not in allow_unbound
+        ]
+        if missing:
+            raise TlangBindingError(
+                f"Kernel '{self._name}' dispatched with required image(s) never bound: "
+                f"{', '.join(sorted(missing))} (bind them first, or pass allow_unbound={{...}})",
+                SourceLocation(module=self._name),
+            )
+
+        for name, (image, *_rest) in self._image_bindings.items():
+            if not getattr(image, 'alive', True):
+                raise TlangBindingError(
+                    f"Kernel '{self._name}': image bound to '{name}' has been freed -- "
+                    f"re-bind before dispatching",
+                    SourceLocation(module=self._name),
+                )
+
+        if self._bound_image_generation == _image_table_generation:
+            return  # nothing else has touched the global image-unit table since our last assert
+
+        for name, (image, read, write, level, format) in self._image_bindings.items():
+            image.bind_to_image(self._resolve_image_unit(name), read=read, write=write, level=level, format=format)
+
+        generation = bump_image_table_generation() if self._image_bindings else _image_table_generation
+        self._bound_image_generation = generation

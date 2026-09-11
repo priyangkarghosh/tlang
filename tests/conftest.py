@@ -73,7 +73,7 @@ def build_manager(gl_ctx):
     session GL context. Only pulls in `gl_ctx` (and therefore only ever
     creates a context) when a gl-marked test actually requests this."""
 
-    def _build(dir_path, constants=None, strict=True, version="430 core"):
+    def _build(dir_path, constants=None, strict=True, version="430 core", keep_sources=False):
         from tlang import ShaderManager
 
         return ShaderManager(
@@ -82,6 +82,7 @@ def build_manager(gl_ctx):
             dir=str(dir_path),
             constants=constants or {},
             strict=strict,
+            keep_sources=keep_sources,
         )
 
     return _build

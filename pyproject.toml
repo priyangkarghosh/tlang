@@ -21,10 +21,12 @@ classifiers = [
 ]
 
 dependencies = [
-    # 5.8 is the verified floor: the Buffer/ComputeShader/StorageBlock surface
-    # tlang uses all exists there, and `bind_to_storage_buffer` takes its
-    # offset/size as keyword-only args on <= 5.8.x, which tlang honours.
-    "moderngl>=5.8",
+    # 5.12 is the verified floor. Beyond the Buffer/ComputeShader/StorageBlock
+    # surface, tlang relies on StorageBlock/UniformBlock `.binding` being
+    # writable post-link and on samplers/images reflecting as `Uniform` with a
+    # writable `.value` -- both are how bindings and texture units get assigned
+    # without hardcoding an index in the GLSL.
+    "moderngl>=5.12",
     "jinja2",
     "regex",
     "bitarray",

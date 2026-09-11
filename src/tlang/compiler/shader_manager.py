@@ -14,8 +14,9 @@ logger = logging.getLogger(__name__)
 import sys
 import time
 from pathlib import Path
+from typing import Mapping
 
-from moderngl import Context
+from moderngl import Buffer, Context
 from tlang.compiler.dependency_manager import DependencyManager
 from tlang.errors import SourceLocation, TlangAttributeError, TlangBuildError, TlangDependencyError
 from tlang.frontend.interface_registry import InterfaceDecl, InterfaceTable
@@ -32,10 +33,14 @@ def _lookup(table: InterfaceTable, name: str) -> InterfaceDecl | None:
 FILE_EXT = '.tlang'
 class ShaderManager:
     def __init__(
-        self, ctx: Context, version: str, dir: str, constants: dict | None = None, strict: bool = True
+        self, ctx: Context, version: str, dir: str, constants: dict | None = None, strict: bool = True,
+        keep_sources: bool = False,
     ) -> None:
         # strict: forwarded to every built `Shader`. True raises TlangCompileError/TlangLinkError
         # on a failed compile/link; False logs and continues, leaving that kernel/program missing.
+        # keep_sources: forwarded to every built `Shader`. False (default) drops a successfully
+        # compiled/linked entry point's generated GLSL once its artifact exists; a failed entry
+        # point's source is always kept. True keeps every entry point's source, always.
         self._ctx = ctx
         self._strict = strict
         constants = constants if constants is not None else {}
@@ -132,7 +137,7 @@ class ShaderManager:
             try:
                 shader = Shader(
                     ctx, name, version, common, process, pref_rank, strict=self._strict,
-                    dep_plain_funcs=dep_plain_funcs,
+                    dep_plain_funcs=dep_plain_funcs, keep_sources=keep_sources,
                 )
             except Exception as e:
                 self._failures[name] = [e]
@@ -158,6 +163,10 @@ class ShaderManager:
             len(self._shaders), t1 - t0
         )
 
+        # buffer source shared by every Shader (and, transitively, every kernel/pipeline) in the
+        # tree -- see the `source` property.
+        self._buffer_source: Mapping[str, Buffer] | None = None
+
     @property
     def ctx(self) -> Context: return self._ctx
 
@@ -171,6 +180,27 @@ class ShaderManager:
     def failures(self) -> dict[str, list[Exception]]:
         """Module name -> the errors it hit while building (only failed modules are keys)."""
         return self._failures
+
+    @property
+    def declared_blocks(self) -> frozenset[str]:
+        """Every SSBO block name declared anywhere in the whole shader tree -- the union of
+        every built `Shader.declared_blocks`. Lets a caller validate a `BufferPool` tag (or any
+        other buffer name) against reality before it becomes an orphan nothing ever binds."""
+        names: set[str] = set()
+        for shader in self._shaders.values(): names.update(shader.declared_blocks)
+        return frozenset(names)
+
+    @property
+    def buffer_source(self) -> Mapping[str, Buffer] | None:
+        """The buffer source shared by every `Shader` in the tree. Setting it here is the one
+        call that reaches every kernel and pipeline this manager built -- equivalent to setting
+        `.buffer_source` on each `Shader` individually."""
+        return self._buffer_source
+
+    @buffer_source.setter
+    def buffer_source(self, value: Mapping[str, Buffer] | None) -> None:
+        self._buffer_source = value
+        for shader in self._shaders.values(): shader.buffer_source = value
 
     def get_shader(self, name: str, *, allow_failed: bool = False) -> Shader | None:
         """Look up a built shader by name, returning `None` if it wasn't built (unlike
