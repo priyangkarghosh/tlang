@@ -187,6 +187,19 @@ class AttributeHandlers:
         )
 
     @staticmethod
+    def _reject_unnamed_block(ctx: AttrCtx, text: str, loc: SourceLocation) -> None:
+        """`[buffer] { vec2 a[]; vec2 b[]; }` -- a block body with no name in front of it.
+        GLSL requires the block to be named, and with several members there is no single
+        member name to stand in for it, so the name has to be written."""
+        if not text.lstrip().startswith('{'): return
+        raise TlangAttributeError(
+            f"[{ctx.attr.name}]: this block has no name. Write "
+            f"'[{ctx.attr.name}] struct Name {{ ... }};', or for a single member "
+            f"'[{ctx.attr.name}] Type name[];' (found '{text.strip()[:60]}')",
+            loc,
+        )
+
+    @staticmethod
     def _declare_struct_same_line(ctx: AttrCtx, kind: InterfaceKind, opts: dict[str, Any]) -> None:
         """`[varyings] struct VertexOut { ... };` -- the struct opens in the tail of the
         attribute's own line. Its body may run on past that line, so the tail is joined with
@@ -275,6 +288,8 @@ class AttributeHandlers:
                     f"'{ctx.line_tail.strip()}')",
                     ctx.attr.location,
                 )
+            AttributeHandlers._reject_unnamed_block(
+                ctx, ctx.line_tail, SourceLocation(ctx.shader_name, ctx.end_index))
             AttributeHandlers._declare_buffer_same_line(ctx, opts)
             return
 
@@ -290,6 +305,8 @@ class AttributeHandlers:
             # place of the struct form -- reuses the same member parser, so
             # emission/the interface table/cross-module comparison need no
             # further change
+            AttributeHandlers._reject_unnamed_block(
+                ctx, ctx.src_map[start].data, SourceLocation(ctx.shader_name, start))
             block_name = opts.pop('name', None)
             result = parse_declarator_at(joined, 0, ctx.shader_name, kind, block_name=block_name, **opts)
         else:

@@ -428,3 +428,30 @@ def test_gl_same_line_shorthand_buffer_binds_by_derived_name_and_dispatches(gl_c
     assert result == pytest.approx(42.0)
 
     data.release()
+
+
+# ---------------------------------------------------------------------------
+# a brace block with no name in front of it: GLSL needs the block named, and
+# with several members there is no member name to stand in for one
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('src', [
+    "[buffer] { vec2 a[]; vec2 b[]; };\n",
+    "[buffer]\n{ vec2 a[]; vec2 b[]; };\n",
+    "[buffer] { vec2 a[]; };\n",
+    "[buffer] { vec2 a[]; vec2 b[]; }\n",
+])
+def test_unnamed_block_names_both_valid_forms(src):
+    with pytest.raises(TlangAttributeError) as exc_info:
+        _processor('demo', src)
+    msg = str(exc_info.value)
+    assert 'has no name' in msg
+    assert 'struct Name' in msg          # the multi-member fix
+    assert 'Type name[]' in msg          # the single-member fix
+    assert 'buffer declarator' not in msg  # never leak the internal placeholder
+
+
+def test_unnamed_block_error_points_at_the_block_line():
+    with pytest.raises(TlangAttributeError) as exc_info:
+        _processor('demo', "[buffer]\n{ vec2 a[]; vec2 b[]; };\n")
+    assert 'demo:2' in str(exc_info.value)
