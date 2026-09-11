@@ -50,6 +50,7 @@ from .compiler.shader import Shader
 from .runtime.kernel import Kernel
 from .runtime.pipeline import Pipeline
 from .runtime.buffer_pool import BufferPool, BufferPoolMetrics, TempHandle, clear_buffer
+from .runtime.pinned_buffer import PinnedBuffer, PinnedBufferFallback, buffer_storage_supported
 from .frontend.interface_registry import (
     InterfaceDecl,
     InterfaceKind,
@@ -80,6 +81,9 @@ __all__ = [
     "BufferPoolMetrics",
     "TempHandle",
     "clear_buffer",
+    "PinnedBuffer",
+    "PinnedBufferFallback",
+    "buffer_storage_supported",
     "InterfaceDecl",
     "InterfaceKind",
     "InterfaceMember",

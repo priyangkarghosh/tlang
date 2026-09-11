@@ -22,6 +22,12 @@ from tlang.shader_utils import mask_comments_and_strings
 
 
 BLOCK_PATTERN = re.compile(r'\[((?:[^\[\]]|\[[^\[\]]*\])*)\]',re.DOTALL) # support for one nested bracket
+# The maximal run of '[...]' blocks (optionally separated by whitespace) starting at the
+# beginning of an attribute line/block. Attribute matching is confined to this run -- not the
+# whole accumulated `line_str` -- so a `[]` (or `[16]`, `[{{ N }}]`, ...) inside trailing GLSL on
+# the same line (e.g. the `[buffer]` single-declarator shorthand's `vec2 name[];`) is never
+# mistaken for another attribute block.
+_ATTR_RUN_PATTERN = re.compile(r'^(?:\s*\[(?:[^\[\]]|\[[^\[\]]*\])*\])*', re.DOTALL)
 ATTR_PATTERN = re.compile(
     r'''
     (?P<name>\w+!?)          # attribute name: shader / include / resourceblock / …
@@ -180,25 +186,30 @@ class AttributeManager:
         cls, attr: Attribute, shader_name: str, funcs: FunctionList, index: int,
         glob_attachments: list[Attribute], diagnostics: Diagnostics,
         src_map: dict[int, ShaderSourceLine] | None = None, end_index: int | None = None,
-    ) -> str:
+        line_tail: str = '',
+    ) -> tuple[str, bool]:
+        """Returns `(replacement_text, tail_consumed)`. `tail_consumed` is True only when a
+        handler claimed `line_tail` (via `ctx.result`/`ctx.tail_consumed`) instead of leaving it
+        to be appended verbatim by the caller -- see `[buffer]`'s same-line shorthand."""
         if (rows := REGISTRY.resolve_scope(attr.name, Scope.GLOBAL, attr.location, diagnostics)) is None:
-            return ''  # unknown name / wrong scope -- diagnosed already (dropped only when strict=False)
+            return '', False  # unknown name / wrong scope -- diagnosed already (dropped only when strict=False)
         spec = rows[0]  # every row sharing a name agrees on `deferred` (enforced at registry construction)
 
         if spec.deferred:
             # Resolved later, in ShaderProcessor, once this function's stage is known.
             if fn := funcs.find_next(index): fn.attrs.append(attr)
-            return f"//<<ATTR '{attr.name}'>>//\n"
+            return f"//<<ATTR '{attr.name}'>>//\n", False
 
         assert spec.handler is not None, f"attribute '{attr.name}' is non-deferred but has no handler"
         bound = bind_params(spec.params, attr, REGISTRY.canonical, spec.variadic)
         ctx = AttrCtx(
             shader_name=shader_name, diagnostics=diagnostics, attr=attr,
             funcs=funcs, index=index, glob_attachments=glob_attachments,
-            src_map=src_map, end_index=end_index,
+            src_map=src_map, end_index=end_index, line_tail=line_tail,
         )
         spec.handler(ctx, bound)
-        return f"//<<ATTR '{attr.name}'>>//\n"
+        text = ctx.result if ctx.result is not None else f"//<<ATTR '{attr.name}'>>//\n"
+        return text, ctx.tail_consumed
 
     @classmethod
     def _dispatch_funcbody(cls, attr: Attribute, shader_name: str, diagnostics: Diagnostics) -> str:
@@ -281,23 +292,40 @@ class AttributeManager:
             index += 1
         end_index = index
 
-        def handle_attr(attr: Attribute) -> str:
+        def handle_attr(attr: Attribute, tail: str) -> tuple[str, bool]:
             if scope is Scope.GLOBAL:
                 return cls._dispatch_global(
                     attr, shader_name, kwargs['funcs'], start_index, kwargs['glob_attachments'],
-                    diagnostics, src_map=map, end_index=end_index,
+                    diagnostics, src_map=map, end_index=end_index, line_tail=tail,
                 )
-            return cls._dispatch_funcbody(attr, shader_name, diagnostics)
+            return cls._dispatch_funcbody(attr, shader_name, diagnostics), False
 
-        out_line, last_match = '', 0
-        for match in BLOCK_PATTERN.finditer(line_str):
-            for attr in cls.split_attr_block(match.group(1).strip(), SourceLocation(shader_name, start_index), diagnostics):
-                attr.location = SourceLocation(shader_name, start_index)
-                out_line += handle_attr(attr)
-            last_match = match.end()
+        # Attribute matching is confined to the leading run of '[...]' blocks -- not the whole
+        # (possibly GLSL-bearing) `line_str` -- so array brackets in trailing same-line code
+        # (`vec2 name[];`) can never be mistaken for another attribute block. Everything after
+        # that run is `tail`; only the LAST attribute in the run is offered it (nothing before
+        # the last match ever reaches the output anyway -- inter-attribute text is dropped, as
+        # it always has been), and only when that attribute actually claims it (`ctx.result` /
+        # `ctx.tail_consumed`, e.g. `[buffer]`'s same-line shorthand) is the raw tail withheld
+        # from the default verbatim append.
+        run_end = _ATTR_RUN_PATTERN.match(line_str).end()
+        tail = line_str[run_end:]
 
-        # Keep any trailing text after the last attribute (e.g. a comment), including the '\n'.
-        out_line += line_str[last_match:]
+        attrs: list[Attribute] = []
+        for match in BLOCK_PATTERN.finditer(line_str, 0, run_end):
+            for attr in cls.split_attr_block(match.group(1).strip(), map[start_index].location(start_index), diagnostics):
+                attr.location = map[start_index].location(start_index)
+                attrs.append(attr)
+
+        out_line, tail_consumed = '', False
+        for i, attr in enumerate(attrs):
+            piece, consumed = handle_attr(attr, tail if i == len(attrs) - 1 else '')
+            out_line += piece
+            if i == len(attrs) - 1 and consumed: tail_consumed = True
+
+        # Keep any trailing text after the last attribute (e.g. a comment), including the '\n'
+        # -- unless the last attribute already consumed it into its own replacement text.
+        if not tail_consumed: out_line += tail
 
         # Blank the interior lines only now; the caller writes the accumulated final line itself.
         for i in range(start_index, end_index): map[i].data = '\n'
@@ -320,9 +348,11 @@ class AttributeManager:
             return index, line
 
         raw_args = match.group('args') or ''
-        attr = Attribute(match.group('name'), raw_args, *cls.parse_args(raw_args), location=SourceLocation(shader_name, index))
+        attr = Attribute(match.group('name'), raw_args, *cls.parse_args(raw_args), location=map[index].location(index))
         if scope is Scope.GLOBAL:
-            replacement = cls._dispatch_global(
+            # The '#name<args>' form has no same-line-shorthand use case, so its trailing text
+            # is always appended verbatim regardless of `tail_consumed`.
+            replacement, _tail_consumed = cls._dispatch_global(
                 attr, shader_name, kwargs['funcs'], index, kwargs['glob_attachments'],
                 diagnostics, src_map=map, end_index=index,
             )

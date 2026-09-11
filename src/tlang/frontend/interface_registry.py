@@ -50,6 +50,9 @@ class InterfaceDecl:
     layout: str = ''                   # 'std430' | 'std140' | ''
     locations: bool = True             # False => emit without layout(location=N)
     block: bool = False                # uniforms only: True => UBO block form
+    source_member: str = ''            # set only by the [buffer] single-declarator shorthand:
+                                        # the member `name` was derived (or overridden) from,
+                                        # so a duplicate-name diagnostic can name it
 
     @property
     def location(self) -> SourceLocation:
@@ -217,6 +220,78 @@ def parse_struct_at(
     return decl, end_offset
 
 
+def _derive_block_name(member_name: str) -> str:
+    """`ptcPositions` -> `PtcPositions`: upper-case the first character only."""
+    return member_name[:1].upper() + member_name[1:]
+
+
+def _find_top_level_semicolon(mask: str, start: int) -> int | None:
+    depth = 0
+    for i in range(start, len(mask)):
+        if mask[i] == '{': depth += 1
+        elif mask[i] == '}': depth -= 1
+        elif mask[i] == ';' and depth == 0: return i
+    return None
+
+
+def parse_declarator_at(
+    src: str, start_offset: int, module: str, kind: InterfaceKind,
+    *, block_name: str | None = None, **opts: Any,
+) -> tuple[InterfaceDecl, int] | None:
+    """Locate a single `Type name[...];` member statement at/after
+    `start_offset` -- the `[buffer]` single-declarator shorthand, which
+    desugars e.g. `[buffer] vec2 ptcPositions[];` to the equivalent
+    `[buffer(std430)] struct PtcPositions { vec2 ptcPositions[]; };`.
+
+    `block_name`, when given, overrides the name derived from the member
+    (`[buffer(name='ElementCount')]`); otherwise it's `_derive_block_name`
+    of the member's own name.
+
+    Returns `None` only when no statement-terminating ';' follows at all,
+    mirroring `parse_struct_at`'s "nothing here" contract; a malformed or
+    multi-declarator statement raises.
+    """
+    mask = mask_comments_and_strings(src)
+    if (end := _find_top_level_semicolon(mask, start_offset)) is None:
+        return None
+
+    stmt = mask[start_offset:end]
+    line = _line_at(src, start_offset)
+    loc = SourceLocation(module, line)
+    if not stmt.strip():
+        raise TlangAttributeError(
+            "[buffer]: shorthand declaration is empty -- expected a single "
+            "'Type name[...];' member before the ';'",
+            loc,
+        )
+
+    members = _parse_member_statement(stmt, start_offset, src, module, '<buffer declarator>')
+    if len(members) != 1:
+        found = ', '.join(f'{m.type_name} {m.name}{m.array}' for m in members)
+        raise TlangAttributeError(
+            f"[buffer]: shorthand declares {len(members)} members ({found}) -- a buffer block "
+            f"has exactly one name, so multiple declarators here are ambiguous; give each its "
+            f"own block, or use the struct form: '[buffer(...)]\\nstruct Name {{ ... }};'",
+            loc,
+        )
+    member = members[0]
+
+    name = block_name if block_name is not None else _derive_block_name(member.name)
+    if not name or not name.isidentifier():
+        raise TlangAttributeError(
+            f"[buffer]: '{name!r}' is not a valid block name for member '{member.name}' -- "
+            f"give a valid identifier with [buffer(name='...')]",
+            loc,
+        )
+
+    decl = InterfaceDecl(
+        name=name, kind=kind, members=(member,), module=module, line=line,
+        layout=opts.get('layout', ''), locations=opts.get('locations', True),
+        block=opts.get('block', False), source_member=member.name,
+    )
+    return decl, end + 1
+
+
 # ---------------------------------------------------------------------------
 # location spans -- a lookup table over GLSL's builtin types, not a type system
 # ---------------------------------------------------------------------------
@@ -362,9 +437,14 @@ class InterfaceTable:
 
     def add(self, decl: InterfaceDecl) -> None:
         if (existing := self._decls.get(decl.name)) is not None:
+            def hint(d: InterfaceDecl) -> str:
+                # a shorthand-derived name never appears literally in its own
+                # source line, so name the member it came from or the error
+                # points at a symbol the author can't find
+                return f" (derived from [buffer] member '{d.source_member}')" if d.source_member else ''
             raise TlangAttributeError(
                 f"interface '{decl.name}' is declared twice in this module "
-                f"(first at {existing.location}, again at {decl.location})",
+                f"(first at {existing.location}{hint(existing)}, again at {decl.location}{hint(decl)})",
                 decl.location,
             )
         self._decls[decl.name] = decl
@@ -398,6 +478,6 @@ class InterfaceTable:
 
 __all__ = [
     'InterfaceKind', 'InterfaceMember', 'InterfaceDecl',
-    'parse_struct_at', 'location_span', 'member_locations', 'is_arrayed',
+    'parse_struct_at', 'parse_declarator_at', 'location_span', 'member_locations', 'is_arrayed',
     'emit_glsl', 'InterfaceTable',
 ]

@@ -193,6 +193,17 @@ class AttrCtx:
     src_map: Any = None               # dict[int, ShaderSourceLine] | None
     end_index: int | None = None
 
+    # Same-line shorthand support ([buffer]'s single-declarator form): the raw text
+    # following this attribute's own closing ']', when it's the last attribute in a
+    # contiguous run at the start of its line -- '' otherwise (global-scope block-attr
+    # dispatch only; never set for '#name<args>' or function-body attributes).
+    line_tail: str = ''
+    # A handler sets `result` to override the default '//<<ATTR name>>//' marker text
+    # emitted in its place, and `tail_consumed = True` to tell the dispatcher that
+    # `line_tail` was folded into `result` itself and must not also be appended verbatim.
+    result: str | None = None
+    tail_consumed: bool = False
+
 
 @dataclass(slots=True)
 class Diagnostics:

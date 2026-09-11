@@ -110,6 +110,34 @@ one declaration):
 demo:3: interface 'Batch' member 'vec4 items[{{ N }}]' has no measurable location span; add [varyings(locations=false)] or give the array a literal size
 ```
 
+## `[buffer]` single-declarator shorthand errors
+
+**Two declarators in one shorthand statement** (a block has exactly one name, so this is
+ambiguous — works the same whether the declarator is on its own line or shares
+`[buffer]`'s own line):
+```
+demo:1: [buffer]: shorthand declares 2 members (vec2 a[], vec2 b[]) -- a buffer block has exactly one name, so multiple declarators here are ambiguous; give each its own block, or use the struct form: '[buffer(...)]
+struct Name { ... };'
+```
+
+**A struct sharing the attribute's own line** — rejected for every declaration attribute,
+not just `[buffer]`, so a same-line struct never gets silently mis-scanned:
+```
+demo:1: [buffer]: the struct must be on its own line after this attribute, not on the same line as [buffer] (found 'struct X { vec3 a; };')
+```
+
+**Duplicate block name where one side was derived by the shorthand** — names both the
+derived block name and the member it came from, since the block name never appears
+literally in the shorthand's own source line:
+```
+demo:5: interface 'PtcPositions' is declared twice in this module (first at demo:3 (derived from [buffer] member 'ptcPositions'), again at demo:5)
+```
+
+**Invalid `name=` override:**
+```
+demo:1: [buffer(name=...)]: '123bad' is not a valid GLSL block name -- give a valid identifier
+```
+
 ## `[program(...)]` errors
 
 **Compute entry point named as a raster stage:**

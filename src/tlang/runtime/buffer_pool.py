@@ -17,8 +17,11 @@ from dataclasses import dataclass
 from moderngl import Buffer, Context
 
 from tlang.errors import TlangError
+from tlang.runtime.pinned_buffer import PinnedBuffer, PinnedBufferFallback, create_pinned_buffer
 
 logger = logging.getLogger(__name__)
+
+PinnedBufferLike = PinnedBuffer | PinnedBufferFallback
 
 _POISON_BYTE = b'\xCD'
 
@@ -93,22 +96,27 @@ class TempHandle:
 
 
 class BufferPool(Mapping[str, Buffer]):
-    """Two independent responsibilities in one object, sharing only the `Context` and `clear()`.
+    """Three independent responsibilities in one object, sharing only the `Context` and `clear()`.
 
     1. **Persistent registry** (`persistent_buffer`) -- buffers named once, created lazily, and
        never recycled.
     2. **Transient pool** (`alloc_temp` / `free_temp` / `temp` / `frame`) -- size-classed, freely
        recyclable scratch buffers with no identity beyond their `TempHandle`.
+    3. **Pinned registry** (`alloc_pinned` / `free_pinned`) -- persistent-mapped buffers backed by
+       immutable `glBufferStorage` (see `pinned_buffer.PinnedBuffer`). Immutable storage cannot be
+       resized or orphaned, so these never enter the transient free lists either -- each is its
+       own GL allocation with its own lifetime, exactly like a persistent buffer.
 
-    No buffer ever moves between the two. Transient buffers are kept in per-power-of-two-size
+    No buffer ever moves between pools. Transient buffers are kept in per-power-of-two-size
     free lists, so acquire/release are O(1) and a request is only ever satisfied by a buffer of
     its own size class -- never a larger one. `trim()` bounds the resulting per-class memory cost.
 
-    Every persistent buffer's name, and every temporary's `tag` (see `alloc_temp`), lives in one
-    shared namespace: the pool itself implements `Mapping[str, Buffer]`, so `pool['SomeTag']`
-    resolves whichever kind of buffer registered that name, and a `Kernel`/`Pipeline` can be
-    given the pool directly as a buffer source (see `Kernel.source`). A tag freed via `free_temp`
-    stops resolving; a name can't be reused while its current buffer is still live.
+    Every persistent buffer's name, every pinned buffer's tag, and every temporary's `tag` (see
+    `alloc_temp`), lives in one shared namespace: the pool itself implements `Mapping[str, Buffer]`,
+    so `pool['SomeTag']` resolves whichever kind of buffer registered that name, and a
+    `Kernel`/`Pipeline` can be given the pool directly as a buffer source (see `Kernel.source`).
+    A tag freed via `free_temp`/`free_pinned` stops resolving; a name can't be reused while its
+    current buffer is still live.
     """
 
     def __init__(self, ctx: Context, min_size: int = 256, *, debug_poison: bool = False) -> None:
@@ -118,6 +126,10 @@ class BufferPool(Mapping[str, Buffer]):
 
         # --- persistent registry ---
         self._persistent: dict[str, Buffer] = {}
+
+        # --- pinned registry ---
+        self._pinned: dict[str, PinnedBufferLike] = {}          # tag -> pinned buffer (shared namespace)
+        self._pinned_untagged: list[PinnedBufferLike] = []      # anonymous pinned buffers, tracked for teardown only
 
         # --- transient pool ---
         self._free: dict[int, list[Buffer]] = {}          # size class -> idle buffers
@@ -138,26 +150,30 @@ class BufferPool(Mapping[str, Buffer]):
 
     def __getitem__(self, name: str) -> Buffer:
         if (buf := self._persistent.get(name)) is not None: return buf
+        if (buf := self._pinned.get(name)) is not None: return buf
         if (handle := self._tags.get(name)) is not None: return handle
         raise KeyError(name)
 
     def __contains__(self, name: object) -> bool:
-        return name in self._persistent or name in self._tags
+        return name in self._persistent or name in self._pinned or name in self._tags
 
     def __iter__(self) -> Iterator[str]:
         yield from self._persistent
+        yield from self._pinned
         yield from self._tags
 
     def __len__(self) -> int:
-        return len(self._persistent) + len(self._tags)
+        return len(self._persistent) + len(self._pinned) + len(self._tags)
 
     def _claim_name(self, name: str, kind: str) -> None:
-        """Raise if `name` is already live in the other half of the shared namespace.
-        `kind` is what the CALLER is about to register ('persistent buffer' or 'tagged temp'),
+        """Raise if `name` is already live anywhere else in the shared namespace. `kind` is what
+        the CALLER is about to register ('persistent buffer', 'pinned buffer', or 'tagged temp'),
         used to name both the request and whatever already holds the name in the error.
         """
         if name in self._persistent:
             raise TlangError(f"Cannot register {kind} '{name}': a persistent buffer '{name}' already exists")
+        if name in self._pinned:
+            raise TlangError(f"Cannot register {kind} '{name}': a pinned buffer '{name}' already exists")
         if name in self._tags:
             raise TlangError(f"Cannot register {kind} '{name}': a temporary is already tagged '{name}'")
 
@@ -187,6 +203,57 @@ class BufferPool(Mapping[str, Buffer]):
         self._persistent[name] = buf
         logger.debug(f"Created persistent buffer '{name}' of size {buf.size}")
         return buf
+
+    # ------------------------------------------------------------------
+    # Pinned registry
+    # ------------------------------------------------------------------
+
+    def alloc_pinned(self, size: int, *, tag: str | None = None, read: bool = True, write: bool = True) -> PinnedBufferLike:
+        """Allocate a persistent-mapped ("pinned") buffer: immutable `glBufferStorage` mapped
+        once for its whole life, so the CPU touches it through a memoryview instead of
+        `glBufferSubData`/`glGetBufferSubData` (see `pinned_buffer.PinnedBuffer` for the fencing
+        contract that makes that safe by default).
+
+        Immutable storage cannot be resized or orphaned, so pinned buffers never enter the
+        transient free lists `alloc_temp` recycles from -- each is its own GL allocation, live
+        until `free_pinned`/`clear()` releases it. Unlike `persistent_buffer`, calling this
+        again does not return an existing buffer: every call allocates a new one.
+
+        `tag`, if given, registers the buffer in this pool's shared name -> buffer `Mapping` --
+        `pool[tag]` / `kernel.bind(**pool)` then resolve it exactly like a persistent buffer or a
+        tagged temporary. Raises `TlangError` if `tag` is already live anywhere in that
+        namespace. Without a `tag`, the buffer is still tracked by this pool (so `clear()` frees
+        it) but does not resolve by name.
+
+        Falls back to a plain `moderngl.Buffer` behind the identical API when
+        `GL_ARB_buffer_storage` is unavailable -- check `.is_pinned` on the result if that
+        distinction matters to the caller; a warning is logged either way.
+        """
+        if tag is not None: self._claim_name(tag, 'pinned buffer')
+        buf = create_pinned_buffer(self._ctx, size, read=read, write=write)
+        if tag is not None: self._pinned[tag] = buf
+        else: self._pinned_untagged.append(buf)
+        logger.debug(f"Allocated pinned buffer of size {size} (tag={tag!r}, is_pinned={buf.is_pinned})")
+        return buf
+
+    def free_pinned(self, tag_or_buffer: 'str | PinnedBufferLike') -> None:
+        """Release one pinned buffer immediately: accepts either the tag it was allocated with,
+        or the buffer object itself (the only way to address an untagged allocation). Untags it
+        from the shared namespace first, then calls its `release()`. Raises `TlangError` for an
+        unknown tag or a buffer this pool never allocated.
+        """
+        if isinstance(tag_or_buffer, str):
+            buf = self._pinned.pop(tag_or_buffer, None)
+            if buf is None: raise TlangError(f"No pinned buffer tagged '{tag_or_buffer}'")
+        else:
+            buf = tag_or_buffer
+            if buf in self._pinned_untagged:
+                self._pinned_untagged.remove(buf)
+            elif (tag := next((k for k, v in self._pinned.items() if v is buf), None)) is not None:
+                del self._pinned[tag]
+            else:
+                raise TlangError("free_pinned was given a buffer this pool did not allocate")
+        buf.release()
 
     # ------------------------------------------------------------------
     # Transient pool
@@ -309,7 +376,7 @@ class BufferPool(Mapping[str, Buffer]):
         return released
 
     def clear(self) -> None:
-        """Release every buffer this pool owns: persistent, pooled, and checked-out.
+        """Release every buffer this pool owns: persistent, pinned, pooled, and checked-out.
 
         Any handle a caller still holds becomes invalid. This is a safety net against leaking
         GL objects, not the intended flow -- callers should free everything first.
@@ -318,12 +385,16 @@ class BufferPool(Mapping[str, Buffer]):
             logger.warning(f"Clearing BufferPool with {len(self._checked_out)} buffer(s) still checked out")
 
         for buf in self._persistent.values(): buf.release()
+        for buf in self._pinned.values(): buf.release()
+        for buf in self._pinned_untagged: buf.release()
         for bucket in self._free.values():
             for buf in bucket: buf.release()
         for handle in list(self._checked_out.values()):
             handle._kill().release()
 
         self._persistent.clear()
+        self._pinned.clear()
+        self._pinned_untagged.clear()
         self._free.clear()
         self._checked_out.clear()
         self._frame_stack.clear()

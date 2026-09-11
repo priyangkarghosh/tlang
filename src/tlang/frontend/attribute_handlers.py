@@ -26,9 +26,9 @@ from tlang.frontend.attribute_registry import (
     USE_ARG,
     parse_resourceblock,
 )
-from tlang.errors import TlangAttributeError
+from tlang.errors import SourceLocation, TlangAttributeError, TlangError
 from tlang.frontend.function_manager import FunctionDef, FunctionList, InterfaceRef
-from tlang.frontend.interface_registry import InterfaceKind, emit_glsl, parse_struct_at
+from tlang.frontend.interface_registry import InterfaceKind, emit_glsl, parse_declarator_at, parse_struct_at
 from tlang.shader_stages import ShaderStage
 from tlang.shader_utils import mask_comments_and_strings
 
@@ -149,12 +149,21 @@ class AttributeHandlers:
     # -- declaration attributes: [varyings]/[uniforms]/[buffer] --
 
     @staticmethod
+    def _expected_after_desc(ctx: AttrCtx) -> str:
+        """[buffer] also accepts the single-declarator shorthand; the other
+        two declaration attributes only ever take the struct form."""
+        if ctx.attr.name == 'buffer':
+            return "a 'struct Name { ... };' declaration or a single 'Type name[...];' declarator"
+        return "a 'struct Name { ... };' declaration"
+
+    @staticmethod
     def _find_struct_start(ctx: AttrCtx) -> int:
         """First real-content line after this attribute: a still-present
         `ctx.src_map` line, or a function header (even though its body was
         already popped out of `ctx.src_map`)."""
         funcs, src_map = ctx.funcs, ctx.src_map
         assert src_map is not None and ctx.end_index is not None
+        expected = AttributeHandlers._expected_after_desc(ctx)
 
         hi = max(src_map, default=0)
         if isinstance(funcs, FunctionList) and funcs.items:
@@ -165,8 +174,7 @@ class AttributeHandlers:
             if isinstance(funcs, FunctionList) and (fn := funcs.find_within(line)) is not None:
                 found = fn.line_body[fn.line_start].data.strip()
                 raise TlangAttributeError(
-                    f"[{ctx.attr.name}]: expected a 'struct Name {{ ... }};' declaration on the "
-                    f"following line, found '{found}'",
+                    f"[{ctx.attr.name}]: expected {expected} on the following line, found '{found}'",
                     ctx.attr.location,
                 )
             if line in src_map and mask_comments_and_strings(src_map[line].data).strip():
@@ -174,29 +182,89 @@ class AttributeHandlers:
             line += 1
 
         raise TlangAttributeError(
-            f"[{ctx.attr.name}]: expected a 'struct Name {{ ... }};' declaration on the following "
-            f"line, found '<end of file>'",
+            f"[{ctx.attr.name}]: expected {expected} on the following line, found '<end of file>'",
             ctx.attr.location,
         )
+
+    @staticmethod
+    def _declare_buffer_same_line(ctx: AttrCtx, opts: dict[str, Any]) -> None:
+        """`[buffer] vec2 name[];` -- the declarator sits in the tail of the
+        attribute's own line, not on the line after it. `ctx.line_tail` is
+        confined to that one physical line, so every location computed
+        against it is remapped onto `ctx.end_index` (the real file line)
+        before it can reach an author -- on both the success and error paths.
+        """
+        assert isinstance(ctx.funcs, FunctionList) and ctx.end_index is not None
+        block_name = opts.pop('name', None)
+        loc = SourceLocation(ctx.shader_name, ctx.end_index)
+
+        try:
+            result = parse_declarator_at(
+                ctx.line_tail, 0, ctx.shader_name, InterfaceKind.BUFFER, block_name=block_name, **opts,
+            )
+        except TlangError as exc:
+            raise type(exc)(exc.message, loc) from None
+
+        if result is None:
+            raise TlangAttributeError(
+                f"[buffer]: expected {AttributeHandlers._expected_after_desc(ctx)}, "
+                f"found '{ctx.line_tail.strip()}'",
+                loc,
+            )
+        decl, end_offset = result
+        decl = replace(decl, line=ctx.end_index, members=tuple(replace(m, line=ctx.end_index) for m in decl.members))
+
+        ctx.funcs.interfaces.add(decl)
+        lines = emit_glsl(decl)
+        ctx.result = ('\n'.join(lines) if lines else '') + ctx.line_tail[end_offset:]
+        ctx.tail_consumed = True
 
     @staticmethod
     def _declare_interface(ctx: AttrCtx, kind: InterfaceKind, opts: dict[str, Any]) -> None:
         if ctx.src_map is None or ctx.end_index is None or not isinstance(ctx.funcs, FunctionList):
             raise TlangAttributeError(f"[{ctx.attr.name}]: internal error -- missing source map", ctx.attr.location)
 
-        start = AttributeHandlers._find_struct_start(ctx)
-        if not re.match(r'\s*struct\b', mask_comments_and_strings(ctx.src_map[start].data)):
-            raise TlangAttributeError(
-                f"[{ctx.attr.name}]: expected a 'struct Name {{ ... }};' declaration on the following "
-                f"line, found '{ctx.src_map[start].data.strip()}'",
-                ctx.attr.location,
-            )
+        tail_masked = mask_comments_and_strings(ctx.line_tail)
+        if tail_masked.strip():
+            if re.match(r'\s*struct\b', tail_masked):
+                raise TlangAttributeError(
+                    f"[{ctx.attr.name}]: the struct must be on its own line after this attribute, "
+                    f"not on the same line as [{ctx.attr.name}] (found '{ctx.line_tail.strip()}')",
+                    ctx.attr.location,
+                )
+            if kind is not InterfaceKind.BUFFER:
+                raise TlangAttributeError(
+                    f"[{ctx.attr.name}]: expected {AttributeHandlers._expected_after_desc(ctx)} on the "
+                    f"following line, not on the same line as the attribute (found "
+                    f"'{ctx.line_tail.strip()}')",
+                    ctx.attr.location,
+                )
+            AttributeHandlers._declare_buffer_same_line(ctx, opts)
+            return
 
+        start = AttributeHandlers._find_struct_start(ctx)
         indices = sorted(i for i in ctx.src_map if i >= start)
         joined = ''.join(ctx.src_map[i].data for i in indices)
+        is_struct = bool(re.match(r'\s*struct\b', mask_comments_and_strings(ctx.src_map[start].data)))
 
-        result = parse_struct_at(joined, 0, ctx.shader_name, kind, **opts)
-        assert result is not None
+        if is_struct:
+            result = parse_struct_at(joined, 0, ctx.shader_name, kind, **opts)
+        elif kind is InterfaceKind.BUFFER:
+            # the single-declarator shorthand: `[buffer] vec2 name[];` in
+            # place of the struct form -- reuses the same member parser, so
+            # emission/the interface table/cross-module comparison need no
+            # further change
+            block_name = opts.pop('name', None)
+            result = parse_declarator_at(joined, 0, ctx.shader_name, kind, block_name=block_name, **opts)
+        else:
+            result = None
+
+        if result is None:
+            raise TlangAttributeError(
+                f"[{ctx.attr.name}]: expected {AttributeHandlers._expected_after_desc(ctx)} on the "
+                f"following line, found '{ctx.src_map[start].data.strip()}'",
+                ctx.attr.location,
+            )
         decl, end_offset = result
 
         # `joined` line 1 == real source line `start` -- rebase both decl
@@ -228,7 +296,13 @@ class AttributeHandlers:
 
     @staticmethod
     def buffer(ctx: AttrCtx, args: dict[str, Any]) -> None:
-        AttributeHandlers._declare_interface(ctx, InterfaceKind.BUFFER, {'layout': args['layout']})
+        name = args.get('name')
+        if name is not None and not name.isidentifier():
+            raise TlangAttributeError(
+                f"[buffer(name=...)]: '{name}' is not a valid GLSL block name -- give a valid identifier",
+                ctx.attr.location,
+            )
+        AttributeHandlers._declare_interface(ctx, InterfaceKind.BUFFER, {'layout': args['layout'], 'name': name})
 
     @staticmethod
     def uses(ctx: AttrCtx, args: dict[str, Any]) -> None:
@@ -335,10 +409,15 @@ SPECS: list[AttrSpec] = [
     ),
     AttrSpec(
         name='buffer', scope=Scope.GLOBAL,
-        params=(Param('layout', str, choices=('std430', 'std140'), default='std430', positional=0),),
+        params=(
+            Param('layout', str, choices=('std430', 'std140'), default='std430', positional=0),
+            Param('name', str, default=None),
+        ),
         handler=AttributeHandlers.buffer,
-        summary="Declares an SSBO block from the following struct.",
-        example="[buffer(std430)]\nstruct Particles { vec4 pos[]; };",
+        summary="Declares an SSBO block from the following struct, or from a single declarator "
+                "('[buffer] vec2 x[];') whose block name is derived by upper-casing the member's "
+                "first character -- override with name='...' when that's wrong.",
+        example="[buffer(std430)]\nstruct Particles { vec4 pos[]; };\n[buffer] vec2 ptcPositions[];",
     ),
 
     # -- reference attribute: ties a stage function to a declared interface --

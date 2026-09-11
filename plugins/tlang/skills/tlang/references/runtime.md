@@ -370,6 +370,65 @@ Use of buffer handle after free: 'read' accessed on a freed temp buffer
 Buffer handle already freed (double free)
 ```
 
+### Pinned buffers -- persistent-mapped GL storage
+
+`alloc_pinned` gives you a buffer allocated with immutable `glBufferStorage` and mapped ONCE for
+its entire life, so CPU code reads/writes it through a `memoryview` instead of round-tripping
+every access through `glBufferSubData`/`glGetBufferSubData`. It duck-types exactly the slice of
+`moderngl.Buffer` tlang's binding layer touches (`.glo`, `.size`, `.bind_to_storage_buffer`,
+`.read`, `.write`, `.release`), so it drops straight into `kernel.bind(**pool)` with zero
+special-casing, same as a `persistent_buffer` or a tagged `alloc_temp`:
+
+```python
+buf = pool.alloc_pinned(size_bytes, tag='Particles', read=True, write=True)
+
+kernel.buffer_source = pool
+kernel.bind()                 # resolves 'Particles' from the pool exactly like any other buffer
+kernel.dispatch(groups)
+
+pool.free_pinned('Particles')          # or pool.free_pinned(buf) for an untagged allocation
+```
+
+**Immutable storage means no recycling.** `glBufferStorage` allocates memory that cannot be
+resized or orphaned, so pinned buffers never enter `alloc_temp`'s size-classed free lists --
+each is its own GL allocation with its own lifetime. They still live in the pool's shared
+name -> buffer `Mapping` when tagged (`pool[tag]` resolves them like anything else), and
+`pool.clear()` releases every pinned buffer (tagged or not) along with everything else.
+
+**The fencing contract -- read this before passing `sync=False` anywhere.** A coherent
+persistent mapping gives the CPU and GPU zero ordering on their own: the CPU can read bytes an
+in-flight compute dispatch hasn't finished writing, or overwrite bytes a dispatch is still
+reading, and neither ever raises -- it silently produces torn or stale data. `PinnedBuffer`
+closes that hole and makes the safe path the default:
+
+- `buf.fence()` -- call this immediately after GL work that reads or writes the buffer (right
+  after `kernel.dispatch(...)`). Records a fence covering every GL command issued so far.
+- `buf.read(...)` / `buf.write(...)` default to `sync=True`: they block on the most recent
+  fence before touching the mapping, so a plain `.read()` can never hand back torn data. No
+  `fence()` yet means nothing to wait on, so the very first access proceeds immediately.
+- `sync=False` skips that wait -- only for a caller who has already synchronised some other way
+  (e.g. `ctx.finish()`) and wants to avoid a redundant stall.
+- `buf.mapping` is the raw `memoryview` -- zero-copy, and deliberately UNSYNCED. It is the
+  explicit opt-in escape hatch for a caller doing its own sync bookkeeping; `read()`/`write()`
+  are the safe default entry points.
+
+CPU -> GPU writes need no extra sync call: `GL_MAP_COHERENT_BIT` alone guarantees a client write
+is visible to any GL command issued afterwards. `fence`/`wait` exist for the other two hazards --
+GPU-write-then-CPU-read, and CPU-write-racing-a-still-in-flight GPU-read.
+
+**Feature detection, not a hard requirement.** Pinned buffers need `GL_ARB_buffer_storage` (core
+in GL 4.4). When it's absent, `alloc_pinned` does not raise -- it transparently falls back to a
+plain `moderngl.Buffer` behind the identical API and logs a warning. Check `buf.is_pinned` if the
+distinction matters to your code (`True` = real persistent mapping; `False` = fallback, and
+`.mapping` raises `TlangError` since there's nothing zero-copy to hand back -- use `read()`/
+`write()`, which work correctly either way).
+
+**Measured on an RTX 3090 (GL 4.6, moderngl 5.12):** 200 x 1 MiB writes, ~9 ms through a pinned
+mapping vs ~45 ms through `moderngl.Buffer.write` (roughly 5x); 200 x 4 KiB reads, ~0.1 ms
+through a pinned mapping vs ~0.6 ms through `moderngl.Buffer.read` with no GPU work in flight
+(the read gap widens sharply once a real fence wait is involved on the `moderngl.Buffer` side,
+since that path has no cheaper way to synchronise than a full round trip).
+
 ## Which tlang am I actually running?
 
 A copied (non-editable) install and an editable checkout are indistinguishable by version

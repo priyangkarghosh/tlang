@@ -27,8 +27,10 @@ struct Particles { vec4 pos[]; };
 ```
 
 The struct must be on the line(s) **immediately after** the declaration attribute —
-nothing between them. It takes no instance name (`struct Name { ... };`, not
-`struct Name { ... } inst;`) — that's a `TlangSyntaxError` if violated.
+nothing between them, and never sharing the attribute's own line (that's rejected with a
+message naming what was actually written — see below). It takes no instance name
+(`struct Name { ... };`, not `struct Name { ... } inst;`) — that's a `TlangSyntaxError` if
+violated.
 
 `[uniforms]`/`[uniforms(std140)]`/`[buffer(...)]` are unconditional, unambiguous GLSL —
 they mean the same thing regardless of which stage reads them, so they need no
@@ -36,6 +38,47 @@ direction and are visible at module scope to any stage that references a member.
 `[varyings]` is different: the same declaration is `out` in the vertex stage and `in`
 in the fragment stage, so it has no single correct module-scope form and emits nothing
 until a stage brings it in with `[uses(...)]`.
+
+## `[buffer]` single-declarator shorthand
+
+The overwhelming majority of real SSBO blocks are one member — usually a single unsized
+array. Writing the block's name twice (once as the struct name, once as the member) for
+that case is pure ceremony, so `[buffer]` also accepts a single declarator directly,
+in place of the struct:
+
+```glsl
+[buffer]              vec2 ptcPositions[];   // => layout(std430) buffer PtcPositions { vec2 ptcPositions[]; };
+[buffer(std140)]      ComputeDispatch dispatch[];
+[buffer(name='ElementCount')] uint numElements;
+```
+
+Both forms work — the declarator on its own line right after `[buffer]` (mirroring the
+struct form), or sharing the attribute's own line, `[buffer] vec2 ptcPositions[];`, which
+is the natural way to write it. Either way it desugars to exactly the struct form would:
+`layout(std430) buffer PtcPositions { vec2 ptcPositions[]; };`.
+
+**Block name derivation:** the block name is the member's name with its first character
+upper-cased — `ptcPositions` -> `PtcPositions`, `grid` -> `Grid`, `dispatch` -> `Dispatch`.
+This is right most of the time, but not always (`ElementCount { uint numElements; }` would
+derive to `NumElements`), so `[buffer(name='...')]` overrides it — as a keyword, since
+positional arg 0 is `layout` (`[buffer(std430)]`):
+
+```glsl
+[buffer(name='ElementCount')] uint numElements;
+```
+
+**Only `[buffer]`** gets this shorthand — `[varyings]`/`[uniforms]` always take the struct
+form, since a bare varying/uniform declarator has no single obviously-correct desugaring
+(direction, block-vs-loose) the way a buffer's `layout(std430) buffer Name { ... };` does.
+
+**One declarator only:** a block has exactly one name, so `vec2 a[], b[];` (two
+declarators in one statement) is rejected — give each its own `[buffer]`, or use the
+struct form for a genuinely multi-member block:
+
+```glsl
+[buffer(std430)]
+struct ContactCounts { uint contactPairs; uint pairOverflowCount; };
+```
 
 ## `[uses(Name, dir='in'|'out')]`
 
