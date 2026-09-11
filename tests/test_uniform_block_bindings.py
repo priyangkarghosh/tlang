@@ -14,6 +14,7 @@ import pytest
 
 import tlang.compiler.binding_registry as br
 from tlang.compiler.binding_registry import BindingRegistry, BLOCK_PATTERN
+from tlang.compiler.dead_code import remove_dead_blocks
 from tlang.errors import TlangBindingError
 from tlang.shader_stages import ShaderStage
 
@@ -61,10 +62,10 @@ def test_uniform_pattern_ignores_buffer_blocks_and_vice_versa():
 
 
 # ---------------------------------------------------------------------------
-# DCE: remove_unused_buffers now strips dead uniform blocks too
+# DCE: remove_dead_blocks strips dead uniform blocks too
 # ---------------------------------------------------------------------------
 
-def test_dead_uniform_block_is_removed_under_the_old_public_name():
+def test_dead_uniform_block_is_removed():
     src = (
         "layout(std140) uniform DeadFrame {\n"
         "    float time;\n"
@@ -74,7 +75,7 @@ def test_dead_uniform_block_is_removed_under_the_old_public_name():
         "    int x = 1;\n"
         "}\n"
     )
-    out = BindingRegistry.remove_unused_buffers(src)
+    out = remove_dead_blocks(src)
     assert 'DeadFrame' not in out
     assert out.count('\n') == src.count('\n')
 
@@ -89,7 +90,7 @@ def test_live_uniform_block_is_kept():
         "    float t = time;\n"
         "}\n"
     )
-    out = BindingRegistry.remove_unused_buffers(src)
+    out = remove_dead_blocks(src)
     assert 'uniform LiveFrame' in out
 
 
@@ -103,7 +104,7 @@ def test_instance_named_uniform_block_referenced_through_instance_is_kept():
         "    float t = inst.x;\n"
         "}\n"
     )
-    out = BindingRegistry.remove_unused_buffers(src)
+    out = remove_dead_blocks(src)
     assert 'uniform Blk' in out
 
 
@@ -124,7 +125,7 @@ def test_mixed_dead_uniform_and_live_buffer_block_only_the_dead_one_goes():
         "    used_field[0] = 1u;\n"
         "}\n"
     )
-    out = BindingRegistry.remove_unused_buffers(src)
+    out = remove_dead_blocks(src)
     assert 'Dead' not in out
     assert 'buffer Live' in out
     assert 'used_field' in out
@@ -145,7 +146,7 @@ def test_mixed_dead_buffer_and_live_uniform_block_only_the_dead_one_goes():
         "    float t = used_field;\n"
         "}\n"
     )
-    out = BindingRegistry.remove_unused_buffers(src)
+    out = remove_dead_blocks(src)
     assert 'Dead' not in out
     assert 'uniform Live' in out
     assert out.count('\n') == src.count('\n')
@@ -161,7 +162,7 @@ def test_unused_uniform_block_with_nested_struct_removed_cleanly():
         "    int x = 1;\n"
         "}\n"
     )
-    out = BindingRegistry.remove_unused_buffers(src)
+    out = remove_dead_blocks(src)
     assert 'DeadStruct' not in out
     assert 'Inner' not in out
     assert 'items' not in out

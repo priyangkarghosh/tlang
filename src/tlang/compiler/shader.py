@@ -9,6 +9,7 @@
 import logging
 
 from tlang.compiler.binding_registry import BindingRegistry
+from tlang.compiler.dead_code import find_missing_export_calls, remove_dead_blocks, remove_dead_functions
 from tlang.errors import SourceLocation, TlangAttributeError, TlangBindingError, TlangCompileError, TlangError, TlangLinkError
 logger = logging.getLogger(__name__)
 
@@ -421,15 +422,15 @@ class Shader:
             # not a real "undefined variable". Once DFE runs, an unreachable caller's call
             # sites are gone; a reachable caller's aren't, but the check is cheap enough
             # to just always run here rather than depend on that distinction.
-            if (missing := BindingRegistry.find_missing_export_calls(src)):
+            if (missing := find_missing_export_calls(src)):
                 self._raise_missing_export(func, missing, process, dep_plain_funcs)
 
             # strip functions unreachable from `main` -- must run before the block DCE below
             # so it only sees blocks text `main` can actually reach.
-            src = BindingRegistry.remove_dead_functions(src)
+            src = remove_dead_functions(src)
 
             # strip SSBO blocks this entry point never references
-            src = BindingRegistry.remove_unused_buffers(src)
+            src = remove_dead_blocks(src)
 
             stage_of[func.name] = func.stage
             dced[func.name] = src

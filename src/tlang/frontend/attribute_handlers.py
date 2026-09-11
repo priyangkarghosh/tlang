@@ -4,9 +4,8 @@
 # @created       2025-06-17
 # @description   The declarative attribute table (REGISTRY) plus the
 #                bodies of the handful of attributes that are genuinely
-#                imperative. Everything else -- the ~20 bare stage markers
-#                that used to be scattered across three hand-synced tables
-#                -- is pure data: an AttrSpec row with no code at all.
+#                imperative. Every bare stage marker is pure data: an
+#                AttrSpec row with no code at all.
 # @license       MIT
 # -------------------------------------------------------------
 

@@ -3,9 +3,7 @@
 # @author        Priyangkar Ghosh
 # @created       2025-07-13
 # @description   Scans generated GLSL and assigns every binding an artifact needs: SSBO and
-#                uniform blocks, texture and image units, and atomic counters. Also carries
-#                the dead-code passes that decide what survives into an artifact in the
-#                first place, and the diagnostic for a helper that was never emitted.
+#                uniform blocks, texture and image units, and atomic counters.
 # @license       MIT
 # -------------------------------------------------------------
 
@@ -19,8 +17,8 @@ from OpenGL.GL import (
 )
 import regex as re
 
+from tlang.compiler.glsl_text import mask
 from tlang.errors import SourceLocation, TlangBindingError
-from tlang.frontend.function_manager import CONTROL_KEYWORDS, FUNC_PATTERN
 from tlang.shader_stages import ShaderStage
 
 logger = logging.getLogger(__name__)
@@ -200,28 +198,6 @@ ATOMIC_COUNTER_PATTERN = re.compile(
 # counterpart of `BINDING_PATTERN`.
 OFFSET_PATTERN = re.compile(r"\boffset\s*=\s*(\d+)\b")
 
-# Optional instance name (and array suffix) between a block's '}' and its ';'.
-INSTANCE_TAIL_PATTERN = re.compile(r"\s*(\w+)?(?:\s*\[[^\]]*\])?\s*;")
-
-# Qualifier words that prefix a field declarator without naming it.
-FIELD_QUALIFIER_WORDS = frozenset({
-    "highp", "mediump", "lowp",
-    "readonly", "writeonly", "coherent", "volatile", "restrict", "const",
-})
-
-# Comments, strings and preprocessor lines, blanked before scanning so none of
-# them count as a use. Blanked character-for-character to preserve offsets.
-MASK_PATTERN = re.compile(
-    r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"|^[ \t]*#[^\n]*',
-    re.DOTALL | re.MULTILINE,
-)
-
-# An identifier immediately followed by '(' -- a call site, a function header, OR a builtin/
-# type-constructor invocation (`vec4(...)`, `atomicAdd(...)`). Builtins are never keys in the
-# function map this module builds, so they fall out of consideration on their own -- nothing
-# here special-cases them.
-CALL_SITE_PATTERN = re.compile(r'\b([A-Za-z_]\w*)\s*\(')
-
 class BindingRegistry():
     @staticmethod
     def compute_usage(modules: dict[str, str]) -> dict[str, int]:
@@ -233,7 +209,7 @@ class BindingRegistry():
         usage: dict[str, int] = defaultdict(int)
         for name, src in modules.items():
             seen: set[str] = set()
-            masked = BindingRegistry._mask(src)
+            masked = mask(src)
             for _layout_args, _qualifiers, block in BLOCK_PATTERN['buffer'].findall(masked):
                 if block not in seen:
                     usage[block] += 1
@@ -294,7 +270,7 @@ class BindingRegistry():
         per_stage_blocks: dict[ShaderStage, set[str]] = {}
         explicit: dict[str, int] = {}
         for stage, src in stage_sources.items():
-            masked = BindingRegistry._mask(src)
+            masked = mask(src)
             names: set[str] = set()
             for layout_args, _qualifiers, block in pattern.findall(masked):
                 names.add(block)
@@ -382,7 +358,7 @@ class BindingRegistry():
         live: set[str] = set()
         explicit: dict[str, int] = {}
         for src in stage_sources.values():
-            masked = BindingRegistry._mask(src)
+            masked = mask(src)
             for match in pattern.finditer(masked):
                 name = match.group(2)
                 live.add(name)
@@ -503,7 +479,7 @@ class BindingRegistry():
         live: set[str] = set()
         explicit: dict[str, tuple[int, int]] = {}
         for stage, src in stage_sources.items():
-            masked = BindingRegistry._mask(src)
+            masked = mask(src)
             names_here: set[str] = set()
             for match in ATOMIC_COUNTER_PATTERN.finditer(masked):
                 name = match.group(1)
@@ -732,290 +708,3 @@ class BindingRegistry():
                         SourceLocation(artifact),
                     )
 
-    @staticmethod
-    def _mask(src: str) -> str:
-        """Blank comments, string literals, and preprocessor lines in `src`.
-
-        Same length, same newline positions as `src` -- offsets computed
-        against the result stay valid against the original.
-        """
-        blank = lambda m: ''.join(c if c == '\n' else ' ' for c in m.group(0))
-        return MASK_PATTERN.sub(blank, src)
-
-    @staticmethod
-    def _match_brace(text: str, open_pos: int) -> int | None:
-        """Index of the '}' matching the '{' at `open_pos` in `text`, or None if unbalanced."""
-        depth = 0
-        for i in range(open_pos, len(text)):
-            if text[i] == '{': depth += 1
-            elif text[i] == '}':
-                depth -= 1
-                if depth == 0: return i
-        return None
-
-    @staticmethod
-    def _split_top_level(body: str) -> list[str]:
-        """Split a block body into field statements on top-level ';' only.
-
-        A nested struct's own members (inside its `{ }`) sit at brace
-        depth > 0, so e.g. `struct S { vec3 a; float b; } s[];` comes back
-        as one statement, not three -- the inner ';'s don't split it.
-        """
-        stmts, depth, start = [], 0, 0
-        for i, c in enumerate(body):
-            if c == '{': depth += 1
-            elif c == '}': depth -= 1
-            elif c == ';' and depth == 0:
-                stmts.append(body[start:i])
-                start = i + 1
-        return stmts
-
-    @staticmethod
-    def _declarator_names(decl_list: str) -> list[str]:
-        """Trailing identifier of each comma-separated declarator in `decl_list`.
-
-        Strips array suffixes, initializers, and leading qualifier/precision words -- so
-        `highp uint counts[]` yields `counts`, and `uint a, b[4], c` yields `a`, `b`, `c`.
-        """
-        names = []
-        for segment in decl_list.split(','):
-            segment = re.sub(r'\[[^\]]*\]', '', segment).split('=')[0]
-            words = [w for w in segment.split() if w not in FIELD_QUALIFIER_WORDS]
-            if (ids := re.findall(r'[A-Za-z_]\w*', ' '.join(words))):
-                names.append(ids[-1])
-        return names
-
-    @staticmethod
-    def _statement_field_names(stmt: str) -> list[str]:
-        """Field identifier(s) declared by one top-level block statement.
-
-        A plain statement is just a declarator list. A nested-struct statement
-        (`struct S { ... } s[]`) skips the type body -- only the declarator list after its
-        closing brace names an actual block field.
-        """
-        stmt = stmt.strip()
-        if not stmt: return []
-        if (brace := stmt.find('{')) == -1:
-            return BindingRegistry._declarator_names(stmt)
-        close = BindingRegistry._match_brace(stmt, brace)
-        return BindingRegistry._declarator_names(stmt[close + 1:]) if close is not None else []
-
-    @staticmethod
-    def remove_dead_blocks(src: str, keywords: tuple[str, ...] = ('buffer', 'uniform')) -> str:
-        """Strip blocks of each kind in `keywords` whose fields are never referenced elsewhere in `src`.
-
-        A best-effort identifier scan with no notion of scope, biased toward keeping when
-        uncertain (a wrongly-kept block costs a binding slot; a wrongly-removed one is a
-        compile error). An instance-named block is searched for by its instance name. Must
-        run before `allocate_artifact` so bindings are only spent on survivors.
-        """
-        masked = BindingRegistry._mask(src)
-        removable: list[tuple[int, int]] = []
-
-        for keyword in keywords:
-            pattern = BLOCK_PATTERN[keyword]
-            for lm in pattern.finditer(masked):
-                block_name = lm.group(3)
-                open_brace = lm.end() - 1
-
-                if (close_brace := BindingRegistry._match_brace(masked, open_brace)) is None:
-                    logger.warning("DCE: unbalanced braces in %s block '%s' -- keeping.", keyword, block_name)
-                    continue
-
-                if not (tail := INSTANCE_TAIL_PATTERN.match(masked, close_brace + 1)):
-                    logger.warning("DCE: %s block '%s' has no terminating ';' -- keeping.", keyword, block_name)
-                    continue
-
-                instance_name, block_end = tail.group(1), tail.end()
-                body = masked[open_brace + 1:close_brace]
-                field_names = [n for stmt in BindingRegistry._split_top_level(body)
-                               for n in BindingRegistry._statement_field_names(stmt)]
-
-                # an instance-named block is only ever referenced through the
-                # instance (`inst.field`), never the bare field names
-                search_names = [instance_name] if instance_name else field_names
-                if not search_names:
-                    logger.warning("DCE: %s block '%s' has no field/instance name to check -- keeping.", keyword, block_name)
-                    continue
-
-                rest = masked[:lm.start()] + masked[block_end:]
-                if any(re.search(r'\b' + re.escape(n) + r'\b', rest) for n in search_names):
-                    continue  # at least one name is referenced elsewhere -- keep
-
-                removable.append((lm.start(), block_end))
-
-        if not removable: return src
-        removable.sort()
-
-        # Replace each removed span with blank lines (not a deletion) so #line-based
-        # diagnostics further down the module stay line-accurate.
-        out, cursor = [], 0
-        for start, end in removable:
-            out.append(src[cursor:start])
-            out.append('\n' * src.count('\n', start, end))
-            cursor = end
-        out.append(src[cursor:])
-        return ''.join(out)
-
-    @staticmethod
-    def remove_unused_buffers(src: str) -> str:
-        """Back-compat name for `remove_dead_blocks` -- strips dead `buffer`
-        AND `uniform` blocks alike. Kept because `Shader._build` and
-        existing tests call it under this name."""
-        return BindingRegistry.remove_dead_blocks(src)
-
-    # -----------------------------------------------------------------
-    # dead-function elimination -- same textual-approximation class as the
-    # block DCE above, sharing `_mask`/`_match_brace`. Must run before
-    # `remove_dead_blocks` so the block DCE only sees text `main` can
-    # actually reach; see `remove_dead_functions`.
-    # -----------------------------------------------------------------
-
-    @staticmethod
-    def _function_spans(masked: str) -> list[tuple[str, int, int, int, int]] | None:
-        """Every top-level function definition in `masked`, in source order.
-
-        Each entry is `(name, def_start, def_end, body_start, body_end)` where
-        `[def_start, def_end)` spans the whole definition (header + body, for
-        blanking) and `[body_start, body_end)` spans just the body (for a callee
-        scan that must not mistake a function's own header for a call to itself).
-
-        Reuses `FunctionManager.FUNC_PATTERN`/`CONTROL_KEYWORDS` so a multi-line
-        parameter list (its `[^\\)]*` spans newlines) and an `else if (` false
-        match are handled identically to real function extraction. Returns
-        `None` -- "do nothing, bias toward keeping" -- on an unbalanced brace,
-        the same policy `remove_dead_blocks` applies per-block.
-        """
-        spans: list[tuple[str, int, int, int, int]] = []
-        pos = 0
-        while (m := FUNC_PATTERN.search(masked, pos)):
-            def_start, header_end = m.span()
-            name = m.group('name')
-            ret_type = m.group('ret_type').strip()
-            ret_last_word = ret_type.rsplit(None, 1)[-1] if ret_type else ''
-
-            if ret_last_word in CONTROL_KEYWORDS or name in CONTROL_KEYWORDS:
-                pos = def_start + 1
-                continue
-
-            open_brace = header_end - 1
-            if (close_brace := BindingRegistry._match_brace(masked, open_brace)) is None:
-                logger.warning("DFE: unbalanced braces in function '%s' -- keeping everything.", name)
-                return None
-
-            spans.append((name, def_start, close_brace + 1, open_brace + 1, close_brace))
-            pos = close_brace + 1
-
-        return spans
-
-    @staticmethod
-    def _analyze_reachability(
-        src: str,
-    ) -> tuple[list[tuple[str, int, int, int, int]], set[str], set[str]] | None:
-        """Walks the call graph of `src` from `main`, on masked text.
-
-        Returns `(spans, reachable_names, unresolved_calls)`:
-          - `spans`: every top-level function definition, as `_function_spans` returns.
-          - `reachable_names`: function names reachable from `main`, keyed by NAME (an
-            overload group is one node -- if any overload is called, the name is reachable
-            and every body sharing it is kept; a textual walk cannot resolve overloads, and
-            over-inclusion is the safe direction).
-          - `unresolved_calls`: names called from `main`, from a name in `reachable_names`,
-            or from module-scope code (outside any function -- a global initializer counts
-            as a root, same as `main`), that resolve to no definition anywhere in `src`.
-            Builtins/type-constructors end up here and are simply never looked up further.
-
-        Returns `None` -- do nothing -- when the text can't be safely analyzed (unbalanced
-        braces) or has no `main` to root the walk at.
-        """
-        masked = BindingRegistry._mask(src)
-        if (spans := BindingRegistry._function_spans(masked)) is None: return None
-
-        by_name: dict[str, list[tuple[int, int, int, int]]] = defaultdict(list)
-        for name, def_start, def_end, body_start, body_end in spans:
-            by_name[name].append((def_start, def_end, body_start, body_end))
-
-        if 'main' not in by_name:
-            logger.warning("DFE: no 'main' function found in generated unit -- keeping everything.")
-            return None
-
-        graph: dict[str, set[str]] = {}
-        unresolved: dict[str, set[str]] = {}
-        for name, occurrences in by_name.items():
-            callees: set[str] = set()
-            stray: set[str] = set()
-            for _, _, body_start, body_end in occurrences:
-                for call in CALL_SITE_PATTERN.finditer(masked, body_start, body_end):
-                    target = call.group(1)
-                    (callees if target in by_name else stray).add(target)
-            graph[name] = callees
-            unresolved[name] = stray
-
-        module_scope_text, cursor = [], 0
-        for _, def_start, def_end, _, _ in spans:
-            module_scope_text.append(masked[cursor:def_start])
-            cursor = def_end
-        module_scope_text.append(masked[cursor:])
-        module_calls = {m.group(1) for m in CALL_SITE_PATTERN.finditer(''.join(module_scope_text))}
-
-        roots = {'main'} | (module_calls & by_name.keys())
-        reachable: set[str] = set()
-        stack = list(roots)
-        while stack:
-            n = stack.pop()
-            if n in reachable: continue
-            reachable.add(n)
-            stack.extend(graph.get(n, ()))
-
-        reachable_unresolved = set(module_calls - by_name.keys())
-        for n in reachable:
-            reachable_unresolved |= unresolved.get(n, set())
-
-        return spans, reachable, reachable_unresolved
-
-    @staticmethod
-    def remove_dead_functions(src: str) -> str:
-        """Blanks every top-level function definition in `src` unreachable from `main`.
-
-        Must run before `remove_dead_blocks` (and before `allocate_artifact`) so the block
-        DCE sees only text `main` can actually reach -- otherwise an `[export()]`ed helper
-        that this particular entry point never calls still keeps whatever SSBO/UBO blocks
-        it touches alive. Same bias as `remove_dead_blocks`: keep when uncertain, since a
-        wrongly-removed function is a loud compile error, never silent wrongness.
-
-        Blanks with `'\\n' * newline-count`, exactly like `remove_dead_blocks`, so `#line`
-        directives further down the unit stay line-accurate.
-        """
-        if (analysis := BindingRegistry._analyze_reachability(src)) is None: return src
-        spans, reachable, _ = analysis
-
-        removable = [(def_start, def_end) for name, def_start, def_end, _, _ in spans if name not in reachable]
-        if not removable: return src
-        removable.sort()
-
-        out, cursor = [], 0
-        for start, end in removable:
-            out.append(src[cursor:start])
-            out.append('\n' * src.count('\n', start, end))
-            cursor = end
-        out.append(src[cursor:])
-        return ''.join(out)
-
-    @staticmethod
-    def find_missing_export_calls(src: str) -> set[str]:
-        """Names called from `main`-reachable code (or module scope) in `src` that resolve
-        to no function definition anywhere in `src` itself.
-
-        `Shader._build` must call this before `remove_dead_functions` touches the same
-        `src`: this diagnostic exists to name the fix for a helper that was never emitted
-        at all, and once DFE runs the reachable call sites it needs are the only evidence
-        that a call happened -- checking after would mean re-deriving exactly what DFE just
-        threw away, for no benefit.
-
-        A name that comes back here is either a builtin/type-constructor (not this
-        diagnostic's concern) or a real problem for the caller to classify against whatever
-        it knows about the project's module-scope functions (same file, `[include]` closure).
-        """
-        if (analysis := BindingRegistry._analyze_reachability(src)) is None: return set()
-        _, _, reachable_unresolved = analysis
-        return reachable_unresolved

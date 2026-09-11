@@ -114,7 +114,7 @@ def render_overloads(*, real: bool, capacity: int) -> str:
 
 def render_buffer_decl(capacity: int) -> str:
     """The SSBO block `printf`'s real body writes into. Single unnamed-instance block, so
-    `BindingRegistry.remove_dead_blocks`'s reachability scan (which searches for a bare
+    `dead_code.remove_dead_blocks`'s reachability scan (which searches for a bare
     field name when there's no instance name) sees exactly the identifiers the real
     overload bodies reference. `tlang_pf_ready` is a FIXED-size array (`capacity` is a
     compile-time constant baked in as a literal) so it can precede the block's one
@@ -143,8 +143,8 @@ def render_buffer_decl(capacity: int) -> str:
 def render_printf_module(*, debug: bool, capacity: int, used: bool) -> str:
     """GLSL text to append to one stage artifact's source for the `printf(...)` feature.
 
-    Must be appended BEFORE `BindingRegistry.find_missing_export_calls`/
-    `remove_dead_functions`/`remove_unused_buffers` run on that source, and AFTER
+    Must be appended BEFORE `dead_code.find_missing_export_calls`/
+    `remove_dead_functions`/`remove_dead_blocks` run on that source, and AFTER
     `rewrite_printf_calls` has already replaced every call site's `printf("...", ...)`
     text with `printf(<id>u, ...)` in `used`'s own source -- see `Shader._build`.
 

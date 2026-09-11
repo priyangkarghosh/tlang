@@ -5,7 +5,7 @@
 #                The suite is split into two tiers:
 #                  - GL-free tests (the majority): ShaderProcessor,
 #                    AttributeManager, FunctionManager,
-#                    BindingRegistry.remove_unused_buffers, and
+#                    dead_code.remove_dead_blocks, and
 #                    DependencyManager.resolve_dependencies all work
 #                    without a GL context, so these must run on any
 #                    machine (no GPU needed) -- that's what makes CI

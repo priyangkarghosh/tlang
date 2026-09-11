@@ -1,18 +1,18 @@
 # -------------------------------------------------------------
 # @file          test_dead_code_elimination.py
 # @description   GL-free regression tests for
-#                BindingRegistry.remove_unused_buffers -- this is the
+#                dead_code.remove_dead_blocks -- this is the
 #                dangerous pass: it used to DELETE LIVE SSBO blocks.
 #                Every KEPT case below pins a false-positive-removal bug;
 #                every REMOVED case pins that genuinely dead code still
 #                gets cleaned up.
 # -------------------------------------------------------------
 
-from tlang.compiler.binding_registry import BindingRegistry
+from tlang.compiler.dead_code import remove_dead_blocks
 
 
 def _dce(src: str) -> str:
-    return BindingRegistry.remove_unused_buffers(src)
+    return remove_dead_blocks(src)
 
 
 # ---------------------------------------------------------------------------

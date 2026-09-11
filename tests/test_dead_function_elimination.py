@@ -1,7 +1,7 @@
 # -------------------------------------------------------------
 # @file          test_dead_function_elimination.py
 # @description   GL-free regression tests for
-#                BindingRegistry.remove_dead_functions -- dead-function
+#                dead_code.remove_dead_functions -- dead-function
 #                elimination (DFE), which must run before the block DCE
 #                (test_dead_code_elimination.py) so an [export()]ed helper
 #                a given entry point never calls doesn't keep that helper's
@@ -9,15 +9,15 @@
 #                file's tests.
 # -------------------------------------------------------------
 
-from tlang.compiler.binding_registry import BindingRegistry
+from tlang.compiler.dead_code import remove_dead_blocks, remove_dead_functions
 
 
 def _dfe(src: str) -> str:
-    return BindingRegistry.remove_dead_functions(src)
+    return remove_dead_functions(src)
 
 
 def _dfe_then_dce(src: str) -> str:
-    return BindingRegistry.remove_unused_buffers(BindingRegistry.remove_dead_functions(src))
+    return remove_dead_blocks(remove_dead_functions(src))
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +195,7 @@ def test_uncalled_helpers_buffer_block_drops_out_after_dfe_then_dce():
     )
     # block DCE alone (no DFE) wrongly keeps the block -- `deadfield` is
     # still referenced from deadHelper's still-present body
-    assert 'DeadBlock' in BindingRegistry.remove_unused_buffers(src)
+    assert 'DeadBlock' in remove_dead_blocks(src)
 
     out = _dfe_then_dce(src)
     assert 'deadHelper' not in out
