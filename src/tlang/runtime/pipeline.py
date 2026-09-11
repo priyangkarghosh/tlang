@@ -12,10 +12,12 @@ import logging
 from collections.abc import Mapping
 from typing import Any
 from moderngl import Buffer, Context, Program, StorageBlock, Texture, UniformBlock, Uniform
+from OpenGL.GL import glBindBufferRange, GL_ATOMIC_COUNTER_BUFFER
 
 from tlang.errors import SourceLocation, TlangBindingError
 from tlang.runtime.kernel import (
-    bump_image_table_generation, bump_ssbo_table_generation, bump_texture_table_generation,
+    bump_counter_table_generation, bump_image_table_generation, bump_ssbo_table_generation,
+    bump_texture_table_generation,
 )
 
 logger = logging.getLogger(__name__)
@@ -28,12 +30,13 @@ class Pipeline:
     binding, so callers never hardcode binding numbers. Get one via `Shader.get_pipeline(name)`."""
     __slots__ = (
         '_ctx', '_name', '_mglo', '_uniform_cache', '_binding_cache', '_bindings', '_ubo_cache', '_buffer_source',
-        '_texture_units', '_image_units',
+        '_texture_units', '_image_units', '_atomic_counters',
     )
 
     def __init__(
         self, ctx: Context, name: str, program: Program, bindings: Mapping[str, int] | None = None,
         texture_units: Mapping[str, int] | None = None, image_units: Mapping[str, int] | None = None,
+        atomic_counters: Mapping[str, tuple[int, int]] | None = None,
     ):
         self._ctx = ctx
         self._name = name
@@ -51,6 +54,10 @@ class Pipeline:
         # see `Kernel.texture_units`/`Kernel.image_units`, which this mirrors.
         self._texture_units: dict[str, int] = dict(texture_units) if texture_units is not None else {}
         self._image_units: dict[str, int] = dict(image_units) if image_units is not None else {}
+        # name -> (binding, offset-within-binding), pruned to counters this program's linked
+        # GL_ATOMIC_COUNTER_BUFFER interface actually reports active -- see
+        # `Kernel.atomic_counters`, which this mirrors.
+        self._atomic_counters: dict[str, tuple[int, int]] = dict(atomic_counters) if atomic_counters is not None else {}
 
     @property
     def ctx(self): return self._ctx
@@ -72,6 +79,12 @@ class Pipeline:
 
     @property
     def image_units(self) -> Mapping[str, int]: return self._image_units # name -> assigned image unit
+
+    @property
+    def atomic_counters(self) -> Mapping[str, tuple[int, int]]:
+        """Read-only: atomic counter name -> (binding, offset-within-binding). See
+        `Kernel.atomic_counters`, which this mirrors."""
+        return self._atomic_counters
 
     @property
     def buffer_source(self) -> Mapping[str, Buffer] | None:
@@ -234,3 +247,26 @@ class Pipeline:
             raise TlangBindingError(f"'{name}' is not a declared image uniform", SourceLocation(module=self._name))
         image.bind_to_image(unit, read=read, write=write, level=level, format=format)
         bump_image_table_generation()
+
+    def bind_counters(self, **counters: Buffer | tuple[Buffer, int]) -> None:
+        loc = self.bind_counter
+        for k, v in counters.items(): loc(k, *v) if isinstance(v, tuple) else loc(k, v)
+
+    def bind_counter(self, name: str, buffer: Buffer, offset: int = 0) -> None:
+        """Bind `buffer` to atomic counter `name`'s binding IMMEDIATELY, unlike
+        `Kernel.bind_counter`. Same asymmetry as `bind_ssbo`/`bind_texture` above, for the same
+        reason: a `Pipeline` has no dispatch-time hook to defer to.
+
+        `offset` is the byte offset in `buffer` where GL's bound range begins -- see
+        `Kernel.bind_counter`'s docstring for the full composition. The range's size is derived
+        from every counter `self.atomic_counters` says shares `name`'s binding (not just `name`
+        itself), computed fresh from the static canon each call -- so binding either of two
+        counters sharing one binding, in either order, produces the same correctly-sized range,
+        with no cross-call bookkeeping needed the way `Kernel`'s deferred assert requires.
+        """
+        if (pos := self._atomic_counters.get(name)) is None:
+            raise TlangBindingError(f"'{name}' is not a declared atomic counter uniform", SourceLocation(module=self._name))
+        binding, _counter_offset = pos
+        size = max(o + 4 for b, o in self._atomic_counters.values() if b == binding)
+        glBindBufferRange(GL_ATOMIC_COUNTER_BUFFER, binding, buffer.glo, offset, size)
+        bump_counter_table_generation()

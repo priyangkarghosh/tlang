@@ -172,6 +172,58 @@ artifact, the count, and every block name:
 cs_overflow: Artifact 'cs_overflow': comp stage references 17 SSBO blocks ['Blk0', 'Blk1', 'Blk10', 'Blk11', 'Blk12', 'Blk13', 'Blk14', 'Blk15', 'Blk16', 'Blk2', 'Blk3', 'Blk4', 'Blk5', 'Blk6', 'Blk7', 'Blk8', 'Blk9'] but the driver allows only 16 (GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS)
 ```
 
+## Atomic counter binding errors
+
+Atomic counters (`uniform atomic_uint x;`) are a 2-D pool -- `(binding, offset)`, not a single
+index -- because GL is designed to pack several counters into one binding at successive 4-byte
+offsets (`layout(binding=0, offset=0)` / `layout(binding=0, offset=4)` is the idiomatic, intended
+form, not a conflict). Unlike SSBO/UBO blocks or sampler/image uniforms, an atomic counter is
+completely invisible to moderngl's own reflection, so an unpinned declaration is patched into the
+generated GLSL as `layout(binding = N, offset = M)` -- there is no post-link `.value` to assign
+the way there is for a sampler.
+
+**Two counters explicitly pinned to the same `(binding, offset)`** (sharing one binding at
+*different* offsets, the idiomatic form above, is never an error):
+```
+cs_conflict: Artifact 'cs_conflict': atomic counters 'a' and 'b' are both explicitly bound to binding=1, offset=0
+```
+
+**An explicit `binding=` pin past the driver's binding-index ceiling** (`GL_MAX_ATOMIC_COUNTER_
+BUFFER_BINDINGS` is not reported at all on this GPU/driver, so this is the fallback of 8):
+```
+cs_ceil: Artifact 'cs_ceil': binding 10 on atomic counter 'a' exceeds the driver's binding-index ceiling (8, from GL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS (not reported, using fallback))
+```
+
+**The binding pool is exhausted** while packing an unpinned counter (every binding up to the
+ceiling is already claimed, by a pin or by an earlier unpinned counter's own packed binding):
+```
+cs_exhaust: Artifact 'cs_exhaust': out of atomic counter bindings while assigning 'overflow' (binding-index ceiling 8, from GL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS (not reported, using fallback))
+```
+
+**`bind_counter`/`bind_counters` on a name that was never declared, or was pruned as
+declared-but-genuinely-unused** (see `kernel.atomic_counters` -- pruning is scoped to the raw
+`GL_ATOMIC_COUNTER_BUFFER` bindings the linked program's own program-interface query reports
+active, since reflection can't see individual counter names at all):
+```
+cs_typo: 'cc' is not a declared atomic counter uniform
+```
+
+**Two counters sharing one binding were bound (via `bind_counter`) to different buffers or
+different range offsets** -- GL has exactly one bound range per binding, so every name sharing a
+binding must agree on where that range starts:
+```
+cs_share: Kernel 'cs_share': atomic counters sharing binding 0 were bound to different buffers/offsets -- bind every counter that shares one binding to the same buffer and the same range offset
+```
+
+**Unlike every other binding pool, dispatching with a declared-and-required counter never bound
+through `bind_counter` does NOT raise.** This is a deliberate divergence from `bind_ssbo`/
+`bind_texture`/`bind_image`'s "never bound" error: a real, driver-verified consumer of this
+feature binds its one global atomic counter buffer exactly once, via a raw `glBindBufferRange`
+call made entirely outside any `Kernel`, and never rebinds it again for the life of the process --
+correct, idiomatic usage for a resource that (unlike an SSBO) is not swapped to a different buffer
+between kernels or frames. `bind_counter` and its re-assert-at-dispatch discipline still exist and
+still protect a caller who opts in by calling it at all.
+
 ## Missing `[export()]` / misattached `[link]`
 
 A module-scope helper is emitted into an entry point's translation unit only if it is

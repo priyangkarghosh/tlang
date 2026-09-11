@@ -284,17 +284,24 @@ class Shader:
                 patched, canon, uniform_canon = BindingRegistry.allocate_artifact(
                     self._ctx, name, {ShaderStage.COMP: dced[name]}, pref_rank
                 )
-                src = self._sources[name] = patched[ShaderStage.COMP]
+                src = patched[ShaderStage.COMP]
                 texture_canon, image_canon = BindingRegistry.allocate_opaque_units(
                     self._ctx, name, {ShaderStage.COMP: src}
                 )
+                counter_patched, counter_canon = BindingRegistry.allocate_atomic_counters(
+                    self._ctx, name, {ShaderStage.COMP: src}
+                )
+                src = self._sources[name] = counter_patched[ShaderStage.COMP]
 
                 shader = self._ctx.compute_shader(src)
                 BindingRegistry.verify_link(shader, canon, name, uniform_canon)
                 BindingRegistry.assign_opaque_units(shader, texture_canon, image_canon)
+                active_bindings = BindingRegistry.active_atomic_counter_bindings(shader)
+                counter_canon = {n: pos for n, pos in counter_canon.items() if pos[0] in active_bindings}
                 self._kernels[name] = Kernel(
                     self._ctx, name, shader, bindings=canon,
                     texture_units=texture_canon, image_units=image_canon,
+                    atomic_counters=counter_canon,
                 )
 
             except TlangBindingError as e:
@@ -327,8 +334,9 @@ class Shader:
                 entries: dict[ShaderStage, str] = {stage: fn.name for stage, fn in pdef.stages.items()}
 
                 patched, canon, uniform_canon = BindingRegistry.allocate_artifact(self._ctx, prog_name, stage_srcs, pref_rank)
-                for stage, entry in entries.items(): self._sources[entry] = patched[stage]
                 texture_canon, image_canon = BindingRegistry.allocate_opaque_units(self._ctx, prog_name, patched)
+                patched, counter_canon = BindingRegistry.allocate_atomic_counters(self._ctx, prog_name, patched)
+                for stage, entry in entries.items(): self._sources[entry] = patched[stage]
 
                 program = self._ctx.program(
                     vertex_shader=patched.get(ShaderStage.VERT),
@@ -339,10 +347,13 @@ class Shader:
                 )
                 BindingRegistry.verify_link(program, canon, prog_name, uniform_canon)
                 BindingRegistry.assign_opaque_units(program, texture_canon, image_canon)
+                active_bindings = BindingRegistry.active_atomic_counter_bindings(program)
+                counter_canon = {n: pos for n, pos in counter_canon.items() if pos[0] in active_bindings}
                 self._programs[prog_name] = program
                 self._pipelines[prog_name] = Pipeline(
                     self._ctx, prog_name, program, bindings=canon,
                     texture_units=texture_canon, image_units=image_canon,
+                    atomic_counters=counter_canon,
                 )
 
             except (TlangLinkError, TlangBindingError) as e:

@@ -7,9 +7,14 @@
 # @license       MIT
 # -------------------------------------------------------------
 
+import ctypes
 import logging
 from collections import defaultdict
 from moderngl import ComputeShader, Context, Program, StorageBlock, Uniform, UniformBlock
+from OpenGL.GL import (
+    GL_ACTIVE_RESOURCES, GL_ATOMIC_COUNTER_BUFFER, GL_BUFFER_BINDING,
+    glGetProgramInterfaceiv, glGetProgramResourceiv,
+)
 import regex as re
 
 from tlang.errors import SourceLocation, TlangBindingError
@@ -39,10 +44,25 @@ UNIFORM_STAGE_LIMIT_KEY: dict[ShaderStage, str] = {
     ShaderStage.TESE: 'GL_MAX_TESS_EVALUATION_UNIFORM_BLOCKS',
 }
 
-# Per-stage limit map by block keyword, so `_stage_limit` serves both pools.
+# Same, for atomic counter BUFFERS (not counters themselves -- GL packs many counters into
+# one buffer binding, so this is the cap on distinct *bindings* a stage may reference, exactly
+# like the SSBO/UBO limits above are caps on distinct *blocks*). GL_MAX_COMPUTE_ATOMIC_COUNTER_
+# BUFFERS=8 IS reported on the reference machine (RTX 3090 / GL 4.6 / moderngl 5.12) -- unlike
+# GL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS below, which is not.
+ATOMIC_COUNTER_STAGE_LIMIT_KEY: dict[ShaderStage, str] = {
+    ShaderStage.COMP: 'GL_MAX_COMPUTE_ATOMIC_COUNTER_BUFFERS',
+    ShaderStage.VERT: 'GL_MAX_VERTEX_ATOMIC_COUNTER_BUFFERS',
+    ShaderStage.FRAG: 'GL_MAX_FRAGMENT_ATOMIC_COUNTER_BUFFERS',
+    ShaderStage.GEOM: 'GL_MAX_GEOMETRY_ATOMIC_COUNTER_BUFFERS',
+    ShaderStage.TESC: 'GL_MAX_TESS_CONTROL_ATOMIC_COUNTER_BUFFERS',
+    ShaderStage.TESE: 'GL_MAX_TESS_EVALUATION_ATOMIC_COUNTER_BUFFERS',
+}
+
+# Per-stage limit map by block keyword, so `_stage_limit` serves all three pools.
 STAGE_LIMIT_KEYS: dict[str, dict[ShaderStage, str]] = {
     'buffer': STAGE_LIMIT_KEY,
     'uniform': UNIFORM_STAGE_LIMIT_KEY,
+    'counter': ATOMIC_COUNTER_STAGE_LIMIT_KEY,
 }
 
 # Context-wide binding-index ceiling per pool; the two are distinct namespaces.
@@ -54,10 +74,17 @@ MAX_POOL_KEY: dict[str, str] = {
     # `ctx.info` at all on that driver, so it always takes the fallback path below).
     'texture': 'GL_MAX_TEXTURE_IMAGE_UNITS',
     'image': 'GL_MAX_IMAGE_UNITS',
+    # atomic counter BUFFER binding-index ceiling -- NOT reported by `ctx.info` at all on the
+    # reference machine (RTX 3090 / GL 4.6 / moderngl 5.12), so this pool always takes the
+    # `_max_pool` fallback path below, exactly like 'image' does there.
+    'counter': 'GL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS',
 }
 
 # Short noun used in diagnostics for each pool, e.g. "SSBO block" / "uniform block".
-BLOCK_NOUN: dict[str, str] = {'buffer': 'SSBO', 'uniform': 'uniform', 'texture': 'sampler', 'image': 'image'}
+BLOCK_NOUN: dict[str, str] = {
+    'buffer': 'SSBO', 'uniform': 'uniform', 'texture': 'sampler', 'image': 'image',
+    'counter': 'atomic counter',
+}
 
 # Conservative guess used only when the driver reports no per-stage limit.
 # `_stage_limit` logs whenever it applies, so it is never silent.
@@ -148,6 +175,28 @@ OPAQUE_PREFIX_PATTERN = re.compile(
 OPAQUE_PATTERN: dict[str, re.Pattern] = {
     kind: _opaque_uniform_pattern(type_alt) for kind, type_alt in OPAQUE_TYPE_ALT.items()
 }
+
+# -----------------------------------------------------------------
+# atomic_uint discovery -- same "scan, not new syntax" deal, but a THIRD shape from either pool
+# above. Two counters can share one binding at different byte offsets
+# (`layout(binding=0, offset=0) uniform atomic_uint a;` / `(binding=0, offset=4) ... b;`), so
+# allocation here is 2-D (binding, offset), not 1-D. And unlike samplers/images, an atomic
+# counter is COMPLETELY INVISIBLE to moderngl reflection (`program.get('name')` is always
+# `None`, verified against a live GL 4.6 context) -- there is no `.value` to assign post-link,
+# so an unpinned declaration's binding/offset MUST be patched into the GLSL text, the same way
+# `_patch_bindings` does for SSBO/UBO blocks. Anchored on the required `\buniform` literal
+# exactly like `OPAQUE_PATTERN`, for the same reason: an unanchored optional `layout(...)`
+# prefix folded into the main scan made a 13-module build go from 0.5s to 32.5s.
+# -----------------------------------------------------------------
+
+ATOMIC_COUNTER_PATTERN = re.compile(
+    r"\buniform\s+atomic_uint\s+(\w+)\s*(?:\[[^\]]*\])?\s*;",
+    re.MULTILINE,
+)
+
+# `offset = M` inside a matched `layout(...)` argument string -- the atomic-counter-specific
+# counterpart of `BINDING_PATTERN`.
+OFFSET_PATTERN = re.compile(r"\boffset\s*=\s*(\d+)\b")
 
 # Optional instance name (and array suffix) between a block's '}' and its ';'.
 INSTANCE_TAIL_PATTERN = re.compile(r"\s*(\w+)?(?:\s*\[[^\]]*\])?\s*;")
@@ -428,6 +477,193 @@ class BindingRegistry():
             reflected = {n: u for n in list(canon) if isinstance(u := linked.get(n, None), Uniform)}
             for name in [n for n in canon if n not in reflected]: del canon[name]
             for name, unit in canon.items(): reflected[name].value = unit
+
+    @staticmethod
+    def _allocate_counter_canon(
+        ctx: Context, artifact: str, stage_sources: dict[ShaderStage, str],
+    ) -> dict[str, tuple[int, int]]:
+        """Assign (binding, offset) for every live `atomic_uint` counter across `stage_sources`.
+
+        Mirrors `_allocate_canon`'s pin/conflict/exhaustion policy, adapted to a 2-D pool: GL is
+        designed to pack many counters into one buffer binding at successive 4-byte offsets, so
+        unpinned counters of one artifact are packed into a SINGLE binding rather than spending
+        one binding per counter (that would exhaust the 8-per-stage counter-buffer budget after
+        just 8 counters, for no reason -- GL doesn't require it). Explicit `binding=`/`offset=`
+        pins are honoured first and never moved. Raises `TlangBindingError` for a pin conflict
+        (two counters at the same (binding, offset)), a pin past the binding-index ceiling, an
+        exhausted pool, or a stage referencing more distinct counter-buffer bindings than the
+        driver allows.
+        """
+        noun = BLOCK_NOUN['counter']
+        max_pool, pool_source = BindingRegistry._max_pool(ctx, 'counter')
+
+        per_stage_names: dict[ShaderStage, set[str]] = {}
+        live: set[str] = set()
+        explicit: dict[str, tuple[int, int]] = {}
+        for stage, src in stage_sources.items():
+            masked = BindingRegistry._mask(src)
+            names_here: set[str] = set()
+            for match in ATOMIC_COUNTER_PATTERN.finditer(masked):
+                name = match.group(1)
+                names_here.add(name)
+                live.add(name)
+
+                prefix = OPAQUE_PREFIX_PATTERN.search(masked, 0, match.start())
+                if not prefix or not (bm := BINDING_PATTERN.search(prefix.group(1))): continue
+
+                binding = int(bm.group(1))
+                if binding >= max_pool:
+                    raise TlangBindingError(
+                        f"Artifact '{artifact}': binding {binding} on {noun} '{name}' exceeds "
+                        f"the driver's binding-index ceiling ({max_pool}, from {pool_source})",
+                        SourceLocation(artifact),
+                    )
+                om = OFFSET_PATTERN.search(prefix.group(1))
+                offset = int(om.group(1)) if om else 0
+
+                prev = explicit.setdefault(name, (binding, offset))
+                if prev != (binding, offset):
+                    raise TlangBindingError(
+                        f"Artifact '{artifact}': {noun} '{name}' has conflicting explicit "
+                        f"bindings ({prev} vs {(binding, offset)}) across its stages",
+                        SourceLocation(artifact),
+                    )
+            per_stage_names[stage] = names_here
+
+        # Two different counters pinned to the same (binding, offset) would silently alias
+        # onto one 4-byte slot of GL's atomic counter buffer -- refuse it outright. Sharing a
+        # BINDING at different offsets is the idiomatic, intended form and is not checked here.
+        owner_of: dict[tuple[int, int], str] = {}
+        for name, pos in explicit.items():
+            if (owner := owner_of.get(pos)) is not None and owner != name:
+                raise TlangBindingError(
+                    f"Artifact '{artifact}': {noun}s '{owner}' and '{name}' are both explicitly "
+                    f"bound to binding={pos[0]}, offset={pos[1]}",
+                    SourceLocation(artifact),
+                )
+            owner_of[pos] = name
+
+        # Pack every live, unpinned counter into ONE binding (the lowest not already claimed
+        # by a pin), at successive 4-byte offsets not already claimed by a pin at that binding.
+        canon: dict[str, tuple[int, int]] = dict(explicit)
+        reserved_bindings = {b for b, _o in explicit.values()}
+        remaining = sorted(n for n in live if n not in canon)
+
+        if remaining:
+            slot = 0
+            while slot in reserved_bindings: slot += 1
+            if slot >= max_pool:
+                raise TlangBindingError(
+                    f"Artifact '{artifact}': out of {noun} bindings while assigning "
+                    f"'{remaining[0]}' (binding-index ceiling {max_pool}, from {pool_source})",
+                    SourceLocation(artifact),
+                )
+            used_offsets = {o for b, o in explicit.values() if b == slot}
+            next_offset = 0
+            for name in remaining:
+                while next_offset in used_offsets: next_offset += 4
+                canon[name] = (slot, next_offset)
+                used_offsets.add(next_offset)
+                next_offset += 4
+
+        # The limit that actually gates linking is the number of distinct counter-buffer
+        # BINDINGS live in one stage (analogous to the SSBO/UBO per-stage block-count check),
+        # not the number of counter names -- many names can share one binding for free.
+        for stage, names in per_stage_names.items():
+            if not names: continue
+            bindings_used = {canon[n][0] for n in names}
+            limit, limit_source = BindingRegistry._stage_limit(ctx, stage, 'counter')
+            if len(bindings_used) > limit:
+                raise TlangBindingError(
+                    f"Artifact '{artifact}': {stage.value} stage references {len(bindings_used)} "
+                    f"{noun} buffer binding(s) {sorted(bindings_used)} but the driver allows only "
+                    f"{limit} ({limit_source})",
+                    SourceLocation(artifact),
+                )
+
+        return canon
+
+    @staticmethod
+    def allocate_atomic_counters(
+        ctx: Context, artifact: str, stage_sources: dict[ShaderStage, str],
+    ) -> tuple[dict[ShaderStage, str], dict[str, tuple[int, int]]]:
+        """Assign and patch (binding, offset) for every `atomic_uint` counter declared across
+        `stage_sources` -- the atomic-counter counterpart of `allocate_artifact`.
+
+        Unlike SSBO/UBO blocks or sampler/image uniforms, an unpinned atomic counter has no
+        legal declaration at all on this driver (`atomic counter 'x' declaration requires the
+        layout qualifier` -- a real, verified compile error, not a style preference), so every
+        live counter this function returns a canon entry for is ALSO patched into the returned
+        source text, even ones that already had an explicit pin (patching is a no-op for those
+        -- see `_patch_counter_bindings`). Returns `(patched_stage_sources, counter_canon)`.
+        """
+        canon = BindingRegistry._allocate_counter_canon(ctx, artifact, stage_sources)
+        patched = {stage: BindingRegistry._patch_counter_bindings(src, canon) for stage, src in stage_sources.items()}
+        return patched, canon
+
+    @staticmethod
+    def active_atomic_counter_bindings(linked: ComputeShader | Program) -> set[int]:
+        """Every GL binding index actually active on `linked`'s `GL_ATOMIC_COUNTER_BUFFER`
+        program-interface resources, queried through raw pyOpenGL post-link.
+
+        Atomic counters are invisible to moderngl's own reflection entirely (verified: a linked
+        program with `layout(binding=0) uniform atomic_uint x;`, actually used by `main`,
+        reflects no member named 'x' at all), so this raw query is the only way to learn which
+        of tlang's textually-discovered counters the driver actually kept active -- exactly the
+        role `assign_opaque_units`'s reflection check plays for samplers/images, adapted to a
+        driver interface that has no notion of "this uniform's value". The granularity is per
+        BINDING (a whole atomic counter buffer), not per counter name -- GL has no active-
+        resource concept finer than that, which is also the right granularity here: two counters
+        packed into one binding are bound or not bound together regardless of which of them
+        `main` happens to touch.
+        """
+        prog = linked.glo
+        count = glGetProgramInterfaceiv(prog, GL_ATOMIC_COUNTER_BUFFER, GL_ACTIVE_RESOURCES)
+        props = (ctypes.c_uint * 1)(GL_BUFFER_BINDING)
+        bindings: set[int] = set()
+        for i in range(count):
+            params = (ctypes.c_int * 1)()
+            glGetProgramResourceiv(prog, GL_ATOMIC_COUNTER_BUFFER, i, 1, props, 1, None, params)
+            bindings.add(int(params[0]))
+        return bindings
+
+    @staticmethod
+    def _patch_counter_bindings(src: str, canon: dict[str, tuple[int, int]]) -> str:
+        """Inject `layout(binding = N, offset = M)` before every `atomic_uint` declarator in
+        `src` that doesn't already pin its own binding, using `canon`.
+
+        Unlike `_patch_bindings`, an `atomic_uint` declaration has no `layout(...)` required to
+        begin with, so one may need to be manufactured whole cloth rather than merely amended.
+        Scans `ATOMIC_COUNTER_PATTERN` once (anchored on the required `uniform` literal, cheap);
+        only at each already-matched offset does it check -- via `OPAQUE_PREFIX_PATTERN`, never
+        across the whole file -- whether a `layout(...)` already precedes it. This is the same
+        two-step shape discovery already uses, for the same performance reason.
+        """
+        if not canon: return src
+
+        out: list[str] = []
+        cursor = 0
+        for match in ATOMIC_COUNTER_PATTERN.finditer(src):
+            name = match.group(1)
+            if name not in canon: continue  # not live per the masked scan -- leave untouched
+
+            prefix = OPAQUE_PREFIX_PATTERN.search(src, 0, match.start())
+            if prefix and BINDING_PATTERN.search(prefix.group(1)):
+                continue  # already pins its own binding -- leave untouched
+
+            binding, offset = canon[name]
+            if prefix:
+                out.append(src[cursor:prefix.start()])
+                new_args = f"binding = {binding}, offset = {offset}, {prefix.group(1)}".strip().strip(',')
+                out.append(f"layout({new_args})")
+                cursor = prefix.end()
+            else:
+                out.append(src[cursor:match.start()])
+                out.append(f"layout(binding = {binding}, offset = {offset}) ")
+                cursor = match.start()
+
+        out.append(src[cursor:])
+        return ''.join(out)
 
     @staticmethod
     def _patch_bindings(src: str, keyword: str, canon: dict[str, int]) -> str:

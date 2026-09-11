@@ -12,7 +12,7 @@ import time
 from collections.abc import Mapping
 from typing import Any
 from moderngl import (
-    SHADER_STORAGE_BARRIER_BIT, Buffer, ComputeShader,
+    ATOMIC_COUNTER_BARRIER_BIT, SHADER_STORAGE_BARRIER_BIT, Buffer, ComputeShader,
     Context, StorageBlock, Texture, Uniform, UniformBlock
 )
 from OpenGL.GL import (
@@ -78,17 +78,34 @@ def bump_image_table_generation() -> int:
     return _image_table_generation
 
 
+# Same discipline again, for GL's atomic counter buffer binding table (`glBindBufferRange` on
+# `GL_ATOMIC_COUNTER_BUFFER`) -- a fourth, independent process-global table.
+_counter_table_generation = 0
+
+
+def bump_counter_table_generation() -> int:
+    """Record one write to GL's global atomic-counter-buffer binding table and return the new
+    generation. See `bump_ssbo_table_generation` -- same discipline, separate table. Also called
+    from `Pipeline.bind_counter`, which binds immediately rather than deferring, exactly like
+    `Pipeline.bind_ssbo`."""
+    global _counter_table_generation
+    _counter_table_generation += 1
+    return _counter_table_generation
+
+
 class Kernel:
     __slots__ = (
         '_ctx', '_name', '_mglo', '_uniform_cache', '_binding_cache', '_bindings', '_ubo_cache',
         '_ssbo_bindings', '_bound_generation', '_buffer_source',
         '_texture_units', '_image_units', '_texture_bindings', '_image_bindings',
         '_bound_texture_generation', '_bound_image_generation',
+        '_atomic_counters', '_counter_bindings', '_bound_counter_generation',
     )
 
     def __init__(
         self, ctx: Context, name: str, shader: ComputeShader, bindings: Mapping[str, int] | None = None,
         texture_units: Mapping[str, int] | None = None, image_units: Mapping[str, int] | None = None,
+        atomic_counters: Mapping[str, tuple[int, int]] | None = None,
     ):
         self._ctx = ctx
         self._name = name
@@ -131,6 +148,23 @@ class Kernel:
         self._bound_texture_generation: int = -1
         self._bound_image_generation: int = -1
 
+        # name -> (binding, offset-within-binding) decided by
+        # `BindingRegistry.allocate_atomic_counters` and patched into the GLSL as
+        # `layout(binding = N, offset = M)`, PRUNED to counters the linked program's own
+        # GL_ATOMIC_COUNTER_BUFFER program interface actually reports active (see
+        # `BindingRegistry.active_atomic_counter_bindings` -- reflection cannot see atomic
+        # counters at all, so this raw post-link query is the only source of truth for which
+        # declared counters this artifact genuinely uses). This is the kernel's REQUIRED set,
+        # exactly like `_bindings`/`_texture_units`/`_image_units` above.
+        self._atomic_counters: dict[str, tuple[int, int]] = dict(atomic_counters) if atomic_counters is not None else {}
+        # name -> (buffer, range_offset) recorded by `bind_counter`/`bind_counters`, NOT yet
+        # written to GL -- same deferred-until-dispatch discipline as `_ssbo_bindings`.
+        # `range_offset` is the byte offset in `buffer` where GLSL's own `offset = 0` would
+        # land -- see `bind_counter`'s docstring for how this composes with the counter's own
+        # canon offset.
+        self._counter_bindings: dict[str, tuple[Buffer, int]] = {}
+        self._bound_counter_generation: int = -1
+
     @property
     def ctx(self): return self._ctx # mgl context
 
@@ -151,6 +185,14 @@ class Kernel:
 
     @property
     def image_units(self) -> Mapping[str, int]: return self._image_units # name -> assigned image unit
+
+    @property
+    def atomic_counters(self) -> Mapping[str, tuple[int, int]]:
+        """Read-only: atomic counter name -> (binding, offset-within-binding), pruned to
+        counters this artifact's linked program actually uses (see the constructor's
+        docstring). tlang's own textual canon is the only source of truth here -- reflection
+        cannot see atomic counters at all."""
+        return self._atomic_counters
 
     @property
     def buffer_source(self) -> Mapping[str, Buffer] | None:
@@ -178,36 +220,51 @@ class Kernel:
     def __contains__(self, value: str) -> bool:
         return value in self._mglo
 
+    @property
+    def default_barrier_bits(self) -> int:
+        """`SHADER_STORAGE_BARRIER_BIT`, plus `ATOMIC_COUNTER_BARRIER_BIT` when this artifact
+        declares a genuinely-used (per `atomic_counters`) counter. Consumers used to hand-write
+        that OR themselves, with a comment explaining why -- tlang knows its own artifact's
+        counter set, so it derives this instead. This is what `dispatch`/`dispatch_indirect` use
+        whenever `barrier_bits` is not passed explicitly; an explicit value always wins
+        unchanged. Exposed read-only so a caller can inspect what a bare `dispatch()` will use
+        without needing to trigger one."""
+        bits = SHADER_STORAGE_BARRIER_BIT
+        if self._atomic_counters: bits |= ATOMIC_COUNTER_BARRIER_BIT
+        return bits
+
     def dispatch(
         self,
         group_x: int = 1,
         group_y: int = 1,
         group_z: int = 1,
         barrier: bool = True,
-        barrier_bits: int = SHADER_STORAGE_BARRIER_BIT,
+        barrier_bits: int | None = None,
         allow_unbound: frozenset[str] | set[str] = frozenset(),
     ) -> None:
         self._assert_ssbo_bindings(allow_unbound)
         self._assert_texture_bindings(allow_unbound)
         self._assert_image_bindings(allow_unbound)
+        self._assert_counter_bindings(allow_unbound)
         self._mglo.run(group_x, group_y, group_z)
-        if barrier: self._ctx.memory_barrier(barrier_bits)
+        if barrier: self._ctx.memory_barrier(barrier_bits if barrier_bits is not None else self.default_barrier_bits)
 
     def dispatch_indirect(
         self,
         buffer: Buffer,
         offset: int = 0,
         barrier: bool = True,
-        barrier_bits: int = SHADER_STORAGE_BARRIER_BIT,
+        barrier_bits: int | None = None,
         allow_unbound: frozenset[str] | set[str] = frozenset(),
     ) -> None:
         self._assert_ssbo_bindings(allow_unbound)
         self._assert_texture_bindings(allow_unbound)
         self._assert_image_bindings(allow_unbound)
+        self._assert_counter_bindings(allow_unbound)
         glUseProgram(self.glo)
         glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, buffer.glo)
         glDispatchComputeIndirect(offset)
-        if barrier: self._ctx.memory_barrier(barrier_bits)
+        if barrier: self._ctx.memory_barrier(barrier_bits if barrier_bits is not None else self.default_barrier_bits)
 
     def dispatch_timed(
         self,
@@ -385,9 +442,110 @@ class Kernel:
         self._image_bindings[name] = (image, read, write, level, format)
         self._bound_image_generation = -1  # force a re-assert on this kernel's next dispatch
 
+    def bind_counters(self, **counters: Buffer | tuple[Buffer, int]) -> None:
+        loc = self.bind_counter
+        for k, v in counters.items(): loc(k, *v) if isinstance(v, tuple) else loc(k, v)
+
+    def bind_counter(self, name: str, buffer: Buffer, offset: int = 0) -> None:
+        """Record that atomic counter `name` should be bound to `buffer` on this kernel,
+        resolving its (binding, offset-within-binding) from `self.atomic_counters` -- the canon
+        `BindingRegistry.allocate_atomic_counters` assigned and patched into the GLSL as
+        `layout(binding = N, offset = M)`. Deferred until the next dispatch, same discipline as
+        `bind_ssbo`/`bind_texture` -- see `bind_ssbo`'s docstring for why.
+
+        **Offset composition.** `offset` is the byte offset WITHIN `buffer` where GL's bound
+        RANGE begins -- i.e. where the shader's own `layout(offset = 0)` would land -- NOT
+        `name`'s own 4 bytes. `name`'s own canon offset `M` is baked into the compiled GLSL, so
+        its actual address is `offset + M` in `buffer`. This is the natural composition for the
+        idiomatic packed form: two counters sharing one `binding` (`layout(binding=0, offset=0)`
+        / `layout(binding=0, offset=4)`) are bound by calling `bind_counter` for EACH name
+        against the SAME `buffer` and the SAME `offset` (typically 0, the start of your packed
+        counter storage) -- tlang works out the range size from the canon so both land
+        correctly. Binding counters that share a `binding` to different buffers or different
+        `offset`s is a caller bug and raises at the next dispatch (`_assert_counter_bindings`),
+        not here, since the conflict is only visible once every name sharing that binding has
+        been recorded.
+
+        `name` is validated immediately against `self.atomic_counters` -- a name this artifact
+        does not require (never declared, or declared but pruned as genuinely unused -- see the
+        constructor's docstring) is a typo, and raises `TlangBindingError` right here.
+        """
+        self._resolve_counter_binding(name)  # validate now; raises TlangBindingError on typo
+        self._counter_bindings[name] = (buffer, offset)
+        self._bound_counter_generation = -1  # force a re-assert on this kernel's next dispatch
+
+    def _resolve_counter_binding(self, name: str) -> tuple[int, int]:
+        """Resolve `name`'s (binding, offset) from the static canon (`self._atomic_counters`).
+        Raises `TlangBindingError` if `name` isn't a required atomic counter -- that's a typo,
+        or a counter this artifact declared but never actually uses (pruned from the required
+        set, see the constructor's docstring)."""
+        if (pos := self._atomic_counters.get(name)) is not None:
+            return pos
+        raise TlangBindingError(f"'{name}' is not a declared atomic counter uniform", SourceLocation(module=self._name))
+
+    def _assert_counter_bindings(self, allow_unbound: frozenset[str] | set[str] = frozenset()) -> None:
+        """Atomic-counter counterpart of `_assert_ssbo_bindings`/the texture equivalent, with one
+        deliberate divergence: it does NOT raise for a required counter that was never bound
+        through this kernel. Everything else mirrors them exactly -- liveness checked every
+        dispatch, full recorded set re-asserted with the same generation-counter fast path
+        against this table's own counter (`_counter_table_generation`), one `glBindBufferRange`
+        call per distinct GL binding (not per name, since several names can share one binding --
+        see `bind_counter`), sized wide enough to cover every live counter the canon says shares
+        it.
+
+        Why no "never bound" error, unlike every other pool: a real, driver-verified consumer of
+        this feature (pbd's `physics.py`) binds its one global atomic counter buffer exactly
+        ONCE, with a raw `glBindBufferRange` call made outside any `Kernel` entirely, and never
+        rebinds it again for the life of the process -- correct, idiomatic usage for a resource
+        that (unlike an SSBO) never gets swapped to a different buffer between kernels or frames.
+        Enforcing "bound through this kernel or dispatch raises" would break that pattern for
+        every kernel using such a counter. `bind_counter`/`bind_counters` and the re-assert
+        discipline below still exist and still protect a caller who DOES want them: recording a
+        bind here still catches a typo immediately, and re-asserting at dispatch still closes the
+        T12-style cross-wiring hazard for anyone who opts in by calling `bind_counter` at all.
+        `allow_unbound` is accepted for signature symmetry with the other `_assert_*` methods but
+        has no effect here, since nothing here ever raises over an unbound name.
+        """
+        for name, (buffer, _offset) in self._counter_bindings.items():
+            if not getattr(buffer, 'alive', True):
+                raise TlangBindingError(
+                    f"Kernel '{self._name}': buffer bound to atomic counter '{name}' has been "
+                    f"freed (recycled temp buffer) -- re-bind before dispatching",
+                    SourceLocation(module=self._name),
+                )
+
+        if self._bound_counter_generation == _counter_table_generation:
+            return  # nothing else has touched the global counter-buffer table since our last assert
+
+        by_binding: dict[int, tuple[Buffer, int]] = {}
+        for name, (buffer, offset) in self._counter_bindings.items():
+            binding, _counter_offset = self._atomic_counters[name]
+            if binding in by_binding:
+                existing_buffer, existing_offset = by_binding[binding]
+                if existing_buffer is not buffer or existing_offset != offset:
+                    raise TlangBindingError(
+                        f"Kernel '{self._name}': atomic counters sharing binding {binding} were "
+                        f"bound to different buffers/offsets -- bind every counter that shares "
+                        f"one binding to the same buffer and the same range offset",
+                        SourceLocation(module=self._name),
+                    )
+                continue
+            by_binding[binding] = (buffer, offset)
+
+        for binding, (buffer, offset) in by_binding.items():
+            size = max(o + 4 for b, o in self._atomic_counters.values() if b == binding)
+            glBindBufferRange(GL_ATOMIC_COUNTER_BUFFER, binding, buffer.glo, offset, size)
+
+        generation = bump_counter_table_generation() if self._counter_bindings else _counter_table_generation
+        self._bound_counter_generation = generation
+
     def bind_atomic_counter(
         self, binding: int, buffer: Buffer, offset: int = 0
     ) -> None:
+        """Documented escape hatch, kept working exactly as before `bind_counter` existed: binds
+        `buffer` to the RAW `binding` index immediately (no deferral, no name validation, no
+        generation-counter tracking). Prefer `bind_counter`/`bind_counters` for anything tlang
+        itself assigned a binding to -- this one takes the number you hand it, on faith."""
         glBindBufferRange(GL_ATOMIC_COUNTER_BUFFER, binding, buffer.glo, offset, 4)
 
     def bind_atomic_counters(

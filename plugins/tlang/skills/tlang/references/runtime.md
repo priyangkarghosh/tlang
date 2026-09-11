@@ -122,8 +122,14 @@ kernel.dispatch(n, barrier=False)                         # skip when chaining d
 kernel.dispatch_indirect(indirect_buffer, offset=0)
 elapsed_ms = kernel.dispatch_timed(n)                     # blocks on finish() -- profiling only
 
-kernel.bind_atomic_counter(binding, buf, offset=0)
+kernel.bind_counter('slotCounter', buf)                  # by name, like everything else above
+kernel.bind_counters(slotCounter=buf, other=(buf2, 4))    # tuple = (buffer, range offset)
+
+kernel.bind_atomic_counter(binding, buf, offset=0)        # raw escape hatch -- still works, see below
 kernel.bind_atomic_counters((0, buf_a), (1, buf_b, 4))
+
+kernel.atomic_counters     # Mapping[str, tuple[int, int]] -- name -> (binding, offset), for debugging
+kernel.default_barrier_bits   # what a bare dispatch(...) will use -- see "Atomic counters" below
 ```
 
 `dispatch` takes **workgroup counts, not thread counts**. With `[numthreads(256,1,1)]`,
