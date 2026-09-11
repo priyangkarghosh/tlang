@@ -107,7 +107,9 @@ class PinnedBuffer:
         if read: flags |= GL_MAP_READ_BIT
         if write: flags |= GL_MAP_WRITE_BIT
 
-        glo = glGenBuffers(1)
+        # PyOpenGL hands back a numpy uint32 when numpy is installed and a plain int when
+        # it is not, so `glo`'s type would depend on the environment. Pin it to int.
+        glo = int(glGenBuffers(1))
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, glo)
         try:
             glBufferStorage(GL_SHADER_STORAGE_BUFFER, size, None, flags)
