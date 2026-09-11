@@ -95,7 +95,9 @@ void cs_go() {
 ```python
 kernel = shader.get_kernel('cs_go')
 kernel.bind(Data=buf, Unused=other)           # bind BY NAME; extras are ignored
-kernel.dispatch((n + 255) // 256)             # workgroup counts, not thread counts
+kernel.dispatch_for(n)                        # covers n invocations -- derives group count
+                                               # from the LINKED kernel's local_size, not a
+                                               # Python-side redeclaration of [numthreads(...)]
 ```
 
 ## Rules that prevent the frequent mistakes
@@ -134,10 +136,16 @@ kernel.dispatch((n + 255) // 256)             # workgroup counts, not thread cou
   from what you pass raises. `bind_ssbo`/`bind_ssbos` stay the explicit form and still
   raise on a name the artifact doesn't declare (that's a typo).
 - **Binds are recorded on the kernel and applied at dispatch, not immediately.**
-  `dispatch`/`dispatch_indirect`/`dispatch_timed` re-assert that kernel's whole set
-  first, so binding through one kernel and dispatching another can no longer cross-wire
-  them. Dispatching with a required block never bound raises `TlangBindingError`; pass
-  `allow_unbound={'Name'}` to opt out.
+  `dispatch`/`dispatch_for`/`dispatch_indirect`/`dispatch_timed` re-assert that kernel's
+  whole set first, so binding through one kernel and dispatching another can no longer
+  cross-wire them. Dispatching with a required block never bound raises
+  `TlangBindingError`; pass `allow_unbound={'Name'}` to opt out.
+- **Prefer `kernel.dispatch_for(n)` over hand-rolled ceiling division.** It reads the
+  linked kernel's actual work-group size off the driver (`kernel.local_size`) and derives
+  the group count itself — `[numthreads(...)]`'s argument can be a GLSL macro name, not a
+  Python integer, so a Python-side redeclaration of the block size can silently drift
+  from the shader's. `dispatch(groups)` (raw group counts) is still there as the explicit
+  form.
 - **A module-scope helper needs `[export()]`** (module-wide) or `[link('name')]` on the
   entry point (that one kernel). This is deliberate — it's what keeps artifacts small.
   Calling a helper that has neither is now a tlang error naming the helper and the

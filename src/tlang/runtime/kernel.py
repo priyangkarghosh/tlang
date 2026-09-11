@@ -6,6 +6,7 @@
 # @license       MIT
 # -------------------------------------------------------------
 
+import ctypes
 import difflib
 import logging
 import time
@@ -18,7 +19,9 @@ from moderngl import (
 from OpenGL.GL import (
     glBindBufferRange, GL_ATOMIC_COUNTER_BUFFER,
     glDispatchComputeIndirect, GL_DISPATCH_INDIRECT_BUFFER,
-    glBindBuffer, glUseProgram
+    glBindBuffer, glUseProgram,
+    glGetProgramiv, GL_COMPUTE_WORK_GROUP_SIZE,
+    glGetIntegeri_v, GL_ATOMIC_COUNTER_BUFFER_BINDING,
 )
 
 from tlang.errors import SourceLocation, TlangBindingError
@@ -100,6 +103,7 @@ class Kernel:
         '_texture_units', '_image_units', '_texture_bindings', '_image_bindings',
         '_bound_texture_generation', '_bound_image_generation',
         '_atomic_counters', '_counter_bindings', '_bound_counter_generation',
+        '_local_size',
     )
 
     def __init__(
@@ -164,6 +168,10 @@ class Kernel:
         # canon offset.
         self._counter_bindings: dict[str, tuple[Buffer, int]] = {}
         self._bound_counter_generation: int = -1
+
+        # lazily-queried, then cached forever -- a linked program's work-group size cannot
+        # change. See `local_size`.
+        self._local_size: tuple[int, int, int] | None = None
 
     @property
     def ctx(self): return self._ctx # mgl context
@@ -233,6 +241,25 @@ class Kernel:
         if self._atomic_counters: bits |= ATOMIC_COUNTER_BARRIER_BIT
         return bits
 
+    @property
+    def local_size(self) -> tuple[int, int, int]:
+        """The linked kernel's actual work-group size (`local_size_x/y/z`), queried once from the
+        driver and cached -- it cannot change for an already-linked program.
+
+        This queries GL rather than reading back `[numthreads(...)]`'s arguments, deliberately:
+        tlang does not coerce those arguments to `int` (see the note in
+        `AttributeHandlers.numthreads`) since `numthreads(BLOCK_SIZE, 1, 1)` is a legitimate GLSL
+        preprocessor macro name resolved by the driver, not a Python integer. The linked program
+        is therefore the only authoritative source for the real size --
+        `glGetProgramiv(glo, GL_COMPUTE_WORK_GROUP_SIZE, ...)` resolves any such macro the same
+        way the driver did at link time.
+        """
+        if self._local_size is None:
+            sizes = (ctypes.c_int * 3)()
+            glGetProgramiv(self.glo, GL_COMPUTE_WORK_GROUP_SIZE, sizes)
+            self._local_size = (sizes[0], sizes[1], sizes[2])
+        return self._local_size
+
     def dispatch(
         self,
         group_x: int = 1,
@@ -248,6 +275,44 @@ class Kernel:
         self._assert_counter_bindings(allow_unbound)
         self._mglo.run(group_x, group_y, group_z)
         if barrier: self._ctx.memory_barrier(barrier_bits if barrier_bits is not None else self.default_barrier_bits)
+
+    def dispatch_for(
+        self,
+        x: int,
+        y: int = 1,
+        z: int = 1,
+        elems_per_thread: int = 1,
+        barrier: bool = True,
+        barrier_bits: int | None = None,
+        allow_unbound: frozenset[str] | set[str] = frozenset(),
+    ) -> None:
+        """Dispatch enough work-groups to cover `x` (and, for a 2-D/3-D kernel, `y`/`z`)
+        invocations, deriving the group counts from `local_size` -- the linked program's actual
+        work-group size -- instead of making the caller redeclare `[numthreads(...)]`'s value in
+        Python and recompute the group count by hand:
+
+            kernel.dispatch_for(num_particles)              # 1-D, the common case
+            kernel.dispatch_for(width, height)               # 2-D
+            kernel.dispatch_for(width, height, depth)        # 3-D
+            kernel.dispatch_for(n, elems_per_thread=4)       # scan-style, 4 elements/thread
+
+        Ceiling division throughout: a kernel is never under-dispatched, even when `x`/`y`/`z`
+        isn't an exact multiple of `local_size`. `elems_per_thread` divides `x` before the
+        ceiling division -- for a kernel whose each invocation processes more than one element
+        along its (typically only) axis. It applies to `x` alone, matching the 1-D idiom it's
+        modeled on; a kernel needing per-thread multiplicity on more than one axis should call
+        `dispatch` directly with hand-computed group counts.
+
+        Forwards `barrier`/`barrier_bits`/`allow_unbound` to `dispatch` unchanged, so this goes
+        through the exact same binding re-assert path (`_assert_ssbo_bindings` and its
+        texture/image/counter counterparts) -- it is a drop-in replacement for
+        `dispatch((n + local_size[0] - 1) // local_size[0])`, not a separate binding path.
+        """
+        lsx, lsy, lsz = self.local_size
+        gx = -(-x // (lsx * elems_per_thread))
+        gy = -(-y // lsy)
+        gz = -(-z // lsz)
+        self.dispatch(gx, gy, gz, barrier=barrier, barrier_bits=barrier_bits, allow_unbound=allow_unbound)
 
     def dispatch_indirect(
         self,
@@ -485,32 +550,48 @@ class Kernel:
 
     def _assert_counter_bindings(self, allow_unbound: frozenset[str] | set[str] = frozenset()) -> None:
         """Atomic-counter counterpart of `_assert_ssbo_bindings`/the texture equivalent, with one
-        deliberate divergence: it does NOT raise for a required counter that was never bound
-        through this kernel. Everything else mirrors them exactly -- liveness checked every
+        deliberate divergence: a counter not bound through this kernel is checked against GL's
+        own binding state rather than against this kernel's records. Everything else mirrors them exactly -- liveness checked every
         dispatch, full recorded set re-asserted with the same generation-counter fast path
         against this table's own counter (`_counter_table_generation`), one `glBindBufferRange`
         call per distinct GL binding (not per name, since several names can share one binding --
         see `bind_counter`), sized wide enough to cover every live counter the canon says shares
         it.
 
-        Why no "never bound" error, unlike every other pool: a real, driver-verified consumer of
-        this feature (pbd's `physics.py`) binds its one global atomic counter buffer exactly
-        ONCE, with a raw `glBindBufferRange` call made outside any `Kernel` entirely, and never
-        rebinds it again for the life of the process -- correct, idiomatic usage for a resource
-        that (unlike an SSBO) never gets swapped to a different buffer between kernels or frames.
-        Enforcing "bound through this kernel or dispatch raises" would break that pattern for
-        every kernel using such a counter. `bind_counter`/`bind_counters` and the re-assert
-        discipline below still exist and still protect a caller who DOES want them: recording a
-        bind here still catches a typo immediately, and re-asserting at dispatch still closes the
-        T12-style cross-wiring hazard for anyone who opts in by calling `bind_counter` at all.
-        `allow_unbound` is accepted for signature symmetry with the other `_assert_*` methods but
-        has no effect here, since nothing here ever raises over an unbound name.
+        Why records alone are the wrong test here, unlike every other pool: a counter is commonly
+        bound ONCE with a raw `glBindBufferRange` outside any `Kernel` and never rebound -- correct
+        usage for a resource that, unlike an SSBO, is not swapped between kernels or frames. A
+        "bound through this kernel or raise" rule rejects that, and an over-broad check is worse
+        than none because it teaches people to suppress it. Asking GL instead keeps the error that
+        matters (nothing bound at that index at all, so the kernel reads no buffer) and drops the
+        false positive. `allow_unbound` opts a name out.
         """
         for name, (buffer, _offset) in self._counter_bindings.items():
             if not getattr(buffer, 'alive', True):
                 raise TlangBindingError(
                     f"Kernel '{self._name}': buffer bound to atomic counter '{name}' has been "
                     f"freed (recycled temp buffer) -- re-bind before dispatching",
+                    SourceLocation(module=self._name),
+                )
+
+        # A counter this kernel never bound may still be legitimately bound from outside tlang.
+        # Ask GL rather than our own records: `GL_ATOMIC_COUNTER_BUFFER_BINDING` reports whatever
+        # is bound at an index, including a raw `glBindBufferRange` we never saw, and reports 0
+        # when nothing is. So this fires only on the case that is always a bug -- the kernel will
+        # read a counter backed by no buffer at all -- and never on a caller who binds once,
+        # globally, outside any Kernel.
+        unbound = {n for n in self._atomic_counters if n not in self._counter_bindings and n not in allow_unbound}
+        if unbound:
+            slot = (ctypes.c_int * 1)()
+            for name in sorted(unbound):
+                binding, _off = self._atomic_counters[name]
+                glGetIntegeri_v(GL_ATOMIC_COUNTER_BUFFER_BINDING, binding, slot)
+                if slot[0]: continue
+                raise TlangBindingError(
+                    f"Kernel '{self._name}' dispatched with atomic counter '{name}' unbound: "
+                    f"nothing is bound at atomic-counter binding {binding}, so it would read no "
+                    f"buffer at all. Bind it with bind_counter('{name}', ...), or pass "
+                    f"allow_unbound={{'{name}'}}",
                     SourceLocation(module=self._name),
                 )
 

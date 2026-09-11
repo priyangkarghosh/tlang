@@ -135,7 +135,49 @@ kernel.default_barrier_bits   # what a bare dispatch(...) will use -- see "Atomi
 `dispatch` takes **workgroup counts, not thread counts**. With `[numthreads(256,1,1)]`,
 covering `n` elements is `kernel.dispatch((n + 255) // 256)`. Passing `n` directly
 launches 256x too many threads — nothing errors, you just get wrong results or an
-out-of-bounds write.
+out-of-bounds write. Prefer `kernel.dispatch_for(n)` below instead of writing that
+ceiling division by hand.
+
+## `local_size` and `dispatch_for` — covering N invocations without redeclaring the block size
+
+`[numthreads(...)]`'s arguments are never coerced to `int` by tlang (see the note in
+`AttributeHandlers.numthreads`) — `[numthreads(BLOCK_SIZE, 1, 1)]` is a legitimate GLSL
+preprocessor macro name, resolved by the driver at compile time, not a Python integer.
+That means the generated GLSL text is not a reliable place to read the work-group size
+back from. The **linked program** is:
+
+```python
+kernel.local_size   # -> (x, y, z), queried once from the driver and cached forever
+                     # (a linked program's work-group size can't change)
+```
+
+This is a real GL query (`glGetProgramiv(glo, GL_COMPUTE_WORK_GROUP_SIZE, ...)`), so it
+resolves any `{{ CONSTANT }}`-templated macro exactly the way the driver did at link
+time — a build with `constants={'BS': 128}` and `[numthreads(BS, 1, 1)]` reports
+`local_size == (128, 1, 1)`, not the literal text `'BS'`.
+
+`dispatch_for` derives its group counts from `local_size`, so the caller never redeclares
+the block size in Python (and can never let that redeclaration drift from the shader's):
+
+```python
+kernel.dispatch_for(num_particles)                  # 1-D, the common case
+kernel.dispatch_for(width, height)                   # 2-D
+kernel.dispatch_for(width, height, depth)            # 3-D
+kernel.dispatch_for(n, elems_per_thread=4)           # scan-style: 4 elements per thread
+```
+
+Ceiling division throughout — a kernel is never under-dispatched, even when `x`/`y`/`z`
+isn't an exact multiple of `local_size`. `elems_per_thread` divides `x` before the
+ceiling division (it applies to `x` alone, matching the 1-D idiom it's modeled on — a
+kernel needing per-thread multiplicity on more than one axis should call `dispatch`
+directly with hand-computed group counts). `dispatch_for` forwards `barrier`/
+`barrier_bits`/`allow_unbound` to `dispatch` unchanged, so it goes through the exact same
+`_assert_ssbo_bindings` (and texture/image/counter) re-assert path — it is a drop-in
+replacement for `dispatch((n + local_size[0] - 1) // local_size[0])`, not a separate
+binding path. `dispatch(groups_x, ...)` remains the explicit, raw-group-count form.
+
+`Pipeline` has no equivalent — work-group size is a compute-only concept (raster stages
+have no `[numthreads(...)]`, and `VAO.render`'s vertex/instance counts are unrelated).
 
 ## Blocks are stripped per artifact, by reachability from `main()`
 
@@ -209,6 +251,79 @@ handed to someone else.
 **`Pipeline` (raster) is the exception.** Drawing happens in moderngl's `VAO.render`,
 outside tlang, so `Pipeline.bind_ssbo` binds immediately and cannot re-assert. A compute
 dispatch between a pipeline's bind and its draw can still rewire it.
+
+## Atomic counters
+
+`uniform atomic_uint x;` is bound by name, like every other resource -- `bind_counter`/
+`bind_counters` resolve `(binding, offset)` from tlang's own textual canon and call
+`glBindBufferRange(GL_ATOMIC_COUNTER_BUFFER, binding, buffer, offset, size)` for you. Discovery,
+allocation and (unlike SSBOs/UBOs) textual patching all happen automatically:
+
+```python
+kernel.bind_counter('slotCounter', buf)     # buf's own byte 0 is where offset=0 in GLSL lands
+kernel.dispatch(n)                          # ATOMIC_COUNTER_BARRIER_BIT included automatically
+```
+
+**Allocation is 2-D: `(binding, offset)`, not a single index.** GL is designed to pack several
+counters into one binding at successive 4-byte offsets --
+`layout(binding=0, offset=0) uniform atomic_uint a;` /
+`layout(binding=0, offset=4) uniform atomic_uint b;` compile and work together, and that is the
+idiomatic form, not a conflict. Unpinned counters of one artifact are packed into a single binding
+this way, spending only one of the driver's (typically 8, per stage) counter-buffer slots no
+matter how many counters share it. An explicit `layout(binding=..., offset=...)` pin is honoured
+and never moved; two counters pinned to the same `(binding, offset)` is a build-time
+`TlangBindingError`.
+
+**Atomic counters are invisible to moderngl's own reflection entirely** -- `program.get('x')` is
+always `None`, verified against a live GL 4.6 context, even for a counter the shader actively
+uses. So unlike samplers/images (assigned post-link, through a writable `.value`), an unpinned
+counter's binding/offset is patched directly into the generated GLSL text, the same way SSBO/UBO
+blocks are. Reflection cannot even tell tlang whether a *pinned* declaration compiled correctly,
+so verification for this pool goes through raw pyOpenGL's `GL_ATOMIC_COUNTER_BUFFER`
+program-interface query instead, post-link -- the only source that can see which of the
+textually-discovered counters the driver actually kept active. That query is also what prunes
+`kernel.atomic_counters`/`pipeline.atomic_counters` down to counters the artifact genuinely uses,
+exactly like the sampler/image pools already do: a declared-but-unused counter never demands a
+binding.
+
+**`bind_counter`'s `offset` is the start of the bound RANGE in your buffer, not the counter's own
+4 bytes.** `name`'s own canon offset `M` is baked into the compiled GLSL, so its actual address is
+`offset + M` in `buffer`. Two counters sharing one `binding` are bound by calling `bind_counter`
+for EACH name against the SAME `buffer` and the SAME `offset` (typically 0, the start of your
+packed counter storage) -- tlang works out the correct range size from the canon so every live
+counter at that binding lands right, regardless of which name you bind first. Binding counters
+that share a binding to different buffers/offsets raises at the next dispatch, once every name
+sharing it has been recorded.
+
+**Dispatching with a declared-and-required counter never bound through `bind_counter` does NOT
+raise** -- the one deliberate divergence from every other pool's `bind_ssbo`/`bind_texture`/
+`bind_image`-style "never bound" error. A real consumer of this feature binds its one global
+atomic counter buffer exactly once, via a raw `glBindBufferRange` call made entirely outside any
+`Kernel`, and never rebinds it for the life of the process -- correct, idiomatic usage for a
+resource that (unlike an SSBO) is never swapped to a different buffer between kernels or frames.
+Enforcing "bound through this kernel or dispatch raises" would break that pattern. `bind_counter`
+and its deferred re-assert (liveness check, generation-counter fast path, same discipline as
+`bind_ssbo`) still exist and still protect a caller who opts in by calling it at all -- a typo in
+the name still raises immediately, at the `bind_counter` call itself.
+
+**The `bind_atomic_counter(binding: int, buffer, offset=0)` raw escape hatch keeps working
+exactly as before** `bind_counter` existed: it binds the raw index you hand it, immediately, with
+no name resolution and no tracking of any kind. Prefer `bind_counter` for anything tlang itself
+assigned a binding to.
+
+**The default `barrier_bits` includes `ATOMIC_COUNTER_BARRIER_BIT` automatically** when the
+kernel's artifact declares a genuinely-used counter (`SHADER_STORAGE_BARRIER_BIT` is always
+included regardless, unchanged from before this feature). Consumers used to hand-write that OR
+themselves with a comment explaining why -- `kernel.default_barrier_bits` shows what a bare
+`dispatch()` will use, and an explicitly passed `barrier_bits` still wins exactly as before:
+
+```python
+kernel.dispatch(n)                                    # counter bit added automatically if declared
+kernel.dispatch(n, barrier_bits=SHADER_STORAGE_BARRIER_BIT)   # explicit value always wins
+```
+
+`Pipeline.bind_counter`/`bind_counters` mirror the `Kernel` API but bind immediately, exactly like
+`Pipeline.bind_ssbo`/`bind_texture` -- see "`Pipeline` (raster) is the exception" above.
 
 ## BufferPool
 
