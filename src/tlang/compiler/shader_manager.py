@@ -11,16 +11,17 @@ import logging
 from tlang.compiler.binding_registry import BindingRegistry
 logger = logging.getLogger(__name__)
 
+import itertools
 import sys
 import time
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 from moderngl import Buffer, Context
 from tlang.compiler.dependency_manager import DependencyManager
 from tlang.errors import SourceLocation, TlangAttributeError, TlangBuildError, TlangDependencyError
 from tlang.frontend.function_manager import param_type_signature
-from tlang.frontend.interface_registry import InterfaceDecl, InterfaceTable
+from tlang.frontend.interface_registry import InterfaceDecl, InterfaceTable, extern_literal
 from tlang.compiler.shader import Shader
 from tlang.compiler.shader_processor import ShaderProcessor
 from tlang.runtime.printf_log import DEFAULT_LOG_CAPACITY, PrintfLog, PrintfStream, PrintfTable
@@ -118,7 +119,14 @@ class ShaderManager:
         # shared by every kernel/pipeline this manager builds) and gives a real body to
         # `printf(...)` in whichever artifacts actually call it. `self.stdout` is the shader's
         # stdout either way -- `None` when `debug=False`.
+        #
+        # `[extern(precompile=[...])]` needs no flag here at all: everything it builds happens
+        # eagerly, inside this constructor, for every declared value -- see the per-module loop
+        # below. Nothing about it is deferred, so nothing about it is retained once this
+        # constructor returns; a module declaring no `precompile=[...]` axis costs exactly what
+        # it always did.
         self._ctx = ctx
+        self._version = version
         self._strict = strict
         # Always built, regardless of `debug` -- every printf(...) call site is scanned and its
         # specifier/argument count validated at build time even in a release build; only the
@@ -126,6 +134,7 @@ class ShaderManager:
         self._printf_table = PrintfTable()
         self._printf_log: PrintfLog | None = PrintfLog(ctx, self._printf_table, debug_log_capacity) if debug else None
         self._stdout: PrintfStream | None = PrintfStream(self._printf_log) if self._printf_log is not None else None
+        self._keep_sources = keep_sources
         constants = constants if constants is not None else {}
 
         t0 = time.perf_counter()
@@ -227,10 +236,16 @@ class ShaderManager:
                     if fn.stage is None: dep_plain_funcs.setdefault(fn.name, dep)
 
             try:
+                variant_shaders = self._build_precompiled_variants(
+                    ctx, version, name, process, dm, pref_rank, dep_plain_funcs, keep_sources,
+                    self._strict, debug=debug, printf_table=self._printf_table,
+                    printf_log=self._printf_log,
+                )
                 shader = Shader(
                     ctx, name, version, common, process, pref_rank, strict=self._strict,
                     dep_plain_funcs=dep_plain_funcs, keep_sources=keep_sources,
                     debug=debug, printf_table=self._printf_table, printf_log=self._printf_log,
+                    variants=variant_shaders,
                 )
             except Exception as e:
                 self._failures[name] = [e]
@@ -259,6 +274,67 @@ class ShaderManager:
         # buffer source shared by every Shader (and, transitively, every kernel/pipeline) in the
         # tree -- see the `source` property.
         self._buffer_source: Mapping[str, Buffer] | None = None
+
+    @staticmethod
+    def _build_precompiled_variants(
+        ctx: Context, version: str, name: str, process: ShaderProcessor, dm: DependencyManager,
+        pref_rank: dict[str, int], dep_plain_funcs: dict[str, str], keep_sources: bool, strict: bool,
+        debug: bool = False, printf_table: 'PrintfTable | None' = None,
+        printf_log: 'PrintfLog | None' = None,
+    ) -> dict[tuple[tuple[str, Any], ...], Shader]:
+        """Builds one additional, fully independent `Shader` for module `name` per COMBINATION
+        of every declared `[extern(precompile=[...])]` axis in it -- the full cross product,
+        not one axis at a time. This is required, not just simpler: a precompile-axis extern
+        has no default artifact at all (see `resolve_externs`), so a module with two axes has
+        no text where only one of them is resolved -- every axis needs a concrete value for
+        the module to compile at all. A module with exactly one axis (the common case) still
+        gets exactly `len(that axis's precompile)` variants, one combination each.
+
+        Each variant is keyed the same way `Shader.get_kernel`'s `**variant` kwargs are:
+        `tuple(sorted({name: value, ...}.items()))`, spanning every axis in the module. Returns
+        `{}` for a module with no precompile axis at all -- the caller then builds that module's
+        ordinary default `Shader` instead (see `Shader.__init__`: a non-empty `variants` mapping
+        means there IS no default artifact to build).
+
+        This is the entire mechanism: every value is compiled right here, at ordinary
+        `ShaderManager` build time, so nothing needs to be retained afterward for a later
+        on-demand compile -- there isn't one. `process`/`dm` are mutated to render each
+        combination's text and reset back to the (blank) unresolved placeholder before
+        returning, so nothing downstream ever sees a half-resolved module.
+        """
+        axis_decls = [d for d in process.funcs.externs if d.precompile]
+        if not axis_decls:
+            return {}
+
+        variants: dict[tuple[tuple[str, Any], ...], Shader] = {}
+        for combo in itertools.product(*(d.precompile for d in axis_decls)):
+            for decl, value in zip(axis_decls, combo):
+                decl.value = value
+                decl.literal = extern_literal(decl.type_name, value)
+                decl.resolved = True
+                process.src_map[decl.line].data = f'const {decl.type_name} {decl.name} = {decl.literal};' + decl.trailing
+
+            dm.modules[name] = Shader.build_map(process.module)
+            variant_common = dm._build(name)
+            key = tuple(sorted((decl.name, value) for decl, value in zip(axis_decls, combo)))
+            variants[key] = Shader(
+                ctx, name, version, variant_common, process, pref_rank, strict=strict,
+                dep_plain_funcs=dep_plain_funcs, keep_sources=keep_sources,
+                debug=debug, printf_table=printf_table, printf_log=printf_log,
+            )
+
+        # Reset every axis back to its unresolved (blank) placeholder -- this module has no
+        # default build that would otherwise see a stale const from the last combination above.
+        for decl in axis_decls:
+            decl.value = None
+            decl.literal = ''
+            decl.resolved = False
+            process.src_map[decl.line].data = '\n'
+        dm.modules[name] = Shader.build_map(process.module)
+
+        return variants
+
+        return variants
 
     @property
     def ctx(self) -> Context: return self._ctx

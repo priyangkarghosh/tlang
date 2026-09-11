@@ -103,7 +103,18 @@ EXTERN_TYPES = frozenset({'int', 'uint', 'float', 'bool'})
 class ExternConst:
     """One `[extern] TYPE NAME [= default];` declaration. Mutable: attach time (attribute
     processing) fills in everything up to `default_value`; `ShaderProcessor.resolve_externs`
-    fills in `value`/`literal`/`resolved` once `constants={...}` is known."""
+    fills in `value`/`literal`/`resolved` once `constants={...}` is known.
+
+    `precompile` backs `[extern(precompile=[...])]` (see the module docstring below the
+    plain-`[extern]` section): its presence alone is what makes this constant a variant axis,
+    and it has NO default/plain artifact at all -- `constants={...}` never resolves it, and
+    `resolve_externs` never emits a `uniform` (or anything else) for it. Instead `ShaderManager`
+    builds one fully independent `const`-specialised `Shader` per listed value, all at
+    ordinary build time -- nothing about it is on-demand or lazy. `Shader.get_kernel(name,
+    THIS_NAME=value)` returns one of those precompiled variants; calling `get_kernel` without a
+    value for this constant at all, or with a `value` not in `precompile`, is a build-time-
+    shaped error (see `Shader.get_kernel`) -- selecting one is mandatory, not optional.
+    """
     name: str
     type_name: str      # one of EXTERN_TYPES
     module: str
@@ -111,6 +122,12 @@ class ExternConst:
     has_default: bool = False
     default_value: Any = None   # parsed Python value of the declared default, if any
     trailing: str = ''          # same-line form only: raw text after the ';' to preserve
+
+    # [extern(precompile=[...])] -- non-empty makes this a variant axis with NO default
+    # artifact: ShaderManager builds one const-specialised Shader per value, all at ordinary
+    # build time (see ShaderManager._build_precompiled_variants); selecting a value is
+    # mandatory for every kernel in a module declaring one.
+    precompile: tuple[Any, ...] = ()
 
     resolved: bool = False
     value: Any = None            # the Python value actually used (constants[name], else the default)
@@ -182,6 +199,27 @@ def parse_extern_default(type_name: str, raw: str) -> Any:
         except ValueError:
             raise ValueError(f"'{text}' is not a valid float default") from None
     raise AssertionError(f"unreachable: unknown [extern] type {type_name!r}")
+
+
+def parse_extern_precompile_list(type_name: str, raw: str) -> tuple[Any, ...]:
+    """`raw` is the bracketed list text from `[extern(precompile=[...])]`, e.g. `'[1, 2, 4]'`
+    -- each token is parsed exactly like a declared `= default` (`parse_extern_default`), so
+    the list is validated against `type_name` the same way, at attach time. Raises plain
+    `ValueError` on a malformed token; the caller attaches location/attribute context, same
+    convention as `parse_extern_default`.
+
+    Every value here gets its own fully compiled `Shader` variant, built eagerly at
+    `ShaderManager` build time (see `ShaderManager._build_precompiled_variants`) -- there is
+    no on-demand compile, so a value NOT in this list is a `Shader.get_kernel` error, not a
+    fallback.
+    """
+    text = raw.strip()
+    if text.startswith('[') and text.endswith(']'):
+        text = text[1:-1]
+    tokens = [t.strip() for t in text.split(',') if t.strip()]
+    if not tokens:
+        raise ValueError("'precompile=[...]' is empty -- list at least one value, or omit it")
+    return tuple(parse_extern_default(type_name, t) for t in tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -631,4 +669,5 @@ __all__ = [
     'parse_struct_at', 'parse_declarator_at', 'location_span', 'member_locations', 'is_arrayed',
     'emit_glsl', 'InterfaceTable',
     'ExternConst', 'EXTERN_TYPES', 'check_extern_value', 'extern_literal', 'parse_extern_default',
+    'parse_extern_precompile_list',
 ]

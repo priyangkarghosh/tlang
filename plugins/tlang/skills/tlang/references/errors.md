@@ -179,6 +179,61 @@ demo:2: 'extern' is a global/file-level attribute; it cannot be used here
 demo:1: [extern] bool FLAG: 'maybe' is not a valid bool default (use true/false)
 ```
 
+## `[extern(precompile=[...])]` errors
+
+**Unknown argument** — the only argument `[extern]` takes is `precompile` (positional or
+keyword; a bare unrecognised word or an unrecognised `key=...` are the same error):
+```
+demo:1: [extern]: unknown argument 'bogus' (expected: precompile)
+demo:1: [extern]: unknown argument 'oops' (expected: precompile)
+```
+
+**`precompile=[...]` combined with `= default`** — `precompile=[...]` already supplies every
+value this constant will ever take, so a `constants=`-fallback default has nothing left to fall
+back to:
+```
+demo:1: [extern(precompile=...)] int mode: a precompiled constant can't also declare a '= default' -- 'precompile=[...]' is already what supplies every value it will ever take; a '= default' has nothing left to fall back to
+```
+
+**A malformed value in the list** (reuses the same per-type parser as a declared `= default`,
+so the message matches):
+```
+demo:1: [extern(precompile=...)] int X: 'x' is not a valid int default
+```
+
+**An empty list:**
+```
+demo:1: [extern(precompile=...)] int X: 'precompile=[...]' is empty -- list at least one value, or omit it
+```
+
+**A value of the wrong type for the declared type:**
+```
+demo:1: [extern(precompile=...)] bool flag: '2' is not a valid bool default (use true/false)
+```
+
+**`Shader.get_kernel(name, X=value)` for a value never precompiled** — no on-demand fallback;
+names the constant, the value asked for, and the precompiled set:
+```
+demo: 'mode=3' was not precompiled -- module 'demo' only precompiled mode in {1, 2, 4}
+```
+
+**`get_kernel(name)` with no value at all** — a precompile axis has no default artifact, so
+selecting a value is mandatory for every kernel in the module, not just ones that reference it:
+```
+demo: 'mode' needs a value -- module 'demo' has no default artifact once it declares [extern(precompile=[...])]; call get_kernel('cs_solve', mode=<one of {1, 2, 4}>)
+```
+
+**A module with more than one axis, given only some of them** — every axis needs a value
+together; there's no partially-resolved text to fall back to for the one you didn't mention:
+```
+demo: 'flag' needs a value -- module 'demo' has no default artifact once it declares [extern(precompile=[...])]; call get_kernel('cs_two', flag=<one of {False, True}>, ...)
+```
+
+**`get_kernel(name, X=value)` naming something that isn't a `precompile=[...]` axis at all:**
+```
+demo: 'bogus' is not declared with [extern(precompile=[...])] in module 'demo' (precompiled axes: mode).
+```
+
 ## Duplicate top-level declaration errors
 
 `ShaderManager` scans every module's merged `[include]` closure for same-named

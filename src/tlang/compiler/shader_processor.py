@@ -96,11 +96,21 @@ class ShaderProcessor:
         return {e.name: e for e in self.funcs.externs}
 
     def resolve_externs(self, constants: dict[str, Any]) -> None:
-        """Resolves every [extern] declaration against `constants` (a required one falls back
-        to its own `= default` when absent), emitting `const <type> <name> = <literal>;` in
-        place of the declaration's placeholder line. Mirrors `resolve_interfaces`: every
-        problem in this module is collected and raised together, not one at a time -- a
-        module needing five constants shouldn't make an author fix them one build at a time.
+        """Resolves every [extern] declaration, emitting the final text in place of the
+        declaration's placeholder line. Mirrors `resolve_interfaces`: every problem in this
+        module is collected and raised together, not one at a time -- a module needing five
+        constants shouldn't make an author fix them one build at a time.
+
+        A **plain** `[extern]` resolves against `constants` (a required one falls back to its
+        own `= default` when absent), emitting `const <type> <name> = <literal>;`.
+
+        An `[extern(precompile=[...])]` -- a non-empty `decl.precompile` -- is left completely
+        untouched here: it never consults `constants`, and gets no default/plain artifact of
+        any kind (the placeholder blank line `AttributeHandlers.extern` wrote stays blank).
+        Only `ShaderManager._build_precompiled_variants` ever gives it text -- one
+        `const <type> <name> = <literal>;` per listed value, in a fully separate `Shader`
+        build per value, never in this module's own default build (there isn't one for a
+        module carrying a precompile axis -- see `ShaderManager.__init__`).
 
         Must run before this processor's module text is registered with `DependencyManager`
         (`ShaderManager` does so immediately after construction) -- once that snapshot is
@@ -108,6 +118,9 @@ class ShaderProcessor:
         """
         problems: list[str] = []
         for decl in self.funcs.externs:
+            if decl.precompile:
+                continue  # resolved only per-variant, in ShaderManager._build_precompiled_variants
+
             if decl.name in constants:
                 value = constants[decl.name]
             elif decl.has_default:

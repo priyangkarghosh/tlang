@@ -172,6 +172,82 @@ core` ("non constant expression in layout value") and accepts the identical text
 `ShaderManager(version=...)` >= `'440 core'` if `[numthreads(...)]`/other layout qualifiers need to
 reference an `[extern]` constant.
 
+## `[extern(precompile=[...])]` — compiled variants of a host-supplied constant
+
+Adding `precompile=[...]` to an `[extern]` declares a **variant axis**: `NAME` compiles to
+`const NAME = v;` in a fully independent `Shader` per listed value, built eagerly by
+`ShaderManager` at ordinary build time. Nothing about it is lazy or on-demand — every value is
+compiled the moment `ShaderManager(...)` runs, so nothing extra is retained afterward and there
+is no first-use compile hitch to warm away.
+
+```glsl
+[extern] int BLOCK_SIZE;                    // unchanged: one baked const from constants=
+[extern(precompile=[1, 2, 4])] int mode;    // three compiled variants, nothing else
+[extern(precompile=[false, true])] bool stabilizing;
+```
+
+**There is no default artifact.** Unlike a plain `[extern]`, a precompile axis is not a uniform
+you can optionally specialise — it is *only* the listed compile-time values. `constants={...}`
+never resolves it, and `get_kernel` with no value for it is an error, not a fallback:
+
+```python
+kernel = shader.get_kernel('solve')  # ERROR: 'mode' needs a value -- module 'demo' has no
+                                      # default artifact once it declares [extern(precompile=[...])]
+kernel = shader.get_kernel('solve', mode=1)  # OK -- tlang emitted 'const int mode = 1;'
+```
+
+**This is a breaking change for an existing uniform.** Adding `precompile=[...]` to an `[extern]`
+that used to be a plain uniform stops `set_uniform(...)` from working at all, for every kernel in
+that module — not just the one that reads it — and stops any value outside the declared list from
+being usable. That trade is intentional: once every value is declared, there is nothing left for a
+runtime uniform to do that a compile-time constant doesn't already do better, and no attribute
+should mean "a uniform, except when it isn't."
+
+**A module with more than one precompile axis needs every axis's value together, every time** —
+there is no partially-resolved text to fall back to for the axis you didn't mention:
+
+```glsl
+[extern(precompile=[1, 2])] int mode;
+[extern(precompile=[false, true])] bool flag;
+```
+```python
+kernel = shader.get_kernel('solve', mode=1)             # ERROR: 'flag' needs a value too
+kernel = shader.get_kernel('solve', mode=1, flag=True)  # OK
+```
+`ShaderManager` builds the full cross product of every axis's declared values — a module with a
+2-value axis and a 3-value axis gets `2 * 3 = 6` compiled variants, not `2 + 3`.
+
+The generated shader SOURCE is otherwise identical across every variant of the same combination
+shape — same buffers, same bindings (`kernel.bindings`) — only the declaration(s) differ. tlang's
+dead-code elimination is textual, not constant-folding, so both arms of a
+`stabilizing ? a : b` stay in the artifact regardless of which value was baked in; `bind()` behaves
+identically across every variant, with no per-variant re-keying needed.
+
+**A value not in `precompile=[...]` is a build-time-shaped error, not a fallback:**
+
+```
+demo: 'mode=3' was not precompiled -- module 'demo' only precompiled mode in {1, 2, 4}
+```
+
+This is deliberate: a silent recompile-on-demand would be a silent performance cliff the first
+time a caller passes an unexpected value; an explicit error, naming the permitted set, is not.
+
+**Why it's worth it, measured:** a `stabilizing ? ptcPositions[i] : ptcPredictedPositions[i]`
+select (5+ read sites in a real solver's hottest loop), compared against the equivalent
+uniform-driven branch, benchmarked at **~0.10 ms/dispatch as a uniform vs ~0.06 ms precompiled**
+on this machine — roughly **1.5-1.6x** — because the driver can fold the select and drop a buffer
+load once the branch condition is a compile-time constant, which it cannot do while the value is
+a runtime uniform.
+
+**Cost.** Every precompiled combination is a full rebuild of the ENTIRE module, not just the one
+kernel using the constant(s) — a module with 5 kernels and a single 2-value `precompile=[...]`
+axis compiles all 5 kernels twice over, not once, and there is no default build to fall back to
+in between. A module that declares no `precompile=[...]` axis at all is completely unaffected:
+build time and retained memory are identical to a build predating this feature.
+
+`precompile=[...]` cannot be combined with `= default` — `precompile=[...]` already supplies
+every value this constant will ever take, so a fallback default has nothing left to fall back to.
+
 ## `[uses(Name, dir='in'|'out')]`
 
 Ties one stage function to one declared `[varyings]` interface, in one direction:

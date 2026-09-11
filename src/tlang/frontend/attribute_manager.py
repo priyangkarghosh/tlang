@@ -77,10 +77,16 @@ ARG_PATTERN = re.compile(r"""
     (?P<value>
         '[^']*'
         |"[^"]*"
+        |\[[^\[\]]*\]
         |[^,]+
     )
     \s*(?:,|$)
 """, re.VERBOSE)
+# The `\[[^\[\]]*\]` branch lets a value be a bracketed list -- `variants=[1, 2, 4]` --
+# without its internal commas being mistaken for argument separators. No nested-bracket
+# support (mirrors every other one-level-only bracket handling in this file); tried before
+# the catch-all `[^,]+` so a bracketed value is never split, but a value that merely starts
+# with '[' and has no matching top-level ']' before the next comma still falls through to it.
 
 
 # class to extract anything in the form []

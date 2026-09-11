@@ -12,8 +12,10 @@ from tlang.compiler.binding_registry import BindingRegistry
 from tlang.errors import SourceLocation, TlangAttributeError, TlangBindingError, TlangCompileError, TlangError, TlangLinkError
 logger = logging.getLogger(__name__)
 
+import difflib
 import time
-from typing import Mapping
+from dataclasses import replace
+from typing import Any, Mapping
 import regex as re
 from moderngl import Buffer, Context, Program
 from tlang.compiler.printf_codegen import render_printf_module, rewrite_printf_calls
@@ -40,6 +42,7 @@ class Shader:
         pref_rank: dict[str, int] | None = None, strict: bool = True,
         dep_plain_funcs: dict[str, str] | None = None, keep_sources: bool = False,
         debug: bool = False, printf_table: PrintfTable | None = None, printf_log: PrintfLog | None = None,
+        variants: Mapping[tuple[tuple[str, Any], ...], 'Shader'] | None = None,
     ) -> None:
         self._ctx = ctx
         self._name = name
@@ -70,8 +73,14 @@ class Shader:
         self._interfaces: dict[str, InterfaceDecl] = {d.name: d for d in processor.resolved_interfaces}
         # [extern] constants this module declares, resolved (see ExternConst.value/.literal)
         # by the time `processor` reached here -- ShaderManager resolves them right after
-        # constructing each ShaderProcessor, before this Shader is ever built.
-        self._externs: dict[str, ExternConst] = dict(processor.externs)
+        # constructing each ShaderProcessor, before this Shader is ever built. Snapshotted
+        # with `replace(e)` (a shallow copy of each small dataclass), not just re-keyed into a
+        # new dict: `processor.funcs.externs`'s own `ExternConst` objects are mutated in place,
+        # once per declared `[extern(precompile=[...])]` value, while `ShaderManager` builds
+        # each precompiled variant of this same module (see `_build_precompiled_variants`) --
+        # without this copy, this `Shader`'s `.externs` would go stale the moment the NEXT
+        # variant (or the module's own default reset) overwrites the same `ExternConst` object.
+        self._externs: dict[str, ExternConst] = {n: replace(e) for n, e in processor.externs.items()}
         # emitted GLSL block name -> HANDLE (InterfaceDecl.name), for every [buffer] interface.
         # Identity for a struct-form block or raw GLSL (never in this map at all, so a lookup
         # miss just falls back to the emitted name itself) -- only the [buffer] single-
@@ -89,7 +98,28 @@ class Shader:
         # property. Kept here (rather than only pushed out) so setting it after construction
         # still reaches kernels/pipelines built by `_build` below.
         self._buffer_source: Mapping[str, Buffer] | None = None
-        self._build(module, processor, pref_rank or {}, dep_plain_funcs or {})
+
+        # Every precompiled variant of this module (see `get_kernel`), already fully built by
+        # `ShaderManager._build_precompiled_variants` -- one entry per combination of every
+        # declared `[extern(precompile=[...])]` axis in this module, keyed
+        # `tuple(sorted({name: value, ...}.items()))`. Nothing here is lazy: every variant that
+        # will ever exist for this `Shader` exists by the time this constructor returns, so
+        # `get_kernel` is a plain lookup, never a compile.
+        self._variants: dict[tuple[tuple[str, Any], ...], 'Shader'] = dict(variants) if variants else {}
+
+        if self._variants:
+            # A module declaring a precompile axis has NO default artifact: `module` here
+            # still has a blank, unresolved line for every such constant (see
+            # `resolve_externs`), so compiling it directly would fail on every kernel that
+            # references one (an undefined identifier) -- there is nothing to `_build` here.
+            # Every kernel this module declares only exists inside `self._variants`; aggregate
+            # this container's `ok`/`failures`/declared-entries from them instead so `get_kernel`,
+            # `.ok`, and `.failures` all still mean the same thing they always have.
+            self._ok = all(v.ok for v in self._variants.values())
+            self._failures = [f for v in self._variants.values() for f in v.failures]
+            self._declared_entries = set().union(*(v._declared_entries for v in self._variants.values()))
+        else:
+            self._build(module, processor, pref_rank or {}, dep_plain_funcs or {})
 
     @property
     def ok(self) -> bool:
@@ -182,8 +212,76 @@ class Shader:
         `keep_sources=True`, only the failed ones otherwise."""
         return self._sources
 
-    def get_kernel(self, name: str) -> Kernel:
-        return self._kernels[name]
+    def get_kernel(self, name: str, **variant: Any) -> Kernel:
+        """The kernel named `name`.
+
+        A module declaring no `[extern(precompile=[...])]` axis at all (`self._variants` is
+        empty) works exactly as it always has -- `variant` is expected to be empty, and `name`
+        is looked up in this `Shader`'s own compiled kernels.
+
+        A module declaring one or more precompile axes has NO default artifact -- selecting a
+        value for EVERY axis is mandatory for every kernel in it, `name` included, regardless
+        of whether `name` itself references that particular constant. `variant` must supply
+        exactly the axes this module declares (`tuple(sorted(variant.items()))` is the same key
+        `ShaderManager._build_precompiled_variants` built), each with one of its precompiled
+        values; the lookup is then a plain dict hit -- every combination that will ever exist
+        was already compiled at ordinary `ShaderManager` build time, so this never compiles
+        anything itself.
+
+        Raises `TlangAttributeError` -- naming the constant(s), the module, and the permitted
+        values -- if `variant` is missing a required axis, names something that isn't a
+        precompile axis in this module, or gives a value outside that axis's declared list.
+        """
+        if not self._variants:
+            if variant:
+                raise TlangAttributeError(
+                    self._describe_variant_miss(name, variant), SourceLocation(module=self._name),
+                )
+            return self._kernels[name]
+
+        key = tuple(sorted(variant.items()))
+        if (found := self._variants.get(key)) is not None:
+            return found.get_kernel(name)
+        raise TlangAttributeError(self._describe_variant_miss(name, variant), SourceLocation(module=self._name))
+
+    def _describe_variant_miss(self, name: str, variant: Mapping[str, Any]) -> str:
+        axis_decls = sorted((e for e in self._externs.values() if e.precompile), key=lambda e: e.name)
+        axis_names = [d.name for d in axis_decls]
+        problems: list[str] = []
+
+        for key in variant:
+            if key in axis_names: continue
+            suggestion = ''
+            if (matches := difflib.get_close_matches(key, axis_names, n=1)):
+                suggestion = f" Did you mean '{matches[0]}'?"
+            problems.append(
+                f"'{key}' is not declared with [extern(precompile=[...])] in module "
+                f"'{self._name}' (precompiled axes: {', '.join(axis_names) or '(none)'}).{suggestion}"
+            )
+
+        for decl in axis_decls:
+            shown = ', '.join(repr(v) for v in decl.precompile)
+            if decl.name not in variant:
+                problems.append(
+                    f"'{decl.name}' needs a value -- module '{self._name}' has no default "
+                    f"artifact once it declares [extern(precompile=[...])]; call "
+                    f"get_kernel('{name}', {decl.name}=<one of {{{shown}}}>{', ...' if len(axis_decls) > 1 else ''})"
+                )
+            elif variant[decl.name] not in decl.precompile:
+                problems.append(
+                    f"'{decl.name}={variant[decl.name]!r}' was not precompiled -- module "
+                    f"'{self._name}' only precompiled {decl.name} in {{{shown}}}"
+                )
+
+        if not problems:
+            # Every individual name/value pair is valid on its own, but this exact combination
+            # isn't in `self._variants` -- shouldn't happen (every combination of every axis's
+            # declared values is built, see `_build_precompiled_variants`), kept only as a
+            # never-silent fallback rather than a confusing KeyError.
+            shown = ', '.join(f'{k}={v!r}' for k, v in sorted(variant.items()))
+            problems.append(f"get_kernel('{name}', {shown}): this combination was not found")
+
+        return '\n'.join(problems)
 
     def get_program(self, name: str) -> Program:
         return self._programs[name]

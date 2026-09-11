@@ -35,6 +35,7 @@ from tlang.frontend.interface_registry import (
     emit_glsl,
     parse_declarator_at,
     parse_extern_default,
+    parse_extern_precompile_list,
     parse_struct_at,
 )
 from tlang.shader_stages import ShaderStage
@@ -380,12 +381,34 @@ class AttributeHandlers:
     # -- [extern]: a host-supplied constant, declared instead of {{ CONSTANT }}-substituted --
 
     @staticmethod
-    def _finish_extern_member(ctx: AttrCtx, member, loc: SourceLocation, trailing: str) -> ExternConst:
-        """Shared tail of both [extern] forms, once a single declarator has been parsed:
-        type/array checks, the default (if any), and the duplicate-name check against every
+    def _parse_extern_flags(ctx: AttrCtx) -> str | None:
+        """[extern(precompile=[...])]'s own arguments -- a bracketed list -- have no
+        equivalent among `Param`'s declared types (no list type), so they're read directly
+        off `ctx.attr`, the same way [glsl] reads `raw_args` itself rather than going through
+        `bind_params`."""
+        if ctx.attr.args:
+            raise TlangAttributeError(
+                f"[extern]: unknown argument '{ctx.attr.args[0]}' (expected: precompile)", ctx.attr.location,
+            )
+        precompile_raw = None
+        for key, val in ctx.attr.kwargs.items():
+            if key != 'precompile':
+                raise TlangAttributeError(
+                    f"[extern]: unknown argument '{key}' (expected: precompile)", ctx.attr.location,
+                )
+            precompile_raw = val
+        return precompile_raw
+
+    @staticmethod
+    def _finish_extern_member(
+        ctx: AttrCtx, member, loc: SourceLocation, trailing: str, precompile_raw: str | None,
+    ) -> ExternConst:
+        """Shared tail of every [extern] form, once a single declarator has been parsed:
+        type/array checks, the default (if any), the duplicate-name check against every
         `const`/`buffer`/`uniform` block this module already declares (raw or [extern] --
         `TopLevelDecl` covers both, so a name collision with a hand-written `const` is caught
-        exactly like one against another [extern])."""
+        exactly like one against another [extern]), and -- for `[extern(precompile=[...])]`
+        -- the precompiled-value list that makes this constant a variant axis."""
         assert isinstance(ctx.funcs, FunctionList)
         name = member.name
 
@@ -416,20 +439,37 @@ class AttributeHandlers:
             except ValueError as exc:
                 raise TlangAttributeError(f"[extern] {member.type_name} {name}: {exc}", loc) from None
 
+        precompile: tuple[Any, ...] = ()
+        if precompile_raw is not None:
+            if has_default:
+                raise TlangAttributeError(
+                    f"[extern(precompile=...)] {member.type_name} {name}: a precompiled "
+                    f"constant can't also declare a '= default' -- 'precompile=[...]' is "
+                    f"already what supplies every value it will ever take; a '= default' has "
+                    f"nothing left to fall back to",
+                    loc,
+                )
+            try:
+                precompile = parse_extern_precompile_list(member.type_name, precompile_raw)
+            except ValueError as exc:
+                raise TlangAttributeError(f"[extern(precompile=...)] {member.type_name} {name}: {exc}", loc) from None
+
         decl = ExternConst(
             name=name, type_name=member.type_name, module=ctx.shader_name, line=loc.line or 0,
             has_default=has_default, default_value=default_value, trailing=trailing,
+            precompile=precompile,
         )
         ctx.funcs.externs.append(decl)
         ctx.funcs.decls.append(TopLevelDecl(kind='const', name=name, line=loc.line or 0))
         return decl
 
     @staticmethod
-    def _declare_extern_same_line(ctx: AttrCtx) -> None:
+    def _declare_extern_same_line(ctx: AttrCtx, precompile_raw: str | None) -> None:
         """`[extern] int BLOCK_SIZE;` -- the declarator sits in the tail of the attribute's
-        own line, mirroring `_declare_buffer_same_line`. The final `const` text isn't known
-        yet (it depends on `constants={...}`, resolved later in `ShaderProcessor.resolve_externs`),
-        so this leaves a blank placeholder and lets `resolve_externs` overwrite this exact line."""
+        own line, mirroring `_declare_buffer_same_line`. The final declaration text isn't known
+        yet (it depends on `constants={...}` for a plain one; a precompiled one is never
+        resolved here at all -- see `ShaderProcessor.resolve_externs` and
+        `ShaderManager._build_precompiled_variants`), so this leaves a blank placeholder."""
         assert isinstance(ctx.funcs, FunctionList) and ctx.end_index is not None
         loc = SourceLocation(ctx.shader_name, ctx.end_index)
 
@@ -448,7 +488,9 @@ class AttributeHandlers:
             )
         decl, end_offset = result
         member = decl.members[0]
-        AttributeHandlers._finish_extern_member(ctx, member, loc, ctx.line_tail[end_offset:])
+        AttributeHandlers._finish_extern_member(
+            ctx, member, loc, ctx.line_tail[end_offset:], precompile_raw,
+        )
 
         ctx.result = '\n'
         ctx.tail_consumed = True
@@ -459,6 +501,16 @@ class AttributeHandlers:
         supplied by the host (`ShaderManager(constants={...})`), emitted as a GLSL `const`
         once `ShaderProcessor.resolve_externs` knows what `constants` actually holds.
 
+        `[extern(precompile=[v1, v2, ...])] TYPE NAME;` makes `NAME` a variant axis instead: it
+        never touches `constants={...}` and has no plain/default artifact at all -- `NAME`
+        compiles to `const NAME = v;` in exactly `len(precompile)` fully independent `Shader`
+        variants, one per listed value, all at ordinary `ShaderManager` build time (see
+        `resolve_externs`/`ShaderManager._build_precompiled_variants`).
+        `Shader.get_kernel(name, NAME=value)` returns one of those precompiled variants;
+        `get_kernel(name)` with no value, or a `value` outside the list, is a build-time-shaped
+        error naming the constant and its permitted values -- selecting one is mandatory for
+        every kernel in a module that declares a precompile axis.
+
         Module scope only: `Scope.GLOBAL` alone (no `Scope.FUNCBODY`) means an `[extern]`
         written inside a function body is dispatched through `AttrRegistry.resolve_scope`
         instead, which already rejects it -- "'extern' is a global/file-level attribute; it
@@ -467,9 +519,11 @@ class AttributeHandlers:
         if ctx.src_map is None or ctx.end_index is None or not isinstance(ctx.funcs, FunctionList):
             raise TlangAttributeError("[extern]: internal error -- missing source map", ctx.attr.location)
 
+        precompile_raw = AttributeHandlers._parse_extern_flags(ctx)
+
         tail_masked = mask_comments_and_strings(ctx.line_tail)
         if tail_masked.strip():
-            AttributeHandlers._declare_extern_same_line(ctx)
+            AttributeHandlers._declare_extern_same_line(ctx, precompile_raw)
             return
 
         start = AttributeHandlers._find_struct_start(ctx)
@@ -490,9 +544,9 @@ class AttributeHandlers:
             )
         decl, end_offset = result
         member = decl.members[0]
-        # '\n' terminates the const line resolve_externs will later write here -- there is no
+        # '\n' terminates the line resolve_externs will later write here -- there is no
         # same-line trailing text to preserve in this (next-line) form, only the line break.
-        AttributeHandlers._finish_extern_member(ctx, member, loc, '\n')
+        AttributeHandlers._finish_extern_member(ctx, member, loc, '\n', precompile_raw)
 
         end_line = start + joined.count('\n', 0, end_offset)
         ctx.src_map[start].data = '\n'
@@ -607,12 +661,17 @@ SPECS: list[AttrSpec] = [
         example="[buffer(std430)]\nstruct Particles { vec4 pos[]; };\n[buffer] vec2 ptcPositions[];",
     ),
     AttrSpec(
-        name='extern', scope=Scope.GLOBAL, handler=AttributeHandlers.extern,
+        name='extern', scope=Scope.GLOBAL, handler=AttributeHandlers.extern, variadic=True,
         summary="Declares a host-supplied constant (int/uint/float/bool), emitted as a GLSL "
                 "'const'; resolved from ShaderManager(constants={...}) or the declaration's own "
                 "'= default'. Replaces the '#define X {{ X }}' idiom where a typed, reflectable, "
-                "checked-before-the-driver constant is wanted.",
-        example="[extern] int BLOCK_SIZE;\n[extern] float WARP_SCALE = 1.0;",
+                "checked-before-the-driver constant is wanted. [extern(precompile=[...])] instead "
+                "declares a variant axis with no default artifact at all: one fully compiled "
+                "'const'-specialised Shader per listed value (Shader.get_kernel(name, X=value)), "
+                "all at ordinary build time -- selecting a value is mandatory, and one outside "
+                "the list is a build-time-shaped error, not an on-demand compile.",
+        example="[extern] int BLOCK_SIZE;\n[extern] float WARP_SCALE = 1.0;\n"
+                "[extern(precompile=[1, 2, 4])] int mode;\n[extern(precompile=[false, true])] bool stabilizing;",
     ),
 
     # -- reference attribute: ties a stage function to a declared interface --
