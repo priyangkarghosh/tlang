@@ -3,7 +3,7 @@
 # @description   Tests for the `printf(...)` debug-log built-in (v2 -- replaces v1's untyped
 #                `print(...)`; see plugins/tlang/skills/tlang/references/runtime.md).
 #
-#                GL-free: format-literal extraction/rewriting in `tlang.compiler.printf_codegen`
+#                GL-free: format-literal extraction/rewriting in `tlang.compiler.printf_glsl`
 #                (including the four literal-scanning edge cases), build-time specifier/argument
 #                validation, GLSL overload generation, and the host-side wire format/decode in
 #                `tlang.runtime.printf_log` -- all work without a GL context.
@@ -21,7 +21,7 @@ import time
 
 import pytest
 
-from tlang.compiler.printf_codegen import (
+from tlang.compiler.printf_glsl import (
     render_buffer_decl, render_overloads, render_printf_module, rewrite_printf_calls,
 )
 from tlang.errors import TlangAttributeError
@@ -626,7 +626,7 @@ void cs_flood() {
 # `printf("%d %f %d %f\n", 7, 2.5, 9, 4.5)` used to decode as
 # "1088421888 2.500000 1091567616 4.500000" (the IEEE-754 bits of 7.0 and 9.0, read as
 # int) instead of "7 2.500000 9 4.500000". Fixed by casting per-specifier at the call site
-# (see `printf_codegen._cast_expr`) instead of relying on a type-matched overload.
+# (see `printf_glsl._cast_expr`) instead of relying on a type-matched overload.
 # ---------------------------------------------------------------------------
 
 MIXED_ARITY_SRC = '''\

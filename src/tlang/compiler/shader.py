@@ -19,7 +19,7 @@ from dataclasses import replace
 from typing import Any, Mapping
 import regex as re
 from moderngl import Buffer, Context, Program
-from tlang.compiler.printf_codegen import render_printf_module, rewrite_printf_calls
+from tlang.compiler.printf_glsl import render_printf_module, rewrite_printf_calls
 from tlang.frontend.function_manager import FunctionDef
 from tlang.runtime.printf_log import BUFFER_HANDLE as PRINTF_BUFFER_HANDLE, DEFAULT_LOG_CAPACITY, PrintfLog, PrintfTable
 from tlang.runtime.kernel import Kernel
@@ -51,7 +51,7 @@ class Shader:
         self._strict = strict  # raise TlangCompileError/TlangLinkError instead of logging and continuing
         # debug: emit real printf(...) bodies (writing into printf_log's ring buffer) instead
         # of empty stubs, but only in an artifact whose own source actually calls printf --
-        # see `tlang.compiler.printf_codegen.render_printf_module`. `printf_table` is the
+        # see `tlang.compiler.printf_glsl.render_printf_module`. `printf_table` is the
         # shared call-site/format registry (see `tlang.runtime.printf_log.PrintfTable`),
         # always present regardless of `debug` -- the build-time specifier/argument-count
         # check it backs is not a debug-only nicety. `printf_log` is the ONE `PrintfLog`

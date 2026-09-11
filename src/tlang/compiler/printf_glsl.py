@@ -1,5 +1,5 @@
 # -------------------------------------------------------------
-# @file          printf_codegen.py
+# @file          printf_glsl.py
 # @author        Priyangkar Ghosh
 # @created       2026-09-10
 # @description   Codegen for the `printf(...)` debug-log built-in: locating and rewriting

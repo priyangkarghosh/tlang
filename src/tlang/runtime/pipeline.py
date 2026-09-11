@@ -7,17 +7,22 @@
 # @license       MIT
 # -------------------------------------------------------------
 
+import ctypes
 import difflib
 import logging
 from collections.abc import Mapping
 from typing import Any
-from moderngl import Buffer, Context, Program, StorageBlock, Texture, UniformBlock, Uniform
-from OpenGL.GL import glBindBufferRange, GL_ATOMIC_COUNTER_BUFFER
+from moderngl import Buffer, Context, Program, StorageBlock, Texture, UniformBlock, Uniform, VertexArray
+from OpenGL.GL import (
+    glBindBufferRange, GL_ATOMIC_COUNTER_BUFFER,
+    glGetIntegeri_v, GL_ATOMIC_COUNTER_BUFFER_BINDING,
+)
 
 from tlang.errors import SourceLocation, TlangBindingError
 from tlang.runtime.kernel import (
     bump_counter_table_generation, bump_image_table_generation, bump_ssbo_table_generation,
-    bump_texture_table_generation,
+    bump_texture_table_generation, counter_table_generation, image_table_generation,
+    ssbo_table_generation, texture_table_generation,
 )
 
 logger = logging.getLogger(__name__)
@@ -31,6 +36,10 @@ class Pipeline:
     __slots__ = (
         '_ctx', '_name', '_mglo', '_uniform_cache', '_binding_cache', '_bindings', '_ubo_cache', '_buffer_source',
         '_texture_units', '_image_units', '_atomic_counters',
+        '_ssbo_bindings', '_bound_generation',
+        '_texture_bindings', '_bound_texture_generation',
+        '_image_bindings', '_bound_image_generation',
+        '_counter_bindings', '_bound_counter_generation',
     )
 
     def __init__(
@@ -60,6 +69,23 @@ class Pipeline:
         # GL_ATOMIC_COUNTER_BUFFER interface actually reports active -- see
         # `Kernel.atomic_counters`, which this mirrors.
         self._atomic_counters: dict[str, tuple[int, int]] = dict(atomic_counters) if atomic_counters is not None else {}
+
+        # name -> (buffer, offset, size) most recently passed to `bind_ssbo`, kept so `render()`
+        # has a full recorded set to re-assert -- the `Kernel._ssbo_bindings` counterpart, except
+        # `bind_ssbo` here ALSO writes it to GL immediately (see that method's docstring).
+        self._ssbo_bindings: dict[str, tuple[Buffer, int, int]] = {}
+        # `ssbo_table_generation()` as of this pipeline's last full re-assert; -1 means "never
+        # asserted", same convention as `Kernel._bound_generation`.
+        self._bound_generation: int = -1
+
+        # texture/image/counter counterparts of the pair above, one per independent GL table --
+        # see `Kernel`'s equivalents for the discipline each shares.
+        self._texture_bindings: dict[str, Texture] = {}
+        self._bound_texture_generation: int = -1
+        self._image_bindings: dict[str, tuple[Texture, bool, bool, int, int]] = {}
+        self._bound_image_generation: int = -1
+        self._counter_bindings: dict[str, tuple[Buffer, int]] = {}
+        self._bound_counter_generation: int = -1
 
     @property
     def ctx(self): return self._ctx
@@ -164,32 +190,41 @@ class Pipeline:
     def bind_ssbo(
         self, buffer_name: str, buffer: Buffer, offset: int = 0, size: int = -1
     ) -> None:
-        """Bind `buffer` to `buffer_name` (a HANDLE) IMMEDIATELY, unlike `Kernel.bind_ssbo`.
+        """Bind `buffer` to `buffer_name` (a HANDLE) IMMEDIATELY, unlike `Kernel.bind_ssbo` --
+        and record it, so `render()` (see its docstring) can re-assert it later.
 
-        `Kernel` can defer its binds because every dispatch entry point re-asserts the kernel's
-        full recorded set right before running -- there's a hook to do it at. A `Pipeline` has no
-        such hook: drawing happens in moderngl's `VAO.render`, entirely outside tlang, so there is
-        no "just before this pipeline runs" moment to re-assert at. Binding immediately is
-        therefore the only option here.
+        Binding immediately, rather than only recording the way `Kernel` does, is what keeps a
+        caller who dispatches `vao.render()` directly working exactly as before: drawing happens
+        in moderngl's `VertexArray.render()`, entirely outside tlang, so that caller has no
+        dispatch-like hook to defer to. `render()` is such a hook, though -- routing through it
+        instead re-asserts this pipeline's full recorded set right before `vao.render()` runs, so
+        a compute dispatch issued between this call and `render()` can no longer leave this
+        pipeline reading someone else's buffers. Only a caller who bypasses `render()` and calls
+        `vao.render()` directly is still exposed to that race.
 
-        This does still bump the same process-global generation counter `Kernel` uses (see
+        This also still bumps the same process-global generation counter `Kernel` uses (see
         `tlang.runtime.kernel.bump_ssbo_table_generation`), so any `Kernel` that dispatches after
         this call correctly notices the table has moved and re-asserts its own bindings. The
-        asymmetry this leaves: a compute dispatch issued BETWEEN a `pipeline.bind_ssbo(s)` call
-        and the eventual `VAO.render` draw can still silently rewire this pipeline's bindings out
-        from under it, and tlang currently has no mechanism to detect or prevent that -- only to
-        keep kernels honest about it.
+        recorded generation is fast-forwarded to the post-bump value rather than forced stale --
+        unlike `Kernel.bind_ssbo`, which always forces a re-assert since it never writes GL
+        itself -- because this entry was just physically written: `render()` must not immediately
+        rewrite it again. Fast-forwarding only when this pipeline's whole recorded set was
+        already current keeps that safe: if some other binder moved the table since this
+        pipeline's last full assert, the miss is preserved so `render()` still catches it.
         """
         binding = self._resolve_ssbo_binding(buffer_name)
         # offset/size are keyword-only on moderngl <= 5.8.x; positional args raise TypeError there.
         buffer.bind_to_storage_buffer(binding, offset=offset, size=size)
-        bump_ssbo_table_generation()
+        self._ssbo_bindings[buffer_name] = (buffer, offset, size)
+        was_current = self._bound_generation == ssbo_table_generation()
+        generation = bump_ssbo_table_generation()
+        self._bound_generation = generation if was_current else -1
 
     def bind(self, **explicit: Buffer | tuple[Buffer, int, int]) -> None:
         """Bind exactly this program's REQUIRED set (`self.bindings`) by name, drawn from
-        `explicit` first and then from `self.buffer_source` -- mirrors `Kernel.bind`, but (like
-        `bind_ssbo`) binds immediately rather than deferring, since a `Pipeline` has no
-        dispatch-time hook to re-assert at."""
+        `explicit` first and then from `self.buffer_source` -- mirrors `Kernel.bind`, going
+        through `bind_ssbo` (see its docstring) for each name, so every bind is both immediate
+        and recorded for `render()` to re-assert."""
         for buffer_name in self._bindings:
             if buffer_name in explicit:
                 value = explicit[buffer_name]
@@ -238,18 +273,23 @@ class Pipeline:
         for k, v in textures.items(): loc(k, v)
 
     def bind_texture(self, name: str, texture: Texture) -> None:
-        """Bind `texture` to `name`'s texture unit IMMEDIATELY, unlike `Kernel.bind_texture`.
+        """Bind `texture` to `name`'s texture unit IMMEDIATELY, unlike `Kernel.bind_texture` --
+        and record it, so `render()` can re-assert it later. Same reasoning as `bind_ssbo` above:
+        immediate binding keeps a direct `vao.render()` caller working unchanged, `render()`
+        closes the cross-wiring hole for anyone who calls it instead, and the recorded generation
+        is fast-forwarded only when this pipeline's whole texture set was already current.
 
-        Same asymmetry as `bind_ssbo` above, for the same reason: a `Pipeline` has no
-        dispatch-time hook to defer to (drawing happens in moderngl's `VAO.render`, entirely
-        outside tlang), so binding immediately is the only option here. Also bumps the shared
-        texture-unit generation counter (see `tlang.runtime.kernel.bump_texture_table_generation`)
-        so any `Kernel` that dispatches after this call notices the table moved and re-asserts.
+        Also bumps the shared texture-unit generation counter (see
+        `tlang.runtime.kernel.bump_texture_table_generation`) so any `Kernel` that dispatches
+        after this call notices the table moved and re-asserts.
         """
         if (unit := self._texture_units.get(name)) is None:
             raise TlangBindingError(f"'{name}' is not a declared texture (sampler) uniform", SourceLocation(module=self._name))
         texture.use(unit)
-        bump_texture_table_generation()
+        self._texture_bindings[name] = texture
+        was_current = self._bound_texture_generation == texture_table_generation()
+        generation = bump_texture_table_generation()
+        self._bound_texture_generation = generation if was_current else -1
 
     def bind_images(self, **images: Texture | tuple[Texture, bool, bool, int, int]) -> None:
         loc = self.bind_image
@@ -260,11 +300,15 @@ class Pipeline:
         level: int = 0, format: int = 0,
     ) -> None:
         """Bind `image` to `name`'s image unit IMMEDIATELY, via `Texture.bind_to_image(...)` --
-        the image counterpart of `bind_texture` above, same asymmetry and same rationale."""
+        the image counterpart of `bind_texture` above: same immediate-plus-recorded discipline,
+        same rationale, same `render()`-closes-the-hole reasoning."""
         if (unit := self._image_units.get(name)) is None:
             raise TlangBindingError(f"'{name}' is not a declared image uniform", SourceLocation(module=self._name))
         image.bind_to_image(unit, read=read, write=write, level=level, format=format)
-        bump_image_table_generation()
+        self._image_bindings[name] = (image, read, write, level, format)
+        was_current = self._bound_image_generation == image_table_generation()
+        generation = bump_image_table_generation()
+        self._bound_image_generation = generation if was_current else -1
 
     def bind_counters(self, **counters: Buffer | tuple[Buffer, int]) -> None:
         loc = self.bind_counter
@@ -272,8 +316,9 @@ class Pipeline:
 
     def bind_counter(self, name: str, buffer: Buffer, offset: int = 0) -> None:
         """Bind `buffer` to atomic counter `name`'s binding IMMEDIATELY, unlike
-        `Kernel.bind_counter`. Same asymmetry as `bind_ssbo`/`bind_texture` above, for the same
-        reason: a `Pipeline` has no dispatch-time hook to defer to.
+        `Kernel.bind_counter` -- and record it, so `render()` can re-assert it later. Same
+        immediate-plus-recorded discipline as `bind_ssbo`/`bind_texture` above, for the same
+        reason.
 
         `offset` is the byte offset in `buffer` where GL's bound range begins -- see
         `Kernel.bind_counter`'s docstring for the full composition. The range's size is derived
@@ -287,4 +332,188 @@ class Pipeline:
         binding, _counter_offset = pos
         size = max(o + 4 for b, o in self._atomic_counters.values() if b == binding)
         glBindBufferRange(GL_ATOMIC_COUNTER_BUFFER, binding, buffer.glo, offset, size)
-        bump_counter_table_generation()
+        self._counter_bindings[name] = (buffer, offset)
+        was_current = self._bound_counter_generation == counter_table_generation()
+        generation = bump_counter_table_generation()
+        self._bound_counter_generation = generation if was_current else -1
+
+    def render(self, vao: VertexArray, mode: int | None = None, vertices: int = -1, first: int = 0, instances: int = -1) -> None:
+        """Re-assert this pipeline's full recorded SSBO/texture/image/counter binding set, then
+        delegate to `vao.render(mode, vertices, first, instances)` -- mirrors
+        `moderngl.VertexArray.render`'s signature exactly.
+
+        This is the hook `bind_ssbo`'s docstring says a `Pipeline` never had: call `render()`
+        instead of `vao.render()` directly and a compute dispatch issued between binding this
+        pipeline and now can no longer leave it drawing with someone else's buffers -- the same
+        guarantee `Kernel.dispatch` gives a kernel, applied here right before the draw call
+        instead of right before a dispatch call. A caller who still calls `vao.render()` directly
+        bypasses this and keeps the old exposure.
+        """
+        self._assert_bindings()
+        vao.render(mode, vertices, first, instances)
+
+    def render_indirect(self, vao: VertexArray, buffer: Buffer, mode: int | None = None, count: int = -1, first: int = 0) -> None:
+        """`render()`'s counterpart for `moderngl.VertexArray.render_indirect` -- same re-assert,
+        same rationale, mirrors that method's signature exactly."""
+        self._assert_bindings()
+        vao.render_indirect(buffer, mode, count, first)
+
+    def transform(
+        self, vao: VertexArray, buffer: Buffer, mode: int | None = None, vertices: int = -1,
+        first: int = 0, instances: int = -1, buffer_offset: int = 0,
+    ) -> None:
+        """`render()`'s counterpart for `moderngl.VertexArray.transform` -- same re-assert, same
+        rationale, mirrors that method's signature exactly."""
+        self._assert_bindings()
+        vao.transform(buffer, mode, vertices, first, instances, buffer_offset)
+
+    def _assert_bindings(self) -> None:
+        """Everything `render`/`render_indirect`/`transform` need before delegating to the real
+        `moderngl.VertexArray` call -- the render-time counterpart of the four asserts
+        `Kernel.dispatch` runs at the top of every dispatch entry point."""
+        self._assert_ssbo_bindings()
+        self._assert_texture_bindings()
+        self._assert_image_bindings()
+        self._assert_counter_bindings()
+
+    def _assert_ssbo_bindings(self) -> None:
+        """Pipeline counterpart of `Kernel._assert_ssbo_bindings`: fail on a required block
+        never bound, catch a freed buffer, then re-assert the full recorded set into GL's global
+        binding table unless the shared generation counter shows nothing has touched it since
+        this pipeline's last full assert."""
+        missing = [name for name in self._bindings if name not in self._ssbo_bindings]
+        if missing:
+            raise TlangBindingError(
+                f"Pipeline '{self._name}' rendered with required buffer(s) never bound: "
+                f"{', '.join(sorted(missing))} (bind them first)",
+                SourceLocation(module=self._name),
+            )
+
+        for name, (buffer, _offset, _size) in self._ssbo_bindings.items():
+            if not getattr(buffer, 'alive', True):
+                raise TlangBindingError(
+                    f"Pipeline '{self._name}': buffer bound to '{name}' has been freed "
+                    f"(recycled temp buffer) -- re-bind before rendering",
+                    SourceLocation(module=self._name),
+                )
+
+        if self._bound_generation == ssbo_table_generation():
+            return  # nothing else has touched the global table since our last full assert
+
+        for name, (buffer, offset, size) in self._ssbo_bindings.items():
+            binding = self._resolve_ssbo_binding(name)
+            buffer.bind_to_storage_buffer(binding, offset=offset, size=size)
+
+        self._bound_generation = bump_ssbo_table_generation() if self._ssbo_bindings else ssbo_table_generation()
+
+    def _assert_texture_bindings(self) -> None:
+        """Texture-unit counterpart of `_assert_ssbo_bindings` -- same jobs, same
+        generation-counter fast path, against the separate texture-unit table/counter."""
+        missing = [name for name in self._texture_units if name not in self._texture_bindings]
+        if missing:
+            raise TlangBindingError(
+                f"Pipeline '{self._name}' rendered with required texture(s) never bound: "
+                f"{', '.join(sorted(missing))} (bind them first)",
+                SourceLocation(module=self._name),
+            )
+
+        for name, texture in self._texture_bindings.items():
+            if not getattr(texture, 'alive', True):
+                raise TlangBindingError(
+                    f"Pipeline '{self._name}': texture bound to '{name}' has been freed -- "
+                    f"re-bind before rendering",
+                    SourceLocation(module=self._name),
+                )
+
+        if self._bound_texture_generation == texture_table_generation():
+            return  # nothing else has touched the global texture-unit table since our last assert
+
+        for name, texture in self._texture_bindings.items():
+            texture.use(self._texture_units[name])
+
+        self._bound_texture_generation = (
+            bump_texture_table_generation() if self._texture_bindings else texture_table_generation()
+        )
+
+    def _assert_image_bindings(self) -> None:
+        """Image-unit counterpart of `_assert_ssbo_bindings` -- same jobs, same
+        generation-counter fast path, against the separate image-unit table/counter."""
+        missing = [name for name in self._image_units if name not in self._image_bindings]
+        if missing:
+            raise TlangBindingError(
+                f"Pipeline '{self._name}' rendered with required image(s) never bound: "
+                f"{', '.join(sorted(missing))} (bind them first)",
+                SourceLocation(module=self._name),
+            )
+
+        for name, (image, *_rest) in self._image_bindings.items():
+            if not getattr(image, 'alive', True):
+                raise TlangBindingError(
+                    f"Pipeline '{self._name}': image bound to '{name}' has been freed -- "
+                    f"re-bind before rendering",
+                    SourceLocation(module=self._name),
+                )
+
+        if self._bound_image_generation == image_table_generation():
+            return  # nothing else has touched the global image-unit table since our last assert
+
+        for name, (image, read, write, level, format) in self._image_bindings.items():
+            image.bind_to_image(self._image_units[name], read=read, write=write, level=level, format=format)
+
+        self._bound_image_generation = (
+            bump_image_table_generation() if self._image_bindings else image_table_generation()
+        )
+
+    def _assert_counter_bindings(self) -> None:
+        """Atomic-counter counterpart of `_assert_ssbo_bindings`, with the same deliberate
+        divergence `Kernel._assert_counter_bindings` documents: a counter never bound through
+        this pipeline is checked against GL's own binding state, not this pipeline's records,
+        since binding one once outside any `Pipeline`/`Kernel` and never rebinding is legitimate
+        usage. See that method's docstring for the full reasoning -- this mirrors it exactly."""
+        for name, (buffer, _offset) in self._counter_bindings.items():
+            if not getattr(buffer, 'alive', True):
+                raise TlangBindingError(
+                    f"Pipeline '{self._name}': buffer bound to atomic counter '{name}' has been "
+                    f"freed (recycled temp buffer) -- re-bind before rendering",
+                    SourceLocation(module=self._name),
+                )
+
+        unbound = {n for n in self._atomic_counters if n not in self._counter_bindings}
+        if unbound:
+            slot = (ctypes.c_int * 1)()
+            for name in sorted(unbound):
+                binding, _off = self._atomic_counters[name]
+                glGetIntegeri_v(GL_ATOMIC_COUNTER_BUFFER_BINDING, binding, slot)
+                if slot[0]: continue
+                raise TlangBindingError(
+                    f"Pipeline '{self._name}' rendered with atomic counter '{name}' unbound: "
+                    f"nothing is bound at atomic-counter binding {binding}, so it would read no "
+                    f"buffer at all. Bind it with bind_counter('{name}', ...)",
+                    SourceLocation(module=self._name),
+                )
+
+        if self._bound_counter_generation == counter_table_generation():
+            return  # nothing else has touched the global counter-buffer table since our last assert
+
+        by_binding: dict[int, tuple[Buffer, int]] = {}
+        for name, (buffer, offset) in self._counter_bindings.items():
+            binding, _counter_offset = self._atomic_counters[name]
+            if binding in by_binding:
+                existing_buffer, existing_offset = by_binding[binding]
+                if existing_buffer is not buffer or existing_offset != offset:
+                    raise TlangBindingError(
+                        f"Pipeline '{self._name}': atomic counters sharing binding {binding} "
+                        f"were bound to different buffers/offsets -- bind every counter that "
+                        f"shares one binding to the same buffer and the same range offset",
+                        SourceLocation(module=self._name),
+                    )
+                continue
+            by_binding[binding] = (buffer, offset)
+
+        for binding, (buffer, offset) in by_binding.items():
+            size = max(o + 4 for b, o in self._atomic_counters.values() if b == binding)
+            glBindBufferRange(GL_ATOMIC_COUNTER_BUFFER, binding, buffer.glo, offset, size)
+
+        self._bound_counter_generation = (
+            bump_counter_table_generation() if self._counter_bindings else counter_table_generation()
+        )

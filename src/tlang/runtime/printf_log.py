@@ -5,7 +5,7 @@
 # @description   Host side of the `printf(...)` debug-log built-in: the pinned ring buffer
 #                tlang owns (never the user), numpy-vectorised decoding of its records, and
 #                the `sm.stdout` surface (dedup, rate-limited streaming, on-demand drain).
-#                See `tlang.compiler.printf_codegen` for the GLSL side (the emitted `printf`
+#                See `tlang.compiler.printf_glsl` for the GLSL side (the emitted `printf`
 #                overloads, the call-site rewrite, and the SSBO block they write into) --
 #                this module is the single source of truth for the wire format both sides
 #                share, plus the `PrintfTable` build-time registry both sides populate/read.
@@ -28,7 +28,7 @@ from tlang.runtime.pinned_buffer import PinnedBuffer, PinnedBufferFallback, crea
 
 logger = logging.getLogger(__name__)
 
-# ----- wire format (see `tlang.compiler.printf_codegen` for the GLSL-side encoder) -----
+# ----- wire format (see `tlang.compiler.printf_glsl` for the GLSL-side encoder) -----
 #
 # layout(std430) buffer TlangPrintfLog {
 #     uint tlang_pf_reserved;        // next slot POSITION to claim -- see the CAS note below
@@ -92,7 +92,7 @@ DEFAULT_LOG_CAPACITY = 4096  # records
 # forever.
 CAS_SPIN_LIMIT = 64
 
-# The raw GLSL names `printf`'s real body touches -- see `tlang.compiler.printf_codegen`,
+# The raw GLSL names `printf`'s real body touches -- see `tlang.compiler.printf_glsl`,
 # the only other place these are spelled out.
 BUFFER_HANDLE = 'TlangPrintfLog'
 RESERVED_FIELD = 'tlang_pf_reserved'
@@ -101,7 +101,7 @@ READY_FIELD = 'tlang_pf_ready'
 DATA_FIELD = 'tlang_pf_data'
 
 # Supported printf specifiers -- decode side. `%%` is handled separately (it consumes no
-# argument at all, see `tlang.compiler.printf_codegen._parse_specifiers`).
+# argument at all, see `tlang.compiler.printf_glsl._parse_specifiers`).
 VALUE_SPECIFIERS = ('d', 'u', 'f', 'x')
 
 # A sensible ceiling, not an arbitrary one: RECORD_WORDS sizes every slot in the ring
@@ -137,7 +137,7 @@ class PrintfTable:
     against the ONE shared `PrintfLog` buffer the whole tree writes into.
 
     Exists, and is always populated, whether or not `debug=True` -- the specifier-vs-
-    argument-count validation `tlang.compiler.printf_codegen.rewrite_printf_calls` performs
+    argument-count validation `tlang.compiler.printf_glsl.rewrite_printf_calls` performs
     while populating this table is a real build-time bug check (see the brief), not a
     debug-only nicety. It costs nothing in release beyond the one-time scan already required
     to find and rewrite each call site.
@@ -189,7 +189,7 @@ _PY_SPEC = {'d': '%d', 'u': '%d', 'f': '%f', 'x': '%x', '%': '%%'}
 
 
 def to_python_format(fmt: str) -> str:
-    """`fmt` has already been validated (`printf_codegen._parse_specifiers`) to contain only
+    """`fmt` has already been validated (`printf_glsl._parse_specifiers`) to contain only
     `%d`/`%u`/`%f`/`%x`/`%%` -- every `%` is the start of one of those five sequences, so a
     single substitution pass is enough."""
     return _SPEC_PATTERN.sub(lambda m: _PY_SPEC[m.group(1)], fmt)

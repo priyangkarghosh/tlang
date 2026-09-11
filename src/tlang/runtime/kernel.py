@@ -55,6 +55,13 @@ def bump_ssbo_table_generation() -> int:
     return _ssbo_table_generation
 
 
+def ssbo_table_generation() -> int:
+    """Current generation of GL's global SSBO binding table, with no side effect. `Kernel`
+    checks this against its own module global directly; `Pipeline.render` lives in a different
+    module and uses this to make the same check without bumping it."""
+    return _ssbo_table_generation
+
+
 # Same generation-counter discipline as `_ssbo_table_generation` above, one counter per GL
 # binding table: texture units (`Texture.use`) and image units (`Texture.bind_to_image`) are
 # separate process-global tables from each other AND from the SSBO one, so each gets its own
@@ -72,12 +79,24 @@ def bump_texture_table_generation() -> int:
     return _texture_table_generation
 
 
+def texture_table_generation() -> int:
+    """Current generation of GL's global texture-unit table, with no side effect -- see
+    `ssbo_table_generation`, same purpose, separate table."""
+    return _texture_table_generation
+
+
 def bump_image_table_generation() -> int:
     """Record one write to GL's global image-unit binding table (`Texture.bind_to_image`) and
     return the new generation. See `bump_ssbo_table_generation` -- same discipline, separate
     table."""
     global _image_table_generation
     _image_table_generation += 1
+    return _image_table_generation
+
+
+def image_table_generation() -> int:
+    """Current generation of GL's global image-unit table, with no side effect -- see
+    `ssbo_table_generation`, same purpose, separate table."""
     return _image_table_generation
 
 
@@ -93,6 +112,12 @@ def bump_counter_table_generation() -> int:
     `Pipeline.bind_ssbo`."""
     global _counter_table_generation
     _counter_table_generation += 1
+    return _counter_table_generation
+
+
+def counter_table_generation() -> int:
+    """Current generation of GL's global atomic-counter-buffer table, with no side effect -- see
+    `ssbo_table_generation`, same purpose, separate table."""
     return _counter_table_generation
 
 
