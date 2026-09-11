@@ -1,0 +1,67 @@
+// Compute-side feature coverage. Everything here is exercised and asserted by
+// examples/smoke.py, so a regression in any of it fails that script.
+
+[include(math)]
+
+// ---------------------------------------------------------------------------
+// buffer declarations -- all three forms coexist in one file
+// ---------------------------------------------------------------------------
+
+// Shorthand: one member, and you bind by the name written here. tlang
+// synthesises the GLSL block name, which GLSL requires to differ from the
+// member's.
+[buffer] uint counts[];
+
+// Same-line struct form, for a block with several members. Here the struct
+// name is both the handle and the emitted block name.
+[buffer] struct Totals { uint hits; uint misses; };
+
+// Raw GLSL still works untouched, and binds by the name written.
+layout(std430) buffer Scratch { uint scratch[]; };
+
+// ---------------------------------------------------------------------------
+// a helper reached only through [link] -- it is emitted into `accumulate`
+// alone, not into every entry point in this file
+// ---------------------------------------------------------------------------
+
+uint weigh(uint v) {
+    return mul(v, 2u);
+}
+
+// ---------------------------------------------------------------------------
+// entry points
+// ---------------------------------------------------------------------------
+
+[shader('compute'), numthreads(64, 1, 1)]
+[glsl(
+    uniform uint elementCount;
+)]
+void tally() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= elementCount) return;
+
+    // body pragmas pass through as #pragma directives
+    [unroll]
+    for (uint i = 0u; i < 2u; ++i) {
+        counts[gid] = add(counts[gid], 1u);
+    }
+}
+
+[shader('compute'), numthreads(64, 1, 1)]
+[link('weigh')]
+[glsl(
+    uniform uint elementCount;
+)]
+void accumulate() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= elementCount) return;
+    scratch[gid] = weigh(counts[gid]);
+}
+
+// Touches only Totals, so DCE strips every other block from this artifact --
+// kernel.bindings is what main() reaches, not what the file declares.
+[shader('compute'), numthreads(1, 1, 1)]
+void summarise() {
+    hits = 1u;
+    misses = 2u;
+}

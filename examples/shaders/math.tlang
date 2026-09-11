@@ -1,0 +1,12 @@
+// Shared helpers, importable by other .tlang modules via [include(math)].
+// [export] marks a non-stage function as part of this module's public surface.
+
+[export]
+uint add(uint x, uint y) {
+    return x + y;
+}
+
+[export]
+uint mul(uint x, uint y) {
+    return x * y;
+}

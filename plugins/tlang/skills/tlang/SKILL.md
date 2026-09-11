@@ -36,6 +36,21 @@ kernel   = shader.get_kernel('cs_go')      # -> Kernel        (KeyError if absen
 pipeline = shader.get_pipeline('default')  # -> Pipeline      (prefer over get_program)
 ```
 
+**Bind by name, dispatch by element count.** Point the tree at a buffer source once, and
+every kernel resolves what it declared:
+
+```python
+pool = BufferPool(ctx)
+pool.persistent_buffer('Particles', size=n * 16)
+sm.buffer_source = pool                    # or any Mapping[str, Buffer]
+
+kernel.bind()                              # binds exactly what this kernel declares
+kernel.dispatch_for(n)                     # work-group count derived from numthreads
+```
+
+`bind(**extra)` overrides or supplements the source for one call; a required block the
+source can't answer raises, naming it.
+
 Module names are the file's path relative to `dir`, dotted, no extension:
 `shaders/fx/blur.tlang` -> `'fx.blur'`. That's what `[include(...)]` and `get_shader()` take.
 
@@ -111,8 +126,14 @@ kernel.dispatch_for(n)                        # covers n invocations -- derives 
 - **`[uses(name, dir=...)]`** only names a `[varyings]` declaration — never
   `[uniforms]`/`[buffer]` — and takes exactly one `dir='in'` and one `dir='out'` per
   stage function. A second `dir='out'` on the same function is a build error.
-- **The struct must sit immediately after its declaration attribute** — nothing between
-  `[varyings]`/`[uniforms(...)]`/`[buffer(...)]` and `struct Name { ... };`.
+- **The declaration follows its attribute directly** — on the same line or the next,
+  with nothing between: `[varyings] struct VertexOut { vec3 color; };` and the two-line
+  form are equivalent.
+- **`[buffer] vec2 ptcPositions[];` declares a one-member SSBO block**, and you bind by
+  the name you wrote (`kernel.bind(ptcPositions=buf)`). GLSL forbids a block sharing its
+  member's name, so tlang synthesises the block name and hides it — like a binding index.
+  Multi-member blocks use the struct form, where you name the block yourself and that name
+  is the handle. `[buffer(name='X')]` pins a handle when something outside tlang needs one.
 - **`[varyings(locations=false)]`** is required, not optional, for a member with no
   measurable location span: an unsized array, or an array sized by `{{ CONSTANT }}`
   rather than an integer literal. Leaving it out is a build-time error naming the
@@ -150,6 +171,9 @@ kernel.dispatch_for(n)                        # covers n invocations -- derives 
   entry point (that one kernel). This is deliberate — it's what keeps artifacts small.
   Calling a helper that has neither is now a tlang error naming the helper and the
   attribute it needs, not a raw GLSL "undefined variable".
+- **Two `[include]`d modules declaring the same top-level symbol is a tlang error**
+  naming both modules and lines, not a driver redefinition at a generated line number.
+  Real GLSL overloads (same name, different parameter types) are fine and don't fire it.
 - **`{{ }}` collides with GLSL brace initializers** (`mat2({{1.0,0.0},{0.0,1.0}})`)
   — add a space or use constructor form.
 - **A raster stage function with no `[program(...)]` reference is compiled and

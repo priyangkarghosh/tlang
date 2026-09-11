@@ -194,6 +194,9 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
-# shader stuff
+# shader stuff -- a consumer's own shaders, not this project's. The examples are
+# tlang's own and must ship, or examples/smoke.py has nothing to build.
 *.glsl
 *.tlang
+!examples/shaders/*.tlang
+!examples/shaders/*.glsl

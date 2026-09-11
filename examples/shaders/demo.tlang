@@ -1,0 +1,46 @@
+[include(math)]
+
+#define BLOCK_SIZE {{ BLOCK_SIZE }}
+
+// Raw GLSL buffer declarations still work exactly as before.
+layout(std430) buffer Data { uint data[]; };
+
+// The structured form declares the same thing, with a binding assigned the
+// same way. Both styles can coexist in one file.
+[buffer(std430)]
+struct Scratch { uint scratch[]; };
+
+// Loose uniforms, grouped. Set them with pipeline.set_uniforms(tint=...).
+[uniforms]
+struct Frame { vec4 tint; };
+
+// Declared once; both stages reference it, so locations match by construction
+// and a rename on one side is a build error rather than a link failure.
+[varyings]
+struct VertexOut { vec3 color; vec2 uv; };
+
+[program('default', vert='vs_main', frag='fs_main')]
+
+[shader('vertex')]
+[uses(VertexOut, dir='out')]
+void vs_main() {
+    color = vec3(1.0, 0.0, 0.0);
+    uv = vec2(0.0);
+    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+}
+
+[shader('fragment')]
+[uses(VertexOut, dir='in')]
+[glsl(
+    out vec4 fragColor;
+)]
+void fs_main() {
+    fragColor = vec4(color, uv.x) * tint;
+}
+
+[shader('compute'), numthreads(BLOCK_SIZE, 1, 1)]
+void cs_go() {
+    uint gid = gl_GlobalInvocationID.x;
+    scratch[gid] = add(mul(gid, 2u), 1u);
+    data[gid] = scratch[gid];
+}
