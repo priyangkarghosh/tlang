@@ -72,7 +72,7 @@ void vs_main() {
 
 [shader('fragment')]
 [uses(VertexOut, dir='in')]      // SAME declaration -> matches by construction
-[resourceblock(                  // escape hatch for anything structs can't express
+[glsl(                  // escape hatch for anything structs can't express
     out vec4 fragColor;
 )]
 void fs_main() {
@@ -120,9 +120,9 @@ kernel.dispatch_for(n)                        # covers n invocations -- derives 
 - **Geometry/tess stages array their per-vertex `in` (and tess-control `out`)
   interfaces automatically** — `[uses(..., dir='in')]` emits `in vec3 color[];`, you
   index `color[i]`. Do not add your own `[]`.
-- **`[resourceblock(...)]` still works and is not deprecated** — it's the escape hatch
+- **`[glsl(...)]` still works and is not deprecated** — it's the escape hatch
   for interface blocks, mixed-direction resources, and anything the struct form can't
-  express. Don't "migrate" existing `[resourceblock(...)]` usage unasked.
+  express. Don't "migrate" existing `[glsl(...)]` usage unasked.
 - **Raw GLSL declarations (`layout(std430) buffer X {...};`, plain `in`/`out`) still
   work exactly as before.** The struct form is an alternative, never required — mix
   freely, migrate one stage at a time or never.
@@ -161,7 +161,7 @@ kernel.dispatch_for(n)                        # covers n invocations -- derives 
 | Question | Read |
 |---|---|
 | Every attribute, its args, valid stages | `references/attributes.md` (generated — do not hand-edit) |
-| Declaring varyings/uniforms/buffers as structs, locations, `[uses]`, `[resourceblock]`, reflection | `references/resources.md` |
+| Declaring varyings/uniforms/buffers as structs, locations, `[uses]`, `[glsl]`, reflection | `references/resources.md` |
 | `ShaderManager`, `Shader`, `Kernel`, `Pipeline`, `BufferPool`, dispatch, binding by name | `references/runtime.md` |
 | An exact error message and what to do about it | `references/errors.md` |
 | Full working shaders to copy: compute kernel, vert+frag with structured varyings, cross-module include/export, geometry stage | `references/patterns.md` |

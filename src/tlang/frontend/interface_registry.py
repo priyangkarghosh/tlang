@@ -369,7 +369,7 @@ def _emit_varyings(decl: InterfaceDecl, direction: str, base_location: int, arra
             raise TlangAttributeError(
                 f"interface '{decl.name}' member '{m.type_name} {m.name}{m.array}' already "
                 f"declares an array; a per-vertex arrayed interface can't add another array "
-                f"dimension here -- use [resourceblock(...)] for an array-of-arrays interface",
+                f"dimension here -- use [glsl(...)] for an array-of-arrays interface",
                 SourceLocation(decl.module, m.line),
             )
         prefix = ''

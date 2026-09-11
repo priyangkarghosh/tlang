@@ -113,7 +113,7 @@ class LayoutQualifier:
     direction: Direction
     tokens: dict[str, str | None] = field(default_factory=dict)
     origin: str = ''
-    exclusive: bool = False                       # True once a verbatim [resourceblock] layout line claims this direction
+    exclusive: bool = False                       # True once a verbatim [glsl] layout line claims this direction
     _origins: dict[str, str] = field(default_factory=dict)  # per-token origin, for conflict diagnostics
 
 
@@ -279,12 +279,12 @@ def bind_update(
 
 # ---------------------------------------------------------------------------
 # Splits verbatim `layout(...) in|out;` lines (merged/conflict-checked against stage defaults)
-# out of a resourceblock, from everything else (plain declarations, appended verbatim).
+# out of a [glsl] block, from everything else (plain declarations, appended verbatim).
 # ---------------------------------------------------------------------------
 
 _LAYOUT_LINE_RE = re.compile(r'^[ \t]*layout\s*\(([^)]*)\)\s*(in|out)\s*;[ \t]*$', re.MULTILINE)
 
-def parse_resourceblock(raw: str) -> tuple[dict[Direction, dict[str, str | None]], str]:
+def parse_glsl_block(raw: str) -> tuple[dict[Direction, dict[str, str | None]], str]:
     claims: dict[Direction, dict[str, str | None]] = {}
 
     def repl(m: re.Match) -> str:
@@ -403,5 +403,5 @@ def generate_docs(registry: AttrRegistry) -> str:
 __all__ = [
     'Scope', 'Direction', 'Param', 'AttrSpec', 'LayoutQualifier', 'RawDecl', 'StageConfig',
     'AttrCtx', 'Diagnostics', 'AttrRegistry', 'USE_ARG',
-    'bind_params', 'bind_update', 'parse_resourceblock', 'generate_docs',
+    'bind_params', 'bind_update', 'parse_glsl_block', 'generate_docs',
 ]

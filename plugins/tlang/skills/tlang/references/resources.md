@@ -194,7 +194,7 @@ void gs_main() {
 
 [shader('fragment')]
 [uses(GOut, dir='in')]
-[resourceblock( out vec4 fragColor; )]
+[glsl( out vec4 fragColor; )]
 void fs_main() { fragColor = vec4(gcolor, 1.0); }
 ```
 
@@ -204,10 +204,14 @@ The geometry stage emits `layout(location = 0) in vec3 color[];` and
 Arraying does not add a location — a per-vertex array of `vec3` still occupies one
 location; the array dimension and the location count are independent. A member that
 *already* declares its own array (`vec3 color[4]`) cannot also be arrayed by the
-stage — that's a build error pointing at `[resourceblock(...)]` as the escape hatch
+stage — that's a build error pointing at `[glsl(...)]` as the escape hatch
 for an array-of-arrays interface.
 
-## `[resourceblock(...)]` — the escape hatch
+## `[glsl(...)]` — the escape hatch
+
+Named `[glsl]` because that is what it means: stop preprocessing, the text inside is
+raw GLSL and reaches the driver untouched. `[resourceblock(...)]` is the former name and
+still works as an alias, so existing shaders need no edit.
 
 Injects verbatim GLSL immediately before a function's body. Still fully supported,
 not deprecated. Use it for anything the struct form can't express: an interface
@@ -216,7 +220,7 @@ syntax the struct parser doesn't accept.
 
 ```glsl
 [shader('fragment')]
-[resourceblock(
+[glsl(
     out vec4 fragColor;
 )]
 void fs_main() { fragColor = vec4(1.0); }
@@ -224,7 +228,7 @@ void fs_main() { fragColor = vec4(1.0); }
 
 Its `layout(...) in;`/`out;` lines conflict-check against the stage's generated
 layout, so you can't silently emit two contradictory qualifiers. Prefer the struct
-form for new code; do not "fix" existing `[resourceblock(...)]` usage unasked.
+form for new code; do not "fix" existing `[glsl(...)]` usage unasked.
 
 ## Cross-stage and cross-module validation
 

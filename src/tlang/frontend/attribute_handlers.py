@@ -24,7 +24,7 @@ from tlang.frontend.attribute_registry import (
     Param,
     Scope,
     USE_ARG,
-    parse_resourceblock,
+    parse_glsl_block,
 )
 from tlang.errors import SourceLocation, TlangAttributeError, TlangError
 from tlang.frontend.function_manager import FunctionDef, FunctionList, InterfaceRef
@@ -133,15 +133,15 @@ class AttributeHandlers:
         ctx.stage_config.set_layout('in', tokens, origin, loc=ctx.attr.location)
 
     @staticmethod
-    def resourceblock(ctx: AttrCtx, args: dict[str, Any]) -> None:
+    def glsl(ctx: AttrCtx, args: dict[str, Any]) -> None:
         """Deferred for the same reason as numthreads: a verbatim
         `layout(...) in|out;` line inside the block must be checked against
         whatever the target stage would otherwise auto-generate for that
         direction, which isn't known until the function's stage is."""
         if ctx.stage_config is None:
-            raise TlangAttributeError("[resourceblock]: internal error -- missing stage config", ctx.attr.location)
-        claims, remainder = parse_resourceblock(ctx.attr.raw_args)
-        origin = f"[resourceblock] at {ctx.attr.location}"
+            raise TlangAttributeError("[glsl]: internal error -- missing stage config", ctx.attr.location)
+        claims, remainder = parse_glsl_block(ctx.attr.raw_args)
+        origin = f"[glsl] at {ctx.attr.location}"
         for direction, tokens in claims.items():
             ctx.stage_config.set_layout(direction, tokens, origin, exclusive=True, loc=ctx.attr.location)
         ctx.stage_config.add_decl(remainder, origin)
@@ -422,10 +422,10 @@ SPECS: list[AttrSpec] = [
         example="[numthreads(64, 1, 1)]",
     ),
     AttrSpec(
-        name='resourceblock', scope=Scope.GLOBAL, deferred=True,
-        handler=AttributeHandlers.resourceblock,
-        summary="Injects verbatim GLSL immediately before this function's body.",
-        example="[resourceblock(out vec4 fragColor;)]",
+        name='glsl', scope=Scope.GLOBAL, deferred=True, aliases=('resourceblock',),
+        handler=AttributeHandlers.glsl,
+        summary="Escapes into raw GLSL: injects the text verbatim immediately before this function's body.",
+        example="[glsl(out vec4 fragColor;)]",
     ),
 
     # -- declaration attributes: desugar the following struct to flat GLSL --

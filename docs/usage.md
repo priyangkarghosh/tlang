@@ -214,7 +214,7 @@ void vs_main() {
 
 [shader('fragment')]
 [uses(VertexOut, dir='in')]
-[resourceblock(out vec4 fragColor;)]
+[glsl(out vec4 fragColor;)]
 void fs_main() {
     fragColor = vec4(color, 1.0);
 }
@@ -329,13 +329,13 @@ void gs_main() {
 Arraying does not add a location — a per-vertex array of `vec3` still occupies one
 location, the array dimension is separate from the location count.
 
-**`[resourceblock(...)]` still works, unchanged.** It stays the escape hatch for
+**`[glsl(...)]` still works, unchanged.** It stays the escape hatch for
 anything the struct form doesn't cover — an interface block, a resource whose members
 mix directions, or GLSL the struct syntax has no way to express:
 
 ```glsl
 [shader('fragment')]
-[resourceblock(out vec4 fragColor;)]
+[glsl(out vec4 fragColor;)]
 void fs_main() { fragColor = vec4(1.0); }
 ```
 

@@ -61,7 +61,7 @@ void vs_main() {
 
 [shader('fragment')]
 [uses(VertexOut, dir='in')]
-[resourceblock(
+[glsl(
     out vec4 fragColor;
 )]
 void fs_main() {
@@ -142,7 +142,7 @@ void gs_main() {
 
 [shader('fragment')]
 [uses(GOut, dir='in')]
-[resourceblock(
+[glsl(
     out vec4 fragColor;
 )]
 void fs_main() {
@@ -197,7 +197,7 @@ void vs_main() {
 
 [shader('fragment')]
 [uses(Batch, dir='in')]
-[resourceblock(
+[glsl(
     out vec4 fragColor;
 )]
 void fs_main() {

@@ -235,7 +235,7 @@ class ShaderProcessor:
 
     # ----- per-function attribute resolution -----
     #
-    # Stage-dependent attributes (markers, frag/geom/tesc/tese, numthreads, resourceblock)
+    # Stage-dependent attributes (markers, frag/geom/tesc/tese, numthreads, glsl)
     # can't resolve until a function's stage is known. That resolution happens here, once per
     # function, building a StageConfig that flattens into `func.config` (see StageConfig.emit()).
 
@@ -276,7 +276,7 @@ class ShaderProcessor:
             if spec is None: continue  # unknown / wrong-stage -- diagnosed already (dropped only when strict=False)
 
             if spec.handler is not None:
-                # numthreads / resourceblock -- imperative, but deferred
+                # numthreads / glsl -- imperative, but deferred
                 # until a StageConfig exists to receive their contribution
                 bound = bind_params(spec.params, attr, REGISTRY.canonical, spec.variadic)
                 ctx = AttrCtx(shader_name=self.name, diagnostics=self.diagnostics, attr=attr, func=func, stage_config=stage_config)

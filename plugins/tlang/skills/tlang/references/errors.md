@@ -61,10 +61,10 @@ demo:1: struct 'Bad': expected ';' immediately after the closing '}' (a flat int
 **An unbalanced parenthesis inside an attribute's argument list** — including one inside
 a `//` comment, since the comment is part of the argument text:
 ```
-demo:3: Malformed attribute 'resourceblock(
+demo:3: Malformed attribute 'glsl(
     uniform float dt;
     // the substep length, used for the clamp (see Sec4.3 Eq. 10
-)' in [resourceblock(
+)' in [glsl(
     uniform float dt;
     // the substep length, used for the clamp (see Sec4.3 Eq. 10
 )]. Expected 'name' or 'name(args)'.
@@ -356,7 +356,7 @@ compute_shader
 demo(4) : error C0000: syntax error, unexpected ';', expecting "::" at token ";"
 ```
 
-**A `[program(...)]` link failure** (e.g. a raw `[resourceblock(...)]` on each stage
+**A `[program(...)]` link failure** (e.g. a raw `[glsl(...)]` on each stage
 declaring the same varying name with mismatched types — the struct/`[uses(...)]`
 form catches this before it ever reaches the driver; raw declarations don't get that
 check):

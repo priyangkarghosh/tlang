@@ -102,7 +102,7 @@ Everything else derives from the table:
 - **Dispatch** — one function resolves `(name, scope)`, filters by stage, coerces
   arguments against `params`, then either calls the spec's handler or applies its
   declarative `emits`. Only genuinely imperative attributes (`shader`, `program`,
-  `include`, `extend`, `link`, `export`, `numthreads`, `resourceblock`) need handler
+  `include`, `extend`, `link`, `export`, `numthreads`, `glsl`) need handler
   code; the ~20 bare markers and the function-body pragmas are pure data.
 - **Validation** — `Param.type` coercion means `[frag(early_tests=false)]` yields a real
   `False`, not the truthy string `'false'`. `Param.choices` rejects invalid values with
@@ -118,7 +118,7 @@ Some attributes resolve immediately; stage-dependent ones are deferred onto
 known.
 
 `StageConfig` collects a function's layout qualifiers and raw declarations separately,
-merging qualifiers by direction so conflicts (two `numthreads`, or a `[resourceblock]`
+merging qualifiers by direction so conflicts (two `numthreads`, or a `[glsl]`
 line contradicting a stage default) are detected rather than emitted twice. It is
 flattened to the `list[str]` that `func.config` exposes.
 

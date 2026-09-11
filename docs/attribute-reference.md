@@ -21,7 +21,7 @@ is a real boolean `False`, not the truthy string `"false"`.
 | Name | Scope | Stages | Params | Aliases | Summary | Example |
 |---|---|---|---|---|---|---|
 | `branch` | function-body | any | — | — | Requests explicit branching. | `[branch]` |
-| `buffer` | global | any | layout: str ∈ {std430,std140} = 'std430' | — | Declares an SSBO block from the following struct. | `[buffer(std430)]`<br>`struct Particles { vec4 pos[]; };` |
+| `buffer` | global | any | layout: str ∈ {std430,std140} = 'std430'; name: str = None | — | Declares an SSBO block from the following struct, or from a single declarator ('[buffer] vec2 x[];') whose block name is derived by upper-casing the member's first character -- override with name='...' when that's wrong. | `[buffer(std430)]`<br>`struct Particles { vec4 pos[]; };`<br>`[buffer] vec2 ptcPositions[];` |
 | `ccw` | global | tese | — | — | Tess-eval winding: counter-clockwise. | `[ccw]` |
 | `cw` | global | tese | — | — | Tess-eval winding: clockwise. | `[cw]` |
 | `early_fragment_tests` | global | frag | — | — | Shorthand for [frag(early_tests=true)]. | `[early_fragment_tests]` |
@@ -35,6 +35,7 @@ is a real boolean `False`, not the truthy string `"false"`.
 | `fractional_odd_spacing` | global | tese | — | odd, frac_odd | Tess-eval spacing: fractional_odd_spacing. | `[fractional_odd_spacing]` |
 | `frag` | global | frag | early_tests: bool = False | — | Fragment-stage settings. | `[frag(early_tests=true)]` |
 | `geom` | global | geom | in: str ∈ {points,lines,triangles,lines_adjacency,triangles_adjacency} = 'triangles'; out: str ∈ {points,line_strip,triangle_strip} = 'triangle_strip'; max_verts: int = 3; stream: int = None | — | Geometry-stage settings. | `[geom(in='points', out='triangle_strip', max_verts=6)]` |
+| `glsl` | global | any | — | resourceblock | Escapes into raw GLSL: injects the text verbatim immediately before this function's body. | `[glsl(out vec4 fragColor;)]` |
 | `include` | global | any | — | — | Pulls another module's exported declarations into this one. | `[include(math)]` |
 | `isolines` | global | tese | — | — | Tess-eval input primitive: isolines. | `[isolines]` |
 | `line_strip` | global | geom | — | — | Geometry output primitive: line_strip. | `[line_strip]` |
@@ -50,7 +51,6 @@ is a real boolean `False`, not the truthy string `"false"`.
 | `program` | global | any | name: str | — | Declares a linked program, mapping stage kwargs (vert=, frag=, ...) to entry points. | `[program('default', vert='vs_main', frag='fs_main')]` |
 | `quads` | global | tese | — | — | Tess-eval input primitive: quads. | `[quads]` |
 | `require` | global | any | — | — | Alias family for [extend!(...)] -- ': require' semantics. | `[require(int64)]` |
-| `resourceblock` | global | any | — | — | Injects verbatim GLSL immediately before this function's body. | `[resourceblock(out vec4 fragColor;)]` |
 | `shader` | global | any | stage: str | — | Assigns the shader stage of the next function. | `[shader('compute')]` |
 | `stream` | global | geom | value: int | — | Geometry output transform-feedback stream index. | `[stream(1)]` |
 | `tesc` | global | tesc | vertices: int = 0 | — | Tessellation-control-stage settings. | `[tesc(vertices=3)]` |

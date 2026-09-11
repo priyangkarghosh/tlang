@@ -30,7 +30,7 @@ BLOCK_PATTERN = re.compile(r'\[((?:[^\[\]]|\[[^\[\]]*\])*)\]',re.DOTALL) # suppo
 _ATTR_RUN_PATTERN = re.compile(r'^(?:\s*\[(?:[^\[\]]|\[[^\[\]]*\])*\])*', re.DOTALL)
 ATTR_PATTERN = re.compile(
     r'''
-    (?P<name>\w+!?)          # attribute name: shader / include / resourceblock / …
+    (?P<name>\w+!?)          # attribute name: shader / include / glsl / …
     (?:                      # argument list is OPTIONAL -- bare attributes
                               # like `export` or `unroll` have none at all
         \(                       # opening '('
@@ -108,7 +108,7 @@ class AttributeManager:
         args: list[str] = []
         kwargs: dict[str, str] = {}
         # Comments are masked to spaces (not stripped from arg_str itself -- callers that
-        # want the raw text, e.g. resourceblock, read attr.raw_args directly) so a comment's
+        # want the raw text, e.g. glsl, read attr.raw_args directly) so a comment's
         # commas can't mis-split the argument list. String literals are left untouched so
         # quoted commas/parens keep parsing exactly as before.
         masked = mask_comments_and_strings(arg_str, mask_strings=False)
