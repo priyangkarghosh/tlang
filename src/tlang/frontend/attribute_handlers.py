@@ -187,6 +187,45 @@ class AttributeHandlers:
         )
 
     @staticmethod
+    def _declare_struct_same_line(ctx: AttrCtx, kind: InterfaceKind, opts: dict[str, Any]) -> None:
+        """`[varyings] struct VertexOut { ... };` -- the struct opens in the tail of the
+        attribute's own line. Its body may run on past that line, so the tail is joined with
+        the lines after it before parsing, and every location is rebased onto `ctx.end_index`,
+        the physical line the struct opens on.
+        """
+        assert isinstance(ctx.funcs, FunctionList) and ctx.src_map is not None and ctx.end_index is not None
+        start = ctx.end_index
+        loc = SourceLocation(ctx.shader_name, start)
+        opts.pop('name', None)
+
+        following = sorted(n for n in ctx.src_map if n > start)
+        joined = ctx.line_tail + ''.join(ctx.src_map[n].data for n in following)
+
+        try:
+            result = parse_struct_at(joined, 0, ctx.shader_name, kind, **opts)
+        except TlangError as exc:
+            raise type(exc)(exc.message, loc) from None
+        if result is None:
+            raise TlangAttributeError(
+                f"[{ctx.attr.name}]: expected {AttributeHandlers._expected_after_desc(ctx)}, "
+                f"found '{ctx.line_tail.strip()}'",
+                loc,
+            )
+
+        decl, end_offset = result
+        rebase = start - 1
+        decl = replace(decl, line=decl.line + rebase, members=tuple(
+            replace(m, line=m.line + rebase) for m in decl.members
+        ))
+        ctx.funcs.interfaces.add(decl)
+
+        emitted = [] if kind is InterfaceKind.VARYINGS else emit_glsl(decl)
+        ctx.result = ('\n'.join(emitted) + '\n') if emitted else '\n'
+        ctx.tail_consumed = True
+        for n in following[:joined.count('\n', 0, end_offset)]:
+            ctx.src_map[n].data = '\n'
+
+    @staticmethod
     def _declare_buffer_same_line(ctx: AttrCtx, opts: dict[str, Any]) -> None:
         """`[buffer] vec2 name[];` -- the declarator sits in the tail of the
         attribute's own line, not on the line after it. `ctx.line_tail` is
@@ -227,11 +266,8 @@ class AttributeHandlers:
         tail_masked = mask_comments_and_strings(ctx.line_tail)
         if tail_masked.strip():
             if re.match(r'\s*struct\b', tail_masked):
-                raise TlangAttributeError(
-                    f"[{ctx.attr.name}]: the struct must be on its own line after this attribute, "
-                    f"not on the same line as [{ctx.attr.name}] (found '{ctx.line_tail.strip()}')",
-                    ctx.attr.location,
-                )
+                AttributeHandlers._declare_struct_same_line(ctx, kind, opts)
+                return
             if kind is not InterfaceKind.BUFFER:
                 raise TlangAttributeError(
                     f"[{ctx.attr.name}]: expected {AttributeHandlers._expected_after_desc(ctx)} on the "

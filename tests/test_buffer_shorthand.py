@@ -135,19 +135,25 @@ def test_same_line_multiple_declarators_rejected_with_correct_line():
 
 
 # ---------------------------------------------------------------------------
-# a struct sharing the attribute's own line is deliberately rejected -- for
-# every declaration attribute, not just [buffer] -- with a message telling
-# the author to put it on its own line, instead of silently mis-scanning
-# or silently starting to support a new, undocumented same-line struct form
+# a struct may share the attribute's own line, for every declaration attribute
+# -- `struct` is a reserved keyword, so it can never be mistaken for the
+# single-declarator shorthand and there is nothing to disambiguate
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize('attr', ['[varyings]', '[uniforms]', '[buffer]'])
-def test_same_line_struct_is_rejected_for_every_declaration_attribute(attr):
-    with pytest.raises(TlangAttributeError) as exc_info:
-        _processor('demo', f"{attr} struct X {{ vec3 a; }};\n")
-    msg = str(exc_info.value)
-    assert 'own line' in msg
-    assert 'struct X' in msg
+def test_same_line_struct_is_accepted_for_every_declaration_attribute(attr):
+    processor = _processor('demo', f"{attr} struct X {{ vec3 a; }};\n")
+    decl = processor.interfaces._decls['X']
+    assert decl.name == 'X'
+    assert [m.name for m in decl.members] == ['a']
+    assert decl.line == 1
+
+
+@pytest.mark.parametrize('attr', ['[varyings]', '[uniforms]', '[buffer]'])
+def test_same_line_struct_body_may_span_following_lines(attr):
+    processor = _processor('demo', f"{attr} struct X {{\n    vec3 a;\n    vec2 b;\n}};\n")
+    decl = processor.interfaces._decls['X']
+    assert [m.name for m in decl.members] == ['a', 'b']
 
 
 @pytest.mark.parametrize('attr', ['[varyings]', '[uniforms]'])
