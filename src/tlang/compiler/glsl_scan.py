@@ -1,5 +1,5 @@
 # -------------------------------------------------------------
-# @file          glsl_text.py
+# @file          glsl_scan.py
 # @author        Priyangkar Ghosh
 # @created       2025-07-13
 # @description   Text-scanning helpers shared by binding_registry.py and dead_code.py: masking,

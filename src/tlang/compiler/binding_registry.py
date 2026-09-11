@@ -17,7 +17,7 @@ from OpenGL.GL import (
 )
 import regex as re
 
-from tlang.compiler.glsl_text import mask
+from tlang.compiler.glsl_scan import mask
 from tlang.errors import SourceLocation, TlangBindingError
 from tlang.shader_stages import ShaderStage
 

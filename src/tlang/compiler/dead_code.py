@@ -5,7 +5,7 @@
 # @description   Dead-code elimination for generated GLSL: strips SSBO/uniform blocks and whole
 #                functions unreachable from `main`, plus the diagnostic for a call that resolves
 #                to no definition at all. All three share one reachability analysis, walked over
-#                masked text via `glsl_text`.
+#                masked text via `glsl_scan`.
 # @license       MIT
 # -------------------------------------------------------------
 
@@ -14,7 +14,7 @@ from collections import defaultdict
 import regex as re
 
 from tlang.compiler.binding_registry import BLOCK_PATTERN
-from tlang.compiler.glsl_text import mask, match_brace, split_top_level, statement_field_names
+from tlang.compiler.glsl_scan import mask, match_brace, split_top_level, statement_field_names
 from tlang.frontend.function_manager import CONTROL_KEYWORDS, FUNC_PATTERN
 
 logger = logging.getLogger(__name__)
