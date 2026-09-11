@@ -19,7 +19,7 @@ from moderngl import Buffer, Context, Program
 from tlang.frontend.function_manager import FunctionDef
 from tlang.runtime.kernel import Kernel
 from tlang.runtime.pipeline import Pipeline
-from tlang.frontend.interface_registry import InterfaceDecl, InterfaceKind
+from tlang.frontend.interface_registry import ExternConst, InterfaceDecl, InterfaceKind
 from tlang.compiler.shader_processor import ShaderProcessor
 from tlang.shader_source_line import ShaderSourceLine
 from tlang.shader_stages import ShaderStage
@@ -54,6 +54,10 @@ class Shader:
         self._pipelines: dict[str, Pipeline] = {}
         self._sources: dict[str, str] = {}
         self._interfaces: dict[str, InterfaceDecl] = {d.name: d for d in processor.resolved_interfaces}
+        # [extern] constants this module declares, resolved (see ExternConst.value/.literal)
+        # by the time `processor` reached here -- ShaderManager resolves them right after
+        # constructing each ShaderProcessor, before this Shader is ever built.
+        self._externs: dict[str, ExternConst] = dict(processor.externs)
         # emitted GLSL block name -> HANDLE (InterfaceDecl.name), for every [buffer] interface.
         # Identity for a struct-form block or raw GLSL (never in this map at all, so a lookup
         # miss just falls back to the emitted name itself) -- only the [buffer] single-
@@ -107,6 +111,12 @@ class Shader:
         """Every [varyings]/[uniforms]/[buffer] interface visible to this module,
         its transitive includes included. Use `member_locations` for assignments."""
         return self._interfaces
+
+    @property
+    def externs(self) -> Mapping[str, ExternConst]:
+        """Every [extern] constant this module declares -- what it requires from
+        `ShaderManager(constants={...})`, and what it actually resolved to."""
+        return self._externs
 
     @property
     def declared_blocks(self) -> frozenset[str]:

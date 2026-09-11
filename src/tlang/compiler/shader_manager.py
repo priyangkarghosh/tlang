@@ -139,6 +139,10 @@ class ShaderManager:
                 )
 
             process = ShaderProcessor(name, fp.read_text(encoding='utf-8'), strict=self._strict)
+            # Must run before `dm.register` below: that call snapshots this module's text for
+            # the {{ CONSTANT }}/[include] pass, so an [extern] constant has to already be
+            # resolved to its final `const ...;` line by then, or the snapshot never sees it.
+            process.resolve_externs(constants)
             processors[name] = process
             dm.register(process)
 

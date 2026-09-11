@@ -4,6 +4,17 @@
 [include(math)]
 
 // ---------------------------------------------------------------------------
+// host-supplied constants: declared here, valued by ShaderManager(constants=...)
+// ---------------------------------------------------------------------------
+
+// Used as the work-group size below, so it must resolve before the layout
+// qualifier that consumes it.
+[extern] int BLOCK;
+
+// A default makes it optional -- supply it to override.
+[extern] float GAIN = 1.0;
+
+// ---------------------------------------------------------------------------
 // buffer declarations -- all three forms coexist in one file
 // ---------------------------------------------------------------------------
 
@@ -32,7 +43,7 @@ uint weigh(uint v) {
 // entry points
 // ---------------------------------------------------------------------------
 
-[shader('compute'), numthreads(64, 1, 1)]
+[shader('compute'), numthreads(BLOCK, 1, 1)]
 [glsl(
     uniform uint elementCount;
 )]
@@ -43,7 +54,7 @@ void tally() {
     // body pragmas pass through as #pragma directives
     [unroll]
     for (uint i = 0u; i < 2u; ++i) {
-        counts[gid] = add(counts[gid], 1u);
+        counts[gid] = add(counts[gid], uint(GAIN));
     }
 }
 

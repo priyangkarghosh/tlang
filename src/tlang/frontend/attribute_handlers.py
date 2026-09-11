@@ -27,8 +27,16 @@ from tlang.frontend.attribute_registry import (
     parse_glsl_block,
 )
 from tlang.errors import SourceLocation, TlangAttributeError, TlangError
-from tlang.frontend.function_manager import FunctionDef, FunctionList, InterfaceRef
-from tlang.frontend.interface_registry import InterfaceKind, emit_glsl, parse_declarator_at, parse_struct_at
+from tlang.frontend.function_manager import FunctionDef, FunctionList, InterfaceRef, TopLevelDecl
+from tlang.frontend.interface_registry import (
+    EXTERN_TYPES,
+    ExternConst,
+    InterfaceKind,
+    emit_glsl,
+    parse_declarator_at,
+    parse_extern_default,
+    parse_struct_at,
+)
 from tlang.shader_stages import ShaderStage
 from tlang.shader_utils import mask_comments_and_strings
 
@@ -150,10 +158,13 @@ class AttributeHandlers:
 
     @staticmethod
     def _expected_after_desc(ctx: AttrCtx) -> str:
-        """[buffer] also accepts the single-declarator shorthand; the other
-        two declaration attributes only ever take the struct form."""
+        """[buffer] also accepts the single-declarator shorthand; [extern] only ever takes a
+        single declarator (never a struct); the other two declaration attributes only ever
+        take the struct form."""
         if ctx.attr.name == 'buffer':
             return "a 'struct Name { ... };' declaration or a single 'Type name[...];' declarator"
+        if ctx.attr.name == 'extern':
+            return "a 'Type NAME;' or 'Type NAME = default;' declaration"
         return "a 'struct Name { ... };' declaration"
 
     @staticmethod
@@ -366,6 +377,128 @@ class AttributeHandlers:
             raise TlangAttributeError("[uses]: internal error -- missing source location", None)
         ctx.func.iface_refs.append(InterfaceRef(args['name'], args['dir'], ctx.attr.location))
 
+    # -- [extern]: a host-supplied constant, declared instead of {{ CONSTANT }}-substituted --
+
+    @staticmethod
+    def _finish_extern_member(ctx: AttrCtx, member, loc: SourceLocation, trailing: str) -> ExternConst:
+        """Shared tail of both [extern] forms, once a single declarator has been parsed:
+        type/array checks, the default (if any), and the duplicate-name check against every
+        `const`/`buffer`/`uniform` block this module already declares (raw or [extern] --
+        `TopLevelDecl` covers both, so a name collision with a hand-written `const` is caught
+        exactly like one against another [extern])."""
+        assert isinstance(ctx.funcs, FunctionList)
+        name = member.name
+
+        if member.array:
+            raise TlangAttributeError(
+                f"[extern]: '{name}' can't be an array -- [extern] declares a single scalar constant",
+                loc,
+            )
+        if member.type_name not in EXTERN_TYPES:
+            raise TlangAttributeError(
+                f"[extern]: '{name}' has type '{member.type_name}', but [extern] only supports "
+                f"{', '.join(sorted(EXTERN_TYPES))}",
+                loc,
+            )
+
+        if (prev := next((d for d in ctx.funcs.decls if d.kind == 'const' and d.name == name), None)) is not None:
+            raise TlangAttributeError(
+                f"[extern] {member.type_name} {name}: '{name}' is already declared as a const "
+                f"in this module (at {SourceLocation(ctx.shader_name, prev.line)})",
+                loc,
+            )
+
+        has_default = bool(member.default)
+        default_value = None
+        if has_default:
+            try:
+                default_value = parse_extern_default(member.type_name, member.default)
+            except ValueError as exc:
+                raise TlangAttributeError(f"[extern] {member.type_name} {name}: {exc}", loc) from None
+
+        decl = ExternConst(
+            name=name, type_name=member.type_name, module=ctx.shader_name, line=loc.line or 0,
+            has_default=has_default, default_value=default_value, trailing=trailing,
+        )
+        ctx.funcs.externs.append(decl)
+        ctx.funcs.decls.append(TopLevelDecl(kind='const', name=name, line=loc.line or 0))
+        return decl
+
+    @staticmethod
+    def _declare_extern_same_line(ctx: AttrCtx) -> None:
+        """`[extern] int BLOCK_SIZE;` -- the declarator sits in the tail of the attribute's
+        own line, mirroring `_declare_buffer_same_line`. The final `const` text isn't known
+        yet (it depends on `constants={...}`, resolved later in `ShaderProcessor.resolve_externs`),
+        so this leaves a blank placeholder and lets `resolve_externs` overwrite this exact line."""
+        assert isinstance(ctx.funcs, FunctionList) and ctx.end_index is not None
+        loc = SourceLocation(ctx.shader_name, ctx.end_index)
+
+        try:
+            result = parse_declarator_at(
+                ctx.line_tail, 0, ctx.shader_name, InterfaceKind.EXTERN, allow_default=True,
+            )
+        except TlangError as exc:
+            raise type(exc)(exc.message, loc) from None
+
+        if result is None:
+            raise TlangAttributeError(
+                f"[extern]: expected {AttributeHandlers._expected_after_desc(ctx)}, "
+                f"found '{ctx.line_tail.strip()}'",
+                loc,
+            )
+        decl, end_offset = result
+        member = decl.members[0]
+        AttributeHandlers._finish_extern_member(ctx, member, loc, ctx.line_tail[end_offset:])
+
+        ctx.result = '\n'
+        ctx.tail_consumed = True
+
+    @staticmethod
+    def extern(ctx: AttrCtx, args: dict[str, Any]) -> None:
+        """[extern] TYPE NAME;` or `[extern] TYPE NAME = default;` -- a module-scope constant
+        supplied by the host (`ShaderManager(constants={...})`), emitted as a GLSL `const`
+        once `ShaderProcessor.resolve_externs` knows what `constants` actually holds.
+
+        Module scope only: `Scope.GLOBAL` alone (no `Scope.FUNCBODY`) means an `[extern]`
+        written inside a function body is dispatched through `AttrRegistry.resolve_scope`
+        instead, which already rejects it -- "'extern' is a global/file-level attribute; it
+        cannot be used here" -- with no special-casing needed here.
+        """
+        if ctx.src_map is None or ctx.end_index is None or not isinstance(ctx.funcs, FunctionList):
+            raise TlangAttributeError("[extern]: internal error -- missing source map", ctx.attr.location)
+
+        tail_masked = mask_comments_and_strings(ctx.line_tail)
+        if tail_masked.strip():
+            AttributeHandlers._declare_extern_same_line(ctx)
+            return
+
+        start = AttributeHandlers._find_struct_start(ctx)
+        indices = sorted(i for i in ctx.src_map if i >= start)
+        joined = ''.join(ctx.src_map[i].data for i in indices)
+        loc = SourceLocation(ctx.shader_name, start)
+
+        try:
+            result = parse_declarator_at(joined, 0, ctx.shader_name, InterfaceKind.EXTERN, allow_default=True)
+        except TlangError as exc:
+            raise type(exc)(exc.message, loc) from None
+
+        if result is None:
+            raise TlangAttributeError(
+                f"[extern]: expected {AttributeHandlers._expected_after_desc(ctx)} on the "
+                f"following line, found '{ctx.src_map[start].data.strip()}'",
+                ctx.attr.location,
+            )
+        decl, end_offset = result
+        member = decl.members[0]
+        # '\n' terminates the const line resolve_externs will later write here -- there is no
+        # same-line trailing text to preserve in this (next-line) form, only the line break.
+        AttributeHandlers._finish_extern_member(ctx, member, loc, '\n')
+
+        end_line = start + joined.count('\n', 0, end_offset)
+        ctx.src_map[start].data = '\n'
+        for i in range(start + 1, end_line + 1):
+            if i in ctx.src_map: ctx.src_map[i].data = '\n'
+
 
 # ---------------------------------------------------------------------------
 # the registry -- one row per (name, stage). Bare markers and stage-settings
@@ -472,6 +605,14 @@ SPECS: list[AttrSpec] = [
                 "GLSL block name is synthesised and never binds to anything. Override the "
                 "handle with name='...'.",
         example="[buffer(std430)]\nstruct Particles { vec4 pos[]; };\n[buffer] vec2 ptcPositions[];",
+    ),
+    AttrSpec(
+        name='extern', scope=Scope.GLOBAL, handler=AttributeHandlers.extern,
+        summary="Declares a host-supplied constant (int/uint/float/bool), emitted as a GLSL "
+                "'const'; resolved from ShaderManager(constants={...}) or the declaration's own "
+                "'= default'. Replaces the '#define X {{ X }}' idiom where a typed, reflectable, "
+                "checked-before-the-driver constant is wanted.",
+        example="[extern] int BLOCK_SIZE;\n[extern] float WARP_SCALE = 1.0;",
     ),
 
     # -- reference attribute: ties a stage function to a declared interface --

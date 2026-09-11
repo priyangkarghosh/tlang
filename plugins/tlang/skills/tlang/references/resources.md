@@ -103,6 +103,75 @@ struct form for a genuinely multi-member block:
 struct ContactCounts { uint contactPairs; uint pairOverflowCount; };
 ```
 
+## `[extern]` — host-supplied constants
+
+Declares a constant the *host* (Python) supplies, instead of the GLSL preprocessor:
+
+```glsl
+[extern] int BLOCK_SIZE;          // required -- value comes from ShaderManager(constants={...})
+[extern] float PTC_RADIUS;
+[extern] int WARP_SIZE = 32;      // optional: a default used when constants= doesn't supply one
+```
+
+Each becomes a plain GLSL `const`:
+
+```glsl
+const int BLOCK_SIZE = 256;
+const int WARP_SIZE = 32;
+```
+
+This replaces the `{{ CONSTANT }}` + `#define X {{ X }}` idiom for the common case of a single
+named number: `{{ }}` is pure text substitution, so a missing constant is either a Jinja failure
+with no tlang context, or (outside a `StrictUndefined` render) silently-wrong GLSL, and nothing
+about it is typed or reflectable. `[extern]` fixes all three — the shader states what it needs, a
+missing or wrong-typed value is a build error naming the constant, and `shader.externs`/
+`proc.externs` let a caller ask what a module requires before ever building it.
+
+**`{{ CONSTANT }}` still works, completely unchanged, including in the same module as
+`[extern]`** — this is additive, not a replacement for `{{ }}`'s actual strength: substituting into
+arbitrary text (`#define`, a value embedded in a comment, anything a `const` declaration can't sit
+inside). Reach for `[extern]` when the shader just needs a typed constant; reach for `{{ }}` when
+text needs to be substituted into something that isn't a standalone declaration.
+
+Supported types: `int`, `uint`, `float`, `bool`. A Python `int` widens harmlessly into a `float`
+declaration; anything else that doesn't match the declared type (a `str` for an `int`, a `float`
+for an `int`, ...) is a build error naming the constant, its declared type, and what was actually
+supplied. Several missing/wrong-typed constants in one module are collected and reported together,
+not one build attempt per constant.
+
+Like `[buffer]`'s single-declarator shorthand, both forms work — the declarator on `[extern]`'s
+own line, or on the line right after it — and both reuse the same declarator parser
+(`parse_declarator_at`) rather than a second one. Unlike every other declaration attribute,
+`[extern]` never takes a struct: it declares exactly one constant per attribute. It's module scope
+only — writing `[extern]` inside a function body is a build error naming the correct scope, an
+array (`[extern] int SIZES[4];`) is rejected (declare one constant per `[extern]`), and a name
+already used by another `[extern]` or a hand-written `const` in the same module is a duplicate-
+declaration error.
+
+**The critical use case — sizing a compute dispatch:**
+
+```glsl
+[extern] int BLOCK_SIZE;
+
+[shader('compute')]
+[numthreads(BLOCK_SIZE, 1, 1)]
+void cs_main() { ... }
+```
+
+`[extern]`'s `const` lands in the module text, which `Shader._build` always assembles ahead of
+every function's `FUNC_CONFIG` (where `[numthreads(...)]`'s `layout(local_size_x = ...)` lands) --
+so GLSL's declare-before-use rule is satisfied regardless of where in the file `[extern]` is
+written relative to the function that uses it.
+
+One real driver restriction to know about: a `const` used *inside a layout qualifier* (as
+`local_size_x` above does) is only a legal constant-foldable expression from **GLSL 4.40 on** --
+verified for real on an RTX 3090 (driver 616.64), NVIDIA's compiler rejects it at `#version 430
+core` ("non constant expression in layout value") and accepts the identical text unchanged at
+440/450/460. This restriction is specific to layout qualifiers -- an ordinary array sized by an
+`[extern]` constant (`uint scratch[BLOCK_SIZE];`) has no such version floor. Pass
+`ShaderManager(version=...)` >= `'440 core'` if `[numthreads(...)]`/other layout qualifiers need to
+reference an `[extern]` constant.
+
 ## `[uses(Name, dir='in'|'out')]`
 
 Ties one stage function to one declared `[varyings]` interface, in one direction:
@@ -290,6 +359,20 @@ member_locations(decl)          # {member_name: location}, or {} if unlocated/op
 
 `InterfaceDecl`, `InterfaceKind`, `InterfaceMember`, `location_span`, and
 `member_locations` are all importable directly from `tlang`.
+
+`[extern]` constants are reflected separately, since they aren't interfaces (see above):
+
+```python
+shader.externs                     # Mapping[str, ExternConst] -- this module's own [extern]s
+shader.externs['BLOCK_SIZE']       # ExternConst(name='BLOCK_SIZE', type_name='int', ...)
+shader.externs['BLOCK_SIZE'].value    # 256 -- the Python value actually used
+shader.externs['BLOCK_SIZE'].literal  # '256' -- the GLSL literal text emitted
+```
+
+`proc.externs` (on a `ShaderProcessor`, before a `Shader` is built) reflects the same
+declarations, `.has_default`/`.default_value` included, before `constants={...}` is even known --
+`.resolved`/`.value`/`.literal` only populate once `resolve_externs` has run. `ExternConst` is
+importable directly from `tlang`.
 
 ## Bindings for `[uniforms(std140)]` and `[buffer(...)]`
 

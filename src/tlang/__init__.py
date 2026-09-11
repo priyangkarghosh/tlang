@@ -52,6 +52,7 @@ from .runtime.pipeline import Pipeline
 from .runtime.buffer_pool import BufferPool, BufferPoolMetrics, TempHandle, clear_buffer
 from .runtime.pinned_buffer import PinnedBuffer, PinnedBufferFallback, buffer_storage_supported
 from .frontend.interface_registry import (
+    ExternConst,
     InterfaceDecl,
     InterfaceKind,
     InterfaceMember,
@@ -84,6 +85,7 @@ __all__ = [
     "PinnedBuffer",
     "PinnedBufferFallback",
     "buffer_storage_supported",
+    "ExternConst",
     "InterfaceDecl",
     "InterfaceKind",
     "InterfaceMember",

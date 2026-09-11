@@ -138,6 +138,47 @@ demo:5: interface 'PtcPositions' is declared twice in this module (first at demo
 demo:1: [buffer(name=...)]: '123bad' is not a valid GLSL block name -- give a valid identifier
 ```
 
+## `[extern]` errors
+
+A missing constant (naming it, its declared type, the module, and what to add to
+`constants=`) — several missing in one module are collected and reported together, not one
+build attempt per constant:
+```
+demo:1: [extern] int BLOCK_SIZE is required but 'BLOCK_SIZE' was not supplied -- add constants={'BLOCK_SIZE': <int>, ...} to ShaderManager(...), or give it a default: '[extern] int BLOCK_SIZE = ...;'
+demo:2: [extern] float PTC_RADIUS is required but 'PTC_RADIUS' was not supplied -- add constants={'PTC_RADIUS': <float>, ...} to ShaderManager(...), or give it a default: '[extern] float PTC_RADIUS = ...;'
+```
+
+**Wrong type supplied** (names the constant, its declared type, and what was actually given):
+```
+demo:1: [extern] int BLOCK_SIZE expects an int, got str ('big')
+```
+
+**Duplicate name** — against another `[extern]` or a hand-written `const`, same rule either way:
+```
+demo:2: [extern] int BLOCK_SIZE: 'BLOCK_SIZE' is already declared as a const in this module (at demo:1)
+```
+
+**Unsupported type** (only `int`/`uint`/`float`/`bool` are declarable):
+```
+demo:1: [extern]: 'DIR' has type 'vec2', but [extern] only supports bool, float, int, uint
+```
+
+**An array** (`[extern]` declares exactly one scalar constant):
+```
+demo:1: [extern]: 'SIZES' can't be an array -- [extern] declares a single scalar constant
+```
+
+**Inside a function body** — module scope only, same message every global-scope-only
+attribute gets when misplaced:
+```
+demo:2: 'extern' is a global/file-level attribute; it cannot be used here
+```
+
+**A malformed `= default`:**
+```
+demo:1: [extern] bool FLAG: 'maybe' is not a valid bool default (use true/false)
+```
+
 ## Duplicate top-level declaration errors
 
 `ShaderManager` scans every module's merged `[include]` closure for same-named

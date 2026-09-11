@@ -29,6 +29,8 @@ class InterfaceKind(str, Enum):
     VARYINGS = 'varyings'
     UNIFORMS = 'uniforms'
     BUFFER = 'buffer'
+    EXTERN = 'extern'   # not an interface block -- see ExternConst below. Shares this enum
+                         # only so `parse_declarator_at` can serve both with one label scheme.
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +40,10 @@ class InterfaceMember:
     array: str = ''                    # '' | '[]' | '[16]', exactly as written
     qualifiers: tuple[str, ...] = ()
     line: int = 0                      # 1-based source line the declarator sits on
+    default: str = ''                  # raw '= <expr>' text, unparsed -- '' when absent.
+                                        # Only ever populated when the caller opted in via
+                                        # `allow_default=True` (see parse_declarator_at); every
+                                        # other caller rejects a declarator carrying one.
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,13 +90,108 @@ class InterfaceDecl:
 
 
 # ---------------------------------------------------------------------------
+# [extern]: a host-supplied constant, resolved from `ShaderManager(constants={...})` and
+# emitted as a GLSL `const`. Never enters `InterfaceTable`/`resolved_interfaces` -- unlike
+# varyings/uniforms/buffer, there is no cross-module signature to compare: each module just
+# states what it needs, independently, against the one project-wide `constants` mapping.
+# ---------------------------------------------------------------------------
+
+EXTERN_TYPES = frozenset({'int', 'uint', 'float', 'bool'})
+
+
+@dataclass
+class ExternConst:
+    """One `[extern] TYPE NAME [= default];` declaration. Mutable: attach time (attribute
+    processing) fills in everything up to `default_value`; `ShaderProcessor.resolve_externs`
+    fills in `value`/`literal`/`resolved` once `constants={...}` is known."""
+    name: str
+    type_name: str      # one of EXTERN_TYPES
+    module: str
+    line: int
+    has_default: bool = False
+    default_value: Any = None   # parsed Python value of the declared default, if any
+    trailing: str = ''          # same-line form only: raw text after the ';' to preserve
+
+    resolved: bool = False
+    value: Any = None            # the Python value actually used (constants[name], else the default)
+    literal: str = ''            # the GLSL literal text emitted for `value`
+
+    @property
+    def location(self) -> SourceLocation:
+        return SourceLocation(self.module, self.line)
+
+
+def check_extern_value(type_name: str, value: Any) -> str | None:
+    """`None` if `value` is an acceptable Python value for an `[extern]` constant declared
+    `type_name`, else a short description of what's required -- for a "wrong type" message.
+
+    `bool` is a subclass of `int` in Python, so it's checked first in every branch: a `bool`
+    must never silently pass as a valid `int`/`uint`/`float` value.
+    """
+    is_bool = isinstance(value, bool)
+    if type_name == 'bool':
+        return None if is_bool else f"a bool, got {type(value).__name__} ({value!r})"
+    if is_bool:
+        return f"{'an' if type_name == 'int' else 'a'} {type_name}, got bool ({value!r})"
+    if type_name == 'int':
+        return None if isinstance(value, int) else f"an int, got {type(value).__name__} ({value!r})"
+    if type_name == 'uint':
+        if isinstance(value, int) and value >= 0: return None
+        if isinstance(value, int): return f"a non-negative int (uint), got {value!r}"
+        return f"a non-negative int (uint), got {type(value).__name__} ({value!r})"
+    if type_name == 'float':
+        # a Python int widens harmlessly into a float constant
+        return None if isinstance(value, (int, float)) else f"a float (int also accepted), got {type(value).__name__} ({value!r})"
+    raise AssertionError(f"unreachable: unknown [extern] type {type_name!r}")
+
+
+def extern_literal(type_name: str, value: Any) -> str:
+    """`value` (already validated by `check_extern_value`) -> the GLSL literal `tlang` emits
+    for it. `float` always carries a decimal point or exponent (Python's `repr` guarantees
+    this for any finite float), so it can never read as an int literal in a float context."""
+    if type_name == 'bool': return 'true' if value else 'false'
+    if type_name == 'uint': return f'{int(value)}u'
+    if type_name == 'int': return str(int(value))
+    if type_name == 'float': return repr(float(value))
+    raise AssertionError(f"unreachable: unknown [extern] type {type_name!r}")
+
+
+def parse_extern_default(type_name: str, raw: str) -> Any:
+    """Declared `= <expr>` text -> a Python value of the right Python type for `type_name`.
+    Raises plain `ValueError` (the caller attaches location/attribute context) -- this never
+    touches `constants={...}`, so a malformed default is a syntax problem, not a "missing/
+    wrong type" one.
+    """
+    text = raw.strip()
+    if type_name == 'bool':
+        low = text.lower()
+        if low in ('true', '1'): return True
+        if low in ('false', '0'): return False
+        raise ValueError(f"'{text}' is not a valid bool default (use true/false)")
+    if type_name in ('int', 'uint'):
+        try:
+            n = int(text)
+        except ValueError:
+            raise ValueError(f"'{text}' is not a valid {type_name} default") from None
+        if type_name == 'uint' and n < 0:
+            raise ValueError(f"'{text}' is not a valid uint default (must be non-negative)")
+        return n
+    if type_name == 'float':
+        try:
+            return float(text.rstrip('fF'))  # tolerate a GLSL-style float suffix, e.g. '0.5f'
+        except ValueError:
+            raise ValueError(f"'{text}' is not a valid float default") from None
+    raise AssertionError(f"unreachable: unknown [extern] type {type_name!r}")
+
+
+# ---------------------------------------------------------------------------
 # struct parsing
 # ---------------------------------------------------------------------------
 
 _BARE_STRUCT_RE = re.compile(r'\bstruct\b')
 _STRUCT_HEADER_RE = re.compile(r'\bstruct\s+(\w+)\s*\{')
 _TAIL_RE = re.compile(r'\s*;')
-_DECLARATOR_RE = re.compile(r'^\s*(\w+)\s*(\[[^\]]*\])?\s*$')
+_DECLARATOR_RE = re.compile(r'^\s*(\w+)\s*(\[[^\]]*\])?\s*(?:=\s*(.+))?$')
 
 # qualifiers recognised on an interface member; anything else in the leading
 # word run is treated as (part of) the type, not a qualifier
@@ -131,11 +232,17 @@ def _line_at(src: str, offset: int) -> int:
 
 def _parse_member_statement(
     masked_stmt: str, stmt_offset: int, src: str, module: str, struct_name: str,
+    *, allow_default: bool = False,
 ) -> list[InterfaceMember]:
     """One struct body statement -> one or more members.
 
     Runs on masked text so an embedded comment cannot be read as part of the
     declaration; names are sliced from `src` at the same offsets.
+
+    `allow_default`, when False (every caller except `[extern]`), rejects a declarator
+    carrying a '= <expr>' the same way an unparseable declarator always has -- a struct
+    member or a `[buffer]` shorthand has nowhere in GLSL to put a default, so silently
+    dropping one would be a worse outcome than the syntax error it already was.
     """
     consumed = 0
     qualifiers: list[str] = []
@@ -163,7 +270,7 @@ def _parse_member_statement(
         part_offset = decl_list_offset + pos
         pos += len(part) + 1  # +1 accounts for the comma `split` consumed
 
-        if not (dm := _DECLARATOR_RE.match(part)):
+        if not (dm := _DECLARATOR_RE.match(part)) or (dm.group(3) and not allow_default):
             line = _line_at(src, part_offset)
             raise TlangSyntaxError(
                 f"struct '{struct_name}': malformed member declarator '{part.strip()}'",
@@ -177,6 +284,7 @@ def _parse_member_statement(
             array=dm.group(2) or '',
             qualifiers=tuple(qualifiers),
             line=_line_at(src, name_offset),
+            default=(dm.group(3) or '').strip(),
         ))
     return members
 
@@ -257,14 +365,19 @@ def _find_top_level_semicolon(mask: str, start: int) -> int | None:
 
 def parse_declarator_at(
     src: str, start_offset: int, module: str, kind: InterfaceKind,
-    *, block_name: str | None = None, **opts: Any,
+    *, block_name: str | None = None, allow_default: bool = False, **opts: Any,
 ) -> tuple[InterfaceDecl, int] | None:
-    """Locate a single `Type name[...];` member statement at/after
-    `start_offset` -- the `[buffer]` single-declarator shorthand, which
-    desugars e.g. `[buffer] vec2 ptcPositions[];` to a block whose HANDLE
-    (what Python binds by) is `ptcPositions` -- the member's own name --
-    and whose emitted GLSL block name is a synthesised one, distinct from
-    the member so the block never shadows it (see `_synthesize_block_name`).
+    """Locate a single `Type name[...];` (or, with `allow_default=True`, `Type name = expr;`)
+    member statement at/after `start_offset`.
+
+    Two callers share this: the `[buffer]` single-declarator shorthand, which desugars e.g.
+    `[buffer] vec2 ptcPositions[];` to a block whose HANDLE (what Python binds by) is
+    `ptcPositions` -- the member's own name -- and whose emitted GLSL block name is a
+    synthesised one, distinct from the member so the block never shadows it (see
+    `_synthesize_block_name`); and `[extern]`, which never becomes a block at all -- its
+    caller reads `.members[0]` straight off the returned `InterfaceDecl` and discards the
+    rest (see `ExternConst`). Messages below are generic across every `kind` except where a
+    `[buffer]`-specific fix (a block, `name=...`) is actually being suggested.
 
     `block_name`, when given, overrides the handle (`[buffer(name='ElementCount')]`
     makes `ElementCount` what Python binds by); otherwise the handle is the
@@ -283,37 +396,48 @@ def parse_declarator_at(
     stmt = mask[start_offset:end]
     line = _line_at(src, start_offset)
     loc = SourceLocation(module, line)
+    label = f'[{kind.value}]'
     if not stmt.strip():
         raise TlangAttributeError(
-            "[buffer]: shorthand declaration is empty -- expected a single "
-            "'Type name[...];' member before the ';'",
+            f"{label}: shorthand declaration is empty -- expected a single "
+            f"'Type name[...];' member before the ';'",
             loc,
         )
 
-    members = _parse_member_statement(stmt, start_offset, src, module, '<buffer declarator>')
+    members = _parse_member_statement(
+        stmt, start_offset, src, module, '<buffer declarator>', allow_default=allow_default,
+    )
     if len(members) != 1:
         found = ', '.join(f'{m.type_name} {m.name}{m.array}' for m in members)
+        if kind is InterfaceKind.BUFFER:
+            raise TlangAttributeError(
+                f"[buffer]: shorthand declares {len(members)} members ({found}) -- a buffer block "
+                f"has exactly one name, so multiple declarators here are ambiguous; give each its "
+                f"own block, or use the struct form: '[buffer(...)]\\nstruct Name {{ ... }};'",
+                loc,
+            )
         raise TlangAttributeError(
-            f"[buffer]: shorthand declares {len(members)} members ({found}) -- a buffer block "
-            f"has exactly one name, so multiple declarators here are ambiguous; give each its "
-            f"own block, or use the struct form: '[buffer(...)]\\nstruct Name {{ ... }};'",
+            f"{label}: declares {len(members)} members ({found}) -- exactly one name is allowed "
+            f"here; declare each on its own '{label}' line",
             loc,
         )
     member = members[0]
 
     handle = block_name if block_name is not None else member.name
     if not handle or not handle.isidentifier():
-        raise TlangAttributeError(
-            f"[buffer]: '{handle!r}' is not a valid handle for member '{member.name}' -- "
-            f"give a valid identifier with [buffer(name='...')]",
-            loc,
-        )
+        if kind is InterfaceKind.BUFFER:
+            raise TlangAttributeError(
+                f"[buffer]: '{handle!r}' is not a valid handle for member '{member.name}' -- "
+                f"give a valid identifier with [buffer(name='...')]",
+                loc,
+            )
+        raise TlangAttributeError(f"{label}: '{handle!r}' is not a valid name for '{member.name}'", loc)
 
     decl = InterfaceDecl(
         name=handle, kind=kind, members=(member,), module=module, line=line,
         layout=opts.get('layout', ''), locations=opts.get('locations', True),
         block=opts.get('block', False), source_member=member.name,
-        emit_name=_synthesize_block_name(member.name),
+        emit_name=_synthesize_block_name(member.name) if kind is InterfaceKind.BUFFER else '',
     )
     return decl, end + 1
 
@@ -506,4 +630,5 @@ __all__ = [
     'InterfaceKind', 'InterfaceMember', 'InterfaceDecl',
     'parse_struct_at', 'parse_declarator_at', 'location_span', 'member_locations', 'is_arrayed',
     'emit_glsl', 'InterfaceTable',
+    'ExternConst', 'EXTERN_TYPES', 'check_extern_value', 'extern_literal', 'parse_extern_default',
 ]

@@ -18,7 +18,7 @@ from tlang import BufferPool, ShaderManager
 
 ctx = mgl.create_context(require=460, standalone=True)
 sm = ShaderManager(ctx=ctx, version='460 core', dir='shaders',
-                   constants={'BLOCK_SIZE': 256})
+                   constants={'BLOCK_SIZE': 256, 'BLOCK': 64})
 
 checks = []
 
@@ -62,7 +62,9 @@ check('[link] pulls a helper in: accumulate reaches Scratch',
 
 # --- local_size read off the linked program, not the attribute text --------
 
-check('local_size reflected', tally.local_size == (64, 1, 1), str(tally.local_size))
+check('[extern] int drives numthreads', tally.local_size == (64, 1, 1), str(tally.local_size))
+check('[extern] default applied without being supplied',
+      'GAIN' in compute.externs, sorted(getattr(compute, 'externs', [])))
 check('local_size differs per kernel', summarise.local_size == (1, 1, 1))
 
 # --- the pool is the name -> buffer map; bind() takes no arguments ---------
@@ -106,7 +108,7 @@ check('struct-form block written through its members', (hits, misses) == (1, 2),
 from tlang.errors import TlangBindingError
 
 lone = ShaderManager(ctx=ctx, version='460 core', dir='shaders',
-                     constants={'BLOCK_SIZE': 256}).get_shader('compute').get_kernel('tally')
+                     constants={'BLOCK_SIZE': 256, 'BLOCK': 64}).get_shader('compute').get_kernel('tally')
 try:
     lone.set_uniforms(elementCount=1)
     lone.dispatch_for(1)
@@ -121,7 +123,7 @@ check('generated GLSL dropped by default',
       f'{sum(len(v) for v in compute.sources.values())} bytes retained')
 
 kept = ShaderManager(ctx=ctx, version='460 core', dir='shaders',
-                     constants={'BLOCK_SIZE': 256}, keep_sources=True).get_shader('compute')
+                     constants={'BLOCK_SIZE': 256, 'BLOCK': 64}, keep_sources=True).get_shader('compute')
 check('keep_sources=True retains it', len(kept.get_source('tally')) > 0)
 
 # --- report ----------------------------------------------------------------

@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 import bisect
 from tlang.frontend.attribute import Attribute
 from tlang.errors import SourceLocation, TlangSyntaxError
-from tlang.frontend.interface_registry import InterfaceTable
+from tlang.frontend.interface_registry import ExternConst, InterfaceTable
 from tlang.shader_stages import ShaderStage
 from tlang.shader_utils import mask_comments_and_strings
 from dataclasses import dataclass, field
@@ -187,6 +187,9 @@ class FunctionList:
     # raw (non-attribute) top-level `const`/`buffer`/`uniform` block declarations found
     # outside every function body, for this module only -- see TopLevelDecl.
     decls: list[TopLevelDecl] = field(default_factory=list)
+
+    # [extern] constant declarations for this module only, in source order -- see ExternConst.
+    externs: list[ExternConst] = field(default_factory=list)
 
     def __post_init__(self):
         self.starts: list[int] = [fn.line_start for fn in self.items]

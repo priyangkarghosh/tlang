@@ -19,7 +19,16 @@ from tlang.frontend.attribute_manager import AttributeManager
 from tlang.frontend.attribute_registry import AttrCtx, AttrSpec, Diagnostics, StageConfig, USE_ARG, bind_params, bind_update
 from tlang.errors import SourceLocation, TlangAttributeError, TlangSyntaxError
 from tlang.frontend.function_manager import FunctionDef, FunctionManager, InterfaceRef
-from tlang.frontend.interface_registry import InterfaceDecl, InterfaceKind, InterfaceTable, emit_glsl, is_arrayed
+from tlang.frontend.interface_registry import (
+    ExternConst,
+    InterfaceDecl,
+    InterfaceKind,
+    InterfaceTable,
+    check_extern_value,
+    emit_glsl,
+    extern_literal,
+    is_arrayed,
+)
 from tlang.shader_source_line import ShaderSourceLine
 from tlang.shader_stages import ShaderStage, _SHADER_STAGE_ALIASES
 from tlang.shader_utils import EXTENSION_GROUPS
@@ -77,6 +86,59 @@ class ShaderProcessor:
     def interfaces(self) -> InterfaceTable:
         """This module's own interface declarations, excluding dependencies."""
         return self.funcs.interfaces
+
+    @property
+    def externs(self) -> dict[str, ExternConst]:
+        """Every [extern] constant this module declares, name -> ExternConst. Populated at
+        attach time (parsing); `.resolved`/`.value`/`.literal` are only meaningful after
+        `resolve_externs` has run -- reflect on `.type_name`/`.has_default` beforehand to ask
+        what a module requires without needing `constants={...}` yet."""
+        return {e.name: e for e in self.funcs.externs}
+
+    def resolve_externs(self, constants: dict[str, Any]) -> None:
+        """Resolves every [extern] declaration against `constants` (a required one falls back
+        to its own `= default` when absent), emitting `const <type> <name> = <literal>;` in
+        place of the declaration's placeholder line. Mirrors `resolve_interfaces`: every
+        problem in this module is collected and raised together, not one at a time -- a
+        module needing five constants shouldn't make an author fix them one build at a time.
+
+        Must run before this processor's module text is registered with `DependencyManager`
+        (`ShaderManager` does so immediately after construction) -- once that snapshot is
+        taken, a later mutation here would never reach the text that's actually built.
+        """
+        problems: list[str] = []
+        for decl in self.funcs.externs:
+            if decl.name in constants:
+                value = constants[decl.name]
+            elif decl.has_default:
+                value = decl.default_value
+            else:
+                problems.append(
+                    f"{decl.location}: [extern] {decl.type_name} {decl.name} is required but "
+                    f"'{decl.name}' was not supplied -- add constants={{'{decl.name}': <{decl.type_name}>, "
+                    f"...}} to ShaderManager(...), or give it a default: "
+                    f"'[extern] {decl.type_name} {decl.name} = ...;'"
+                )
+                continue
+
+            if (bad := check_extern_value(decl.type_name, value)) is not None:
+                problems.append(
+                    f"{decl.location}: [extern] {decl.type_name} {decl.name} expects {bad}"
+                )
+                continue
+
+            decl.value = value
+            decl.literal = extern_literal(decl.type_name, value)
+            decl.resolved = True
+            # `decl.trailing` always carries the line's terminating '\n' (plus, for the
+            # same-line form, anything written after the ';' on that line) -- mirrors
+            # `_declare_buffer_same_line`, which relies on `line_tail[end_offset:]` the same way.
+            self.src_map[decl.line].data = f'const {decl.type_name} {decl.name} = {decl.literal};' + decl.trailing
+
+        if problems:
+            message = '\n'.join(problems)
+            if self.strict: raise TlangAttributeError(message)
+            for line in problems: logger.warning("%s (continuing: strict=False)", line)
 
     # Builds the module text exported to dependents: common code plus any [export]ed helpers.
     def _create_module(self) -> None:

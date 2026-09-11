@@ -174,6 +174,13 @@ kernel.dispatch_for(n)                        # covers n invocations -- derives 
 - **Two `[include]`d modules declaring the same top-level symbol is a tlang error**
   naming both modules and lines, not a driver redefinition at a generated line number.
   Real GLSL overloads (same name, different parameter types) are fine and don't fire it.
+- **Prefer `[extern] int BLOCK_SIZE;` over `#define X {{ X }}`** for a host-supplied
+  constant. The shader declares what it needs, so a missing one is a tlang error naming
+  it and what to add to `constants=`, and a wrong type is caught before the driver sees
+  it. Emits `const int BLOCK_SIZE = 256;`, which GLSL accepts everywhere a `#define`
+  works — including `[numthreads(BLOCK_SIZE, 1, 1)]` and array sizes. A default
+  (`[extern] int WARP = 32;`) makes it optional. `{{ }}` still works and is still the
+  only option when substituting into arbitrary text rather than a value.
 - **`{{ }}` collides with GLSL brace initializers** (`mat2({{1.0,0.0},{0.0,1.0}})`)
   — add a space or use constructor form.
 - **A raster stage function with no `[program(...)]` reference is compiled and

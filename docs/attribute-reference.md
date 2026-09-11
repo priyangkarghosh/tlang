@@ -21,7 +21,7 @@ is a real boolean `False`, not the truthy string `"false"`.
 | Name | Scope | Stages | Params | Aliases | Summary | Example |
 |---|---|---|---|---|---|---|
 | `branch` | function-body | any | — | — | Requests explicit branching. | `[branch]` |
-| `buffer` | global | any | layout: str ∈ {std430,std140} = 'std430'; name: str = None | — | Declares an SSBO block from the following struct, or from a single declarator ('[buffer] vec2 x[];') whose block name is derived by upper-casing the member's first character -- override with name='...' when that's wrong. | `[buffer(std430)]`<br>`struct Particles { vec4 pos[]; };`<br>`[buffer] vec2 ptcPositions[];` |
+| `buffer` | global | any | layout: str ∈ {std430,std140} = 'std430'; name: str = None | — | Declares an SSBO block from the following struct, or from a single declarator ('[buffer] vec2 x[];'), which binds by the member's own name -- the emitted GLSL block name is synthesised and never binds to anything. Override the handle with name='...'. | `[buffer(std430)]`<br>`struct Particles { vec4 pos[]; };`<br>`[buffer] vec2 ptcPositions[];` |
 | `ccw` | global | tese | — | — | Tess-eval winding: counter-clockwise. | `[ccw]` |
 | `cw` | global | tese | — | — | Tess-eval winding: clockwise. | `[cw]` |
 | `early_fragment_tests` | global | frag | — | — | Shorthand for [frag(early_tests=true)]. | `[early_fragment_tests]` |
@@ -29,6 +29,7 @@ is a real boolean `False`, not the truthy string `"false"`.
 | `export` | global | any | — | — | Marks a non-stage function as part of this module's public (includable) surface. | `[export]` |
 | `extend` | global | any | — | — | Enables a GLSL extension (or named extension group) with ': enable'. | `[extend(int64)]` |
 | `extend!` | global | any | — | — | Enables a GLSL extension (or named extension group) with ': require'. | `[extend!(int64)]` |
+| `extern` | global | any | — | — | Declares a host-supplied constant (int/uint/float/bool), emitted as a GLSL 'const'; resolved from ShaderManager(constants={...}) or the declaration's own '= default'. Replaces the '#define X {{ X }}' idiom where a typed, reflectable, checked-before-the-driver constant is wanted. | `[extern] int BLOCK_SIZE;`<br>`[extern] float WARP_SCALE = 1.0;` |
 | `fastopt` | function-body | any | — | — | Enables compiler optimization. | `[fastopt]` |
 | `flatten` | function-body | any | — | — | Requests branch flattening. | `[flatten]` |
 | `fractional_even_spacing` | global | tese | — | frac_even | Tess-eval spacing: fractional_even_spacing. | `[fractional_even_spacing]` |
