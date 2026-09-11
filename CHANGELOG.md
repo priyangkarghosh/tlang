@@ -8,6 +8,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `printf(...)` from inside shader code, streaming to the shader's stdout. The format
+  string never reaches GLSL — tlang lifts it out at build time, so a specifier/argument
+  mismatch fails the *build*, and each argument is cast at the call site per its
+  specifier rather than dispatched through overload resolution. Output leads with the
+  call site (`physics/dynamics.tlang:42`). `sm.stdout.stream(sink=print)` polls a pinned
+  buffer from a thread that makes no GL calls, so it never stalls the pipeline; drops are
+  counted, never silent. `debug=False` (the default) is completely inert — no buffer, no
+  binding slot — so calls can be left in permanently.
+- `[extern] int BLOCK_SIZE;` declares a host-supplied constant, emitted as
+  `const int BLOCK_SIZE = 256;`. Unlike `#define X {{ X }}`, a missing value is an error
+  naming the constant and what to add to `constants=`, a wrong type is caught before the
+  driver, and a module can be asked what it requires. `{{ }}` is unchanged.
+- `[extern(precompile=[...])]` compiles one artifact per listed value, selected with
+  `shader.get_kernel(name, const=value)`. Measured 1.57x on a real dispatch by letting
+  the compiler fold a branch a uniform cannot. A module declaring an axis has no generic
+  build; multiple axes build the cross product.
+- `[buffer] vec2 ptcPositions[];` declares a single-member SSBO block and binds by the
+  name written — GLSL forbids a block sharing its member's name, so tlang synthesises the
+  block name and hides it. The struct form covers multi-member blocks; raw GLSL is
+  unchanged.
+- Texture units, image units and atomic counters are now allocated and bound by name, the
+  way SSBO and UBO blocks already were. Without this every sampler in an artifact defaults
+  to unit 0 and silently collides. `bind_texture`/`bind_image`/`bind_counter` mirror
+  `bind_ssbo`.
+- Pinned (persistently mapped) buffers via `BufferPool.alloc_pinned`, for CPU access
+  without `glBufferSubData` — 9.8x on writes here. Fencing is the API's job, not the
+  caller's.
+- `Kernel.local_size` and `dispatch_for(n)` derive the work-group count from the linked
+  program, so a Python-side block size cannot drift from the shader's.
+- Tagged allocation in `BufferPool`, which is now a `Mapping[str, Buffer]`, plus a buffer
+  source on `ShaderManager`/`Shader`/`Kernel` so `kernel.bind()` takes no arguments.
+- Duplicate top-level declarations across a module's `[include]` closure are a located
+  diagnostic naming both sites, instead of a driver redefinition error. Real GLSL
+  overloads do not trigger it.
+- `Shader.ok`/`.failures`, `ShaderManager.failures`, and `__version__`/`build_info()`.
+
+### Changed
+- `[resourceblock(...)]` is now `[glsl(...)]` — it means "stop preprocessing, this is raw
+  GLSL". `resourceblock` remains as an alias, so no shader needs editing.
+- A declaration may share its attribute's line: `[varyings] struct VertexOut { ... };`.
+- `kernel.bindings` now means "blocks reachable from this kernel's `main()`" rather than
+  "blocks reachable from anything `[include]`d", because dead functions are eliminated
+  before dead blocks. Artifacts shrank ~37% in a real consumer.
+- Bindings are per-kernel state re-asserted at dispatch, making cross-wiring between
+  kernels structurally impossible; dispatching with a required block unbound now raises.
+- `ShaderManager` builds every module in isolation and raises once naming every failure,
+  and `get_shader()` returns `None` for a module that did not fully compile.
+- Generated GLSL is no longer retained after a successful build (`keep_sources=False` by
+  default) — 294 KB to 0 on a 13-module tree. A failed entry point's source is always kept.
+- `moderngl>=5.12` (writable `.binding` and sampler `.value`), and `numpy` is now required.
+- `GL_NV_gpu_shader5` added to the `int64` extension group — it is what actually enables
+  64-bit atomics on NVIDIA.
+
+### Fixed
+- A `(` or `)` in an attribute's argument list — a comment containing prose, typically —
+  could hang the preprocessor indefinitely. `ATTR_PATTERN`'s recursion was ambiguous, so a
+  failed match enumerated an exponential space: 16 characters before a lone `(` took 5.3s,
+  18 took over 10. Now linear, and every attribute scan is time-bounded.
+- Calling a module-scope helper that was never emitted produced a raw GLSL "undefined
+  variable" at a generated line number. It now names the helper, the caller, and the
+  attribute needed — and detects a `[link]` attached to the helper instead of its caller.
+
+## [0.x] Struct-based resource declarations
+
+### Added
 - Struct-based resource declarations: `[varyings]`, `[uniforms]`/`[uniforms(std140)]`,
   and `[buffer(std430|std140)]` declare a resource once, as a
   `struct Name { ... };`, instead of hand-written raw GLSL duplicated across stages.
@@ -21,7 +86,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (and tess-control's `dir='out'`) automatically. `[varyings(locations=false)]` opts a
   declaration out of explicit locations, for member types `location_span` can't
   measure (a user struct, or an array sized by anything but an integer literal).
-  `[resourceblock(...)]` is unchanged and remains the escape hatch for anything the
+  `[glsl(...)]` (formerly `[resourceblock]`) remains the escape hatch for anything the
   struct form doesn't cover; raw GLSL declarations keep working without modification.
 - `tlang.frontend.interface_registry`: GL-free struct parsing, GLSL emission, and
   location-span computation for the declarations above (`InterfaceDecl`,

@@ -2,8 +2,10 @@
 # @file          binding_registry.py
 # @author        Priyangkar Ghosh
 # @created       2025-07-13
-# @description   Scans generated GLSL for buffer/uniform block declarations and assigns
-#                bindings for any not pinned explicitly.
+# @description   Scans generated GLSL and assigns every binding an artifact needs: SSBO and
+#                uniform blocks, texture and image units, and atomic counters. Also carries
+#                the dead-code passes that decide what survives into an artifact in the
+#                first place, and the diagnostic for a helper that was never emitted.
 # @license       MIT
 # -------------------------------------------------------------
 

@@ -20,7 +20,7 @@ void vs_main() {
 }
 
 [shader('fragment')]
-[resourceblock(
+[glsl(
     out vec4 fragColor;
 )]
 void fs_main() {
