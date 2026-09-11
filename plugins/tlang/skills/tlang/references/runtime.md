@@ -10,8 +10,8 @@ sm = ShaderManager(
     constants={'BLOCK_SIZE': 256},
     strict=True,           # default: raise on any build failure
     keep_sources=False,    # default: drop a successful entry point's generated GLSL
-    debug=False,           # default: print(...) compiles to nothing -- see "print(...)" below
-    debug_log_capacity=4096,   # records the debug log holds before it starts overflowing
+    debug=False,           # default: printf(...) compiles to nothing -- see "printf(...)" below
+    debug_log_capacity=4096,   # records the printf ring buffer holds before it starts overflowing
 )
 ```
 
@@ -327,75 +327,162 @@ kernel.dispatch(n, barrier_bits=SHADER_STORAGE_BARRIER_BIT)   # explicit value a
 `Pipeline.bind_counter`/`bind_counters` mirror the `Kernel` API but bind immediately, exactly like
 `Pipeline.bind_ssbo`/`bind_texture` -- see "`Pipeline` (raster) is the exception" above.
 
-## `print(...)` -- a debug log callable from inside shader code
+## `printf(...)` -- a debug log callable from inside shader code
 
-OpenGL has no `debugPrintfEXT` (that's Vulkan-only). `print(...)` is tlang's replacement: call it
-from any stage, in any build --
+OpenGL has no `debugPrintfEXT` (that's Vulkan-only). `printf(...)` is tlang's replacement, and the
+**leading, normal way to use it is guarded by thread id**:
 
 ```glsl
-print(gid);
-print(gid, depth, correction.x);   // mixed types are fine (see below)
+if (gid == 0) printf("frame start, dt=%f\n", dt);   // the common case: one line per dispatch
 ```
 
--- and read the decoded values back on the host:
+Be honest with yourself about the alternative before reaching for it: **per-thread printing at
+full occupancy is not workable.** One unguarded `printf(...)` in a million-invocation dispatch is a
+million records, most of which will be dropped (see "Bounded ring, ACK'd" below) and the rest of
+which will flood any console you point at them. This feature is closer to an **assert** you can
+leave compiled in than a general-purpose log -- reach for `if (gid == 0)`, `if (gid == targetId)`,
+or a rare-condition guard (`if (isnan(x))`) before printing from every invocation.
+
+```glsl
+printf("ptc %d depth %f\n", gid, depth);   // %d, %u, %f, %x, %% -- see "Format specifiers" below
+printf("hit\n");                            // no arguments is fine
+```
+
+GLSL has no strings, so the format string never reaches it: tlang lifts it out of your source at
+build time, assigns it (and the call site itself) an id, and rewrites the call to carry only the id
+and the values:
+
+```
+printf("ptc %d depth %f\n", gid, depth);   ->   printf(7u, gid, depth);
+```
+
+-- and reads the decoded, formatted lines back on the host, from the shader's stdout:
 
 ```python
 sm = ShaderManager(ctx, '460 core', 'shaders', debug=True)   # off by default
 ...
 kernel.dispatch(n)
-records, overflow = kernel.debug_log()      # -> DebugLogResult(records, overflow)
-for values in records: print(values)        # each is a tuple, e.g. (3, 1.5)
-if overflow: print(f'{overflow} print(...) calls were dropped -- log was full')
-kernel.clear_debug_log()                    # reset before the next dispatch
+for line in sm.stdout.drain(): print(line)   # 'physics.dynamics:42  ptc 3 depth 0.5'
+if sm.stdout.dropped: print(f'{sm.stdout.dropped} printf(...) calls were dropped -- ring was full')
 ```
 
-**`debug=False` (the default) is completely inert.** `print(...)` calls are never rewritten or
-stripped from your source -- tlang has been burned by textual call-stripping before, and doing that
-to `print(...)` specifically would be the same mistake. Instead, tlang always emits real GLSL
-*definitions* for `print` (empty-bodied in release, real in debug) into any artifact whose own
-source calls it; **an artifact that never calls `print` gets no overloads, no log buffer, and no
-binding slot, in either build** -- proven by benchmark, not assumed: unconditionally injecting the
-full overload set into every artifact regardless of use measurably slowed a many-kernel real
-project's build, so both modes gate injection on the same cheap `print(`-in-this-artifact's-own-
-source check. The only build that pays anything for print support is one that actually calls it;
-an empty release body costs nothing further, since the driver is free to eliminate a called-but-
-empty function.
+Every line leads with WHERE it came from (`module:line`, resolved from the call site, not baked
+into the format text) followed by the formatted message -- the format string says what the values
+mean, the call site says where they came from.
 
-**Supported types and overloads.** `uint`, `int`, `float`, `bool`, up to 8 arguments. GLSL has no
-varargs, so tlang emits concrete overloads: every same-type overload for arities 1-8, PLUS the full
-cross product of all 4 types for arities 2 and 3 (16 + 64 overloads), so a mixed call like
-`print(gid, depth)` (`uint`, `float`) resolves to an EXACT-type overload rather than leaning on
-GLSL's implicit (and lossy, one-directional) int/uint->float conversion. Arities 4-8 are same-type
-only -- a mixed call that long is rare enough that casting arguments to a common type explicitly
-(`print(float(a), float(b), float(c), float(d))`) is the documented answer instead of a few
-thousand more overloads for a shape of call real shaders essentially never make.
+**`debug=False` (the default) is completely inert.** `printf(...)` calls are never rewritten or
+stripped from your source depending on mode -- tlang has been burned by textual call-stripping
+before, and doing that to `printf(...)` specifically would be the same mistake. The format-string
+extraction and call-site id rewrite happen in BOTH modes (so a specifier/argument mismatch is a
+build error in a release build too, not only when `debug=True`); what differs is only whether
+`printf`'s emitted GLSL *definition* has a real body or an empty one. **An artifact that never calls
+`printf` gets no overloads, no ring buffer, and no binding slot, in either build** -- proven by
+benchmark, not assumed: unconditionally injecting the full overload set into every artifact
+regardless of use measurably slowed a many-kernel real project's build (this was v1's `print`'s own
+finding, and still holds), so both modes gate injection on the same cheap
+`printf(`-in-this-artifact's-own-source check. The only build that pays anything for printf support
+is one that actually calls it; an empty release body costs nothing further, since the driver is
+free to eliminate a called-but-empty function.
 
-**Encoding.** One fixed-size record per call: a header word (argument count + a 2-bit type tag per
-argument) followed by up to 8 value words, each the argument bit-cast to `uint`
-(`floatBitsToUint` for `float`; int/bool convert to `uint` directly -- GLSL guarantees that
-conversion preserves the bit pattern). Fixed-size slots mean a dropped write (see below) can never
-leave a *neighbouring* record torn.
+**Format specifiers.** `%d` (signed int), `%u` (unsigned), `%f` (float), `%x` (unsigned hex), `%%`
+(a literal `%`, consumes no argument). The specifier count must match the argument count exactly --
+checked at BUILD TIME, naming the format and the mismatch:
 
-**Bounded, with overflow visible.** The log buffer holds `debug_log_capacity` records (default
-4096); a call past capacity is dropped, not wrapped or corrupted, and counted in `overflow` --
-check it before trusting that `records` is the complete log for a dispatch.
+```
+demo:4: printf format 'a %d b %d c %d' has 3 specifier(s) but 2 argument(s) were passed
+```
 
-**tlang owns the buffer.** You never declare, bind, size, or free it -- `ShaderManager(debug=True)`
-allocates ONE buffer shared by every kernel/pipeline it builds, and automatically binds it (as an
-ordinary SSBO, no atomic-counter machinery involved) to whichever artifacts actually declare it.
+**Up to 8 arguments per call** (`MAX_PRINTF_ARGS` in `tlang.runtime.printf_log`) -- a direct
+per-record memory cost (each ring slot is sized for the worst case regardless of how many
+arguments any individual call actually used), tuned the same way v1 `print`'s limit was: against
+how many values one debug line realistically carries, not any GLSL/driver ceiling.
+
+**Locating the format string.** A naive regex over raw text breaks on an escaped quote, a comma or
+a close-paren inside the string, and `%%` -- tlang scans character-by-character (respecting `\"`
+escapes) to find the literal's real span, so all four are handled correctly:
+
+```glsl
+printf("a \" b\n");        // escaped quote -- not the end of the string
+printf("x, y: %d\n", n);   // comma inside the string -- not an argument separator
+printf("f(%d)\n", n);      // close-paren inside the string -- not the call's own
+printf("100%% done\n");    // %% -- a literal percent, not a specifier
+```
+
+**Overloads.** GLSL has no varargs, so tlang emits one concrete overload per arity (0-8), and every
+value parameter is `uint` -- there is no type-matched overload set to resolve at all. Each argument
+is cast to its stored `uint` bit pattern AT THE CALL SITE, driven by that argument's OWN format
+specifier (`%d`/`%u`/`%x` -> `uint(expr)`, `%f` -> `floatBitsToUint(expr)`), not by leaning on GLSL
+overload resolution:
+
+```
+printf("%d %f %d %f\n", 7, 2.5, 9, 4.5);
+  ->  printf(3u, uint(7), floatBitsToUint(2.5), uint(9), floatBitsToUint(4.5));
+```
+
+This is deliberate, not incidental: an earlier version tried to make mixed-type calls resolve to an
+exact-type overload the way v1's `print` did, via a full type cross product -- but GLSL's overload
+rules only make that tractable for arities 2-3 (a 4-type cross product is `4**n` overloads), so
+arities 4-8 fell back to same-type-only overloads. A mixed-type call at arity 4+ (e.g. `printf("%d
+%f %d %f\n", 7, 2.5, 9, 4.5)`) then had no matching overload, so GLSL silently implicit-converted
+every integer argument to `float` to match the all-float overload -- and the host, decoding per the
+format's `%d`, read the resulting float bit pattern back as if it were an integer. Wrong values,
+no error. Casting per-specifier at the call site removes the overload-resolution step (and its
+implicit-conversion hazard) for every arity uniformly, and is smaller: 9 overloads total instead of
+a type cross product.
+
+**Publish ordering.** Each record is: reserve a ring slot, write the body, call
+`memoryBarrierBuffer()`, THEN publish (a per-slot ready word) -- a reader can never observe a record
+before its body has landed. `memoryBarrierBuffer()` is per-invocation, not the device-wide
+`glMemoryBarrier`, so it costs nothing close to a real device barrier's price.
+
+**Bounded ring, ACK'd.** The ring holds `debug_log_capacity` records (default 4096, set on
+`ShaderManager(...)`). A claim past capacity is dropped, not wrapped or corrupted, and counted --
+`sm.stdout.dropped` reports exactly how many. What gets dropped is always the NEWEST claim attempt;
+the earliest records that fit are the ones that survive, since silently losing those would be the
+worst version of this failure. The host acknowledges a record by writing back into the SAME buffer
+after decoding it (a plain memory write through a coherent persistent mapping -- no GL call), which
+is what lets the ring reuse that slot; see `tlang.runtime.printf_log`'s module docstring for exactly
+how (a bounded lock-free MPSC queue, not a plain atomic counter -- the plain-counter version has a
+real bug where a single overflow can permanently strand every later record, found and fixed while
+building this feature).
+
+**Volume control.** Three things make this usable instead of a console-flooding liability:
+- **Guard by thread id** (see the top of this section) -- the intended default usage.
+- **Dedup**: `sm.stdout.drain()`/`stream()` collapse a run of CONSECUTIVE identical lines into one,
+  suffixed with a repeat count (`'dbg:6  hit  (x8)'`) -- pass `dedup=False` to see every line raw.
+- **A rate limit on `stream()`'s sink** (a token bucket, `rate_limit` lines/second, default 200) so
+  a flood can never overwhelm whatever `sink` does -- excess lines are withheld and reported as one
+  summary line (`'... N line(s) suppressed by rate limit ...'`), not silently discarded data (the
+  ring's own `dropped` count is unaffected either way).
+
+**tlang owns the ring buffer.** You never declare, bind, size, or free it --
+`ShaderManager(debug=True)` allocates ONE pinned (persistent-mapped) buffer shared by every
+kernel/pipeline it builds, and automatically binds it (as an ordinary SSBO, no atomic-counter
+machinery involved) to whichever artifacts actually declare it.
+
+## `sm.stdout` -- the shader's stdout
 
 ```python
-kernel.debug_log()          # -> DebugLogResult(records, overflow); raises TlangError if this
-                             # kernel has no log (debug=False, or it never calls print)
-kernel.clear_debug_log()    # reset the SHARED log's cursor/overflow to zero
-pipeline.debug_log()        # identical API for a [program(...)]'s vertex/fragment/etc. stages
-sm.debug_log                # the shared DebugLog itself (None if debug=False), for a caller that
-                             # wants to read/clear it without going through one specific kernel
+sm.stdout.stream(sink=print)   # background thread -> sink(line) per formatted record, until stop()
+sm.stdout.stop()               # stop it cleanly
+sm.stdout.drain()              # -> formatted lines available right now, synchronously
+sm.stdout.dropped              # records dropped so far because the ring was full
+sm.stdout.clear()              # reset the ring's cursors/counters
+sm.stdout.capacity             # the ring's capacity, in records
 ```
 
-The log is one shared buffer across the whole `ShaderManager` tree: `clear_debug_log()` on any
-kernel clears it for all of them, and `debug_log()` on any kernel that participates shows every
-`print(...)` call from every participating kernel/pipeline since the last clear -- not just its own.
+`None` when `debug=False` (the default). Shared by the WHOLE `ShaderManager` tree, not one kernel:
+`clear()`/`dropped` and every drained/streamed line reflect every participating kernel/pipeline's
+`printf(...)` calls since the last clear, not just one artifact's own.
+
+`stream()` runs its poll loop on a background daemon thread that touches only the ring's pinned
+memory mapping directly -- never a GL call, so it needs no GL context and never stalls the render
+thread the way `buffer.read()` would. (Verified while building this: a thread with no GL context
+polling the raw mapping saw every record live and in order while the GL thread kept dispatching.)
+Without `GL_ARB_buffer_storage` (rare on anything from the last decade), the ring falls back to a
+plain buffer with no real mapping -- `stream()` still runs, but correctness there depends on your GL
+binding tolerating a cross-thread `.read()` call, which is not guaranteed; prefer `drain()` from the
+render thread in that fallback case. `drain()` always works correctly either way, mapped or not.
 
 ## BufferPool
 

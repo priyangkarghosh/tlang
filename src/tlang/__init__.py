@@ -51,7 +51,7 @@ from .runtime.kernel import Kernel
 from .runtime.pipeline import Pipeline
 from .runtime.buffer_pool import BufferPool, BufferPoolMetrics, TempHandle, clear_buffer
 from .runtime.pinned_buffer import PinnedBuffer, PinnedBufferFallback, buffer_storage_supported
-from .runtime.debug_log import DebugLog, DebugLogResult
+from .runtime.printf_log import PrintfStream
 from .frontend.interface_registry import (
     ExternConst,
     InterfaceDecl,
@@ -86,8 +86,7 @@ __all__ = [
     "PinnedBuffer",
     "PinnedBufferFallback",
     "buffer_storage_supported",
-    "DebugLog",
-    "DebugLogResult",
+    "PrintfStream",
     "ExternConst",
     "InterfaceDecl",
     "InterfaceKind",

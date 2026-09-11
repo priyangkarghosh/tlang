@@ -24,8 +24,7 @@ from OpenGL.GL import (
     glGetIntegeri_v, GL_ATOMIC_COUNTER_BUFFER_BINDING,
 )
 
-from tlang.errors import SourceLocation, TlangBindingError, TlangError
-from tlang.runtime.debug_log import DebugLog, DebugLogResult
+from tlang.errors import SourceLocation, TlangBindingError
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +103,7 @@ class Kernel:
         '_texture_units', '_image_units', '_texture_bindings', '_image_bindings',
         '_bound_texture_generation', '_bound_image_generation',
         '_atomic_counters', '_counter_bindings', '_bound_counter_generation',
-        '_local_size', '_debug_source',
+        '_local_size',
     )
 
     def __init__(
@@ -177,12 +176,6 @@ class Kernel:
         # change. See `local_size`.
         self._local_size: tuple[int, int, int] | None = None
 
-        # The shared `DebugLog` this kernel's artifact writes `print(...)` records into --
-        # set by `Shader._build` ONLY when this artifact's `bindings` actually declares the
-        # debug log block (`debug=False`, or a `debug=True` artifact that never calls
-        # `print`, leaves this `None`). See `debug_log`/`clear_debug_log`.
-        self._debug_source: DebugLog | None = None
-
     @property
     def ctx(self): return self._ctx # mgl context
 
@@ -222,49 +215,6 @@ class Kernel:
     @buffer_source.setter
     def buffer_source(self, value: Mapping[str, Buffer] | None) -> None:
         self._buffer_source = value
-
-    @property
-    def debug_source(self) -> DebugLog | None:
-        """The shared `DebugLog` backing this kernel's `print(...)` calls, or `None` if this
-        artifact never declared the debug log block -- set by `Shader._build`, never by user
-        code. `None` here means `debug_log()`/`clear_debug_log()` raise `TlangError`: either
-        `ShaderManager(debug=False)` (the default), or this kernel's code never calls `print`."""
-        return self._debug_source
-
-    @debug_source.setter
-    def debug_source(self, value: DebugLog | None) -> None:
-        self._debug_source = value
-
-    def debug_log(self) -> DebugLogResult:
-        """Decode and return every `print(...)` record this artifact (and any other kernel or
-        pipeline sharing the same debug build) has appended since the last `clear_debug_log()`.
-
-        Returns a `DebugLogResult(records, overflow)` -- `records` is a list of tuples, one per
-        call, values already converted to Python `int`/`float`/`bool`; `overflow` is how many
-        calls were dropped because the log was already full (0 means nothing was lost). Raises
-        `TlangError` if this kernel has no debug log at all: `ShaderManager(debug=False)`, or
-        this kernel's code never calls `print(...)`.
-        """
-        if self._debug_source is None:
-            raise TlangError(
-                f"Kernel '{self._name}' has no debug log -- either the build has "
-                f"debug=False, or this kernel's code never calls print(...)",
-                SourceLocation(module=self._name),
-            )
-        return self._debug_source.read()
-
-    def clear_debug_log(self) -> None:
-        """Reset the shared debug log's cursor/overflow counter to zero (see `debug_log`).
-        Since the log buffer is shared by every debug-enabled kernel/pipeline in the build,
-        this clears it for all of them, not just this one. Raises `TlangError` under the same
-        conditions as `debug_log`."""
-        if self._debug_source is None:
-            raise TlangError(
-                f"Kernel '{self._name}' has no debug log -- either the build has "
-                f"debug=False, or this kernel's code never calls print(...)",
-                SourceLocation(module=self._name),
-            )
-        self._debug_source.clear()
 
     @property
     def uniform_blocks(self) -> Mapping[str, int]:

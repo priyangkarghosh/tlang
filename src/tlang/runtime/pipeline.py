@@ -14,8 +14,7 @@ from typing import Any
 from moderngl import Buffer, Context, Program, StorageBlock, Texture, UniformBlock, Uniform
 from OpenGL.GL import glBindBufferRange, GL_ATOMIC_COUNTER_BUFFER
 
-from tlang.errors import SourceLocation, TlangBindingError, TlangError
-from tlang.runtime.debug_log import DebugLog, DebugLogResult
+from tlang.errors import SourceLocation, TlangBindingError
 from tlang.runtime.kernel import (
     bump_counter_table_generation, bump_image_table_generation, bump_ssbo_table_generation,
     bump_texture_table_generation,
@@ -31,7 +30,7 @@ class Pipeline:
     binding, so callers never hardcode binding numbers. Get one via `Shader.get_pipeline(name)`."""
     __slots__ = (
         '_ctx', '_name', '_mglo', '_uniform_cache', '_binding_cache', '_bindings', '_ubo_cache', '_buffer_source',
-        '_texture_units', '_image_units', '_atomic_counters', '_debug_source',
+        '_texture_units', '_image_units', '_atomic_counters',
     )
 
     def __init__(
@@ -61,9 +60,6 @@ class Pipeline:
         # GL_ATOMIC_COUNTER_BUFFER interface actually reports active -- see
         # `Kernel.atomic_counters`, which this mirrors.
         self._atomic_counters: dict[str, tuple[int, int]] = dict(atomic_counters) if atomic_counters is not None else {}
-        # The shared `DebugLog` backing this program's `print(...)` calls -- see `Kernel`'s
-        # identical field for the full docstring; set by `Shader._build`, never by user code.
-        self._debug_source: DebugLog | None = None
 
     @property
     def ctx(self): return self._ctx
@@ -101,36 +97,6 @@ class Pipeline:
     @buffer_source.setter
     def buffer_source(self, value: Mapping[str, Buffer] | None) -> None:
         self._buffer_source = value
-
-    @property
-    def debug_source(self) -> DebugLog | None:
-        """The shared `DebugLog` backing this program's `print(...)` calls, or `None` if no
-        stage of this program declared the debug log block. See `Kernel.debug_source`."""
-        return self._debug_source
-
-    @debug_source.setter
-    def debug_source(self, value: DebugLog | None) -> None:
-        self._debug_source = value
-
-    def debug_log(self) -> DebugLogResult:
-        """See `Kernel.debug_log` -- identical contract, program-side."""
-        if self._debug_source is None:
-            raise TlangError(
-                f"Pipeline '{self._name}' has no debug log -- either the build has "
-                f"debug=False, or no stage of this program ever calls print(...)",
-                SourceLocation(module=self._name),
-            )
-        return self._debug_source.read()
-
-    def clear_debug_log(self) -> None:
-        """See `Kernel.clear_debug_log` -- identical contract, program-side."""
-        if self._debug_source is None:
-            raise TlangError(
-                f"Pipeline '{self._name}' has no debug log -- either the build has "
-                f"debug=False, or no stage of this program ever calls print(...)",
-                SourceLocation(module=self._name),
-            )
-        self._debug_source.clear()
 
     @property
     def uniform_blocks(self) -> Mapping[str, int]:

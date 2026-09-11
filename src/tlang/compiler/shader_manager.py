@@ -23,7 +23,7 @@ from tlang.frontend.function_manager import param_type_signature
 from tlang.frontend.interface_registry import InterfaceDecl, InterfaceTable
 from tlang.compiler.shader import Shader
 from tlang.compiler.shader_processor import ShaderProcessor
-from tlang.runtime.debug_log import DEFAULT_LOG_CAPACITY, DebugLog
+from tlang.runtime.printf_log import DEFAULT_LOG_CAPACITY, PrintfLog, PrintfStream, PrintfTable
 
 
 def _lookup(table: InterfaceTable, name: str) -> InterfaceDecl | None:
@@ -111,15 +111,21 @@ class ShaderManager:
         # keep_sources: forwarded to every built `Shader`. False (default) drops a successfully
         # compiled/linked entry point's generated GLSL once its artifact exists; a failed entry
         # point's source is always kept. True keeps every entry point's source, always.
-        # debug: turns on `print(...)` inside shader code (see references/runtime.md). False
-        # (default) is completely inert: every `print(...)` overload compiles to an empty body
+        # debug: turns on `printf(...)` inside shader code (see references/runtime.md). False
+        # (default) is completely inert: every `printf(...)` overload compiles to an empty body
         # with no backing buffer anywhere in the tree -- the driver eliminates it for free. True
-        # allocates ONE `DebugLog` GPU buffer (sized for `debug_log_capacity` records, shared by
-        # every kernel/pipeline this manager builds) and gives a real body to `print(...)` in
-        # whichever artifacts actually call it.
+        # allocates ONE pinned `PrintfLog` ring buffer (sized for `debug_log_capacity` records,
+        # shared by every kernel/pipeline this manager builds) and gives a real body to
+        # `printf(...)` in whichever artifacts actually call it. `self.stdout` is the shader's
+        # stdout either way -- `None` when `debug=False`.
         self._ctx = ctx
         self._strict = strict
-        self._debug_log: DebugLog | None = DebugLog(ctx, debug_log_capacity) if debug else None
+        # Always built, regardless of `debug` -- every printf(...) call site is scanned and its
+        # specifier/argument count validated at build time even in a release build; only the
+        # GPU-side ring buffer (`_printf_log` below) is debug-only.
+        self._printf_table = PrintfTable()
+        self._printf_log: PrintfLog | None = PrintfLog(ctx, self._printf_table, debug_log_capacity) if debug else None
+        self._stdout: PrintfStream | None = PrintfStream(self._printf_log) if self._printf_log is not None else None
         constants = constants if constants is not None else {}
 
         t0 = time.perf_counter()
@@ -224,7 +230,7 @@ class ShaderManager:
                 shader = Shader(
                     ctx, name, version, common, process, pref_rank, strict=self._strict,
                     dep_plain_funcs=dep_plain_funcs, keep_sources=keep_sources,
-                    debug=debug, debug_log=self._debug_log,
+                    debug=debug, printf_table=self._printf_table, printf_log=self._printf_log,
                 )
             except Exception as e:
                 self._failures[name] = [e]
@@ -290,14 +296,18 @@ class ShaderManager:
         for shader in self._shaders.values(): shader.buffer_source = value
 
     @property
-    def debug_log(self) -> DebugLog | None:
-        """The one `DebugLog` shared by every `print(...)`-using kernel/pipeline in the tree,
-        or `None` when this manager was built with `debug=False` (the default). Prefer
-        `kernel.debug_log()`/`pipeline.debug_log()` for a specific artifact; this is the same
-        underlying object, exposed for a caller that wants to read/clear it without going
-        through any one kernel (e.g. a build where every artifact's `print` was pruned by DCE
-        but the caller still wants to assert the log is empty)."""
-        return self._debug_log
+    def stdout(self) -> PrintfStream | None:
+        """The shader's stdout -- every `printf(...)` call from every kernel/pipeline this
+        manager built streams (or drains) through this ONE object, or `None` when this
+        manager was built with `debug=False` (the default):
+
+            sm.stdout.stream(sink=print)   # background thread -> sink(line) per record
+            sm.stdout.stop()
+            sm.stdout.drain()              # -> formatted lines available right now
+
+        See `references/runtime.md` for the full contract (dedup, rate limiting, the ring
+        buffer's ACK'd flow control)."""
+        return self._stdout
 
     def get_shader(self, name: str, *, allow_failed: bool = False) -> Shader | None:
         """Look up a built shader by name, returning `None` if it wasn't built (unlike
