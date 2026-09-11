@@ -181,11 +181,52 @@ kernel.dispatch_for(n)                        # covers n invocations -- derives 
   works — including `[numthreads(BLOCK_SIZE, 1, 1)]` and array sizes. A default
   (`[extern] int WARP = 32;`) makes it optional. `{{ }}` still works and is still the
   only option when substituting into arbitrary text rather than a value.
+- **`[extern(precompile=[false, true])] bool stabilizing;` compiles one artifact per
+  value**, picked with `shader.get_kernel('solve', stabilizing=True)`. Specialising a
+  uniform branch measured 1.57x on a real dispatch, because the compiler can fold the
+  select and drop a buffer load. A module declaring an axis has NO generic build — every
+  `get_kernel` in it must supply a value, and a value outside the list raises. Cost is
+  artifacts: one 2-value axis doubles that module's builds, and multiple axes build the
+  **cross product** of every kernel in the module, so keep specialised constants in small
+  modules.
 - **`{{ }}` collides with GLSL brace initializers** (`mat2({{1.0,0.0},{0.0,1.0}})`)
   — add a space or use constructor form.
 - **A raster stage function with no `[program(...)]` reference is compiled and
   discarded with a warning** — usually a typo. Compute entry points never go in
   `[program(...)]`.
+
+## Debugging: printf from inside a shader
+
+```glsl
+layout(std430) buffer Depths { float depths[]; };
+
+[shader('compute'), numthreads(64, 1, 1)]
+void solve() {
+    uint gid = gl_GlobalInvocationID.x;
+    float depth = depths[gid];
+    if (gid == 0u) printf("ptc %d depth %f
+", gid, depth);   // guard it — see below
+}
+```
+```python
+sm = ShaderManager(ctx=ctx, version='460 core', dir='shaders', debug=True)
+sm.stdout.stream(sink=print)      # live, from a thread that makes no GL calls
+...
+sm.stdout.stop()
+lines = sm.stdout.drain()         # or pull on demand instead of streaming
+sm.stdout.dropped                 # records lost to a full ring — always check this
+```
+
+- Supports `%d`, `%u`, `%f`, `%x`, `%%`. The format string never reaches GLSL — tlang
+  lifts it out at build time, so a mismatch between specifier and argument count fails
+  the **build**, not the decode.
+- Output leads with the call site: `physics/dynamics.tlang:42  ptc 3 depth 0.5`.
+- **`debug=False` (the default) is completely inert** — no buffer, no binding slot, no
+  cost. Leave `printf` calls in permanently.
+- **Guard your calls.** One unguarded `printf` in a 1M-invocation dispatch is 1M records.
+  The host decodes ~10k records per frame before it blows a frame budget, so treat this
+  as closer to an assert than a log: `if (gid == 0u)`, or a condition that should never
+  fire. Drops are counted, never silent.
 
 ## References
 
@@ -197,7 +238,7 @@ kernel.dispatch_for(n)                        # covers n invocations -- derives 
 | An exact error message and what to do about it | `references/errors.md` |
 | Full working shaders to copy: compute kernel, vert+frag with structured varyings, cross-module include/export, geometry stage | `references/patterns.md` |
 
-Requires `moderngl>=5.8`. A GL context must exist before any tlang call. There is no
+Requires `moderngl>=5.12` and `numpy`. A GL context must exist before any tlang call. There is no
 CLI — verify a change by building it: `sm = ShaderManager(...)`; a successful
 construction with `strict=True` (the default) means the whole pipeline compiled and
 linked. Prefer this over reading GLSL and reasoning about whether it should work.
