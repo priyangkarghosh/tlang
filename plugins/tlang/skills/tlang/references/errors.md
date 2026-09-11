@@ -21,7 +21,7 @@ from tlang.errors import (
 | `TlangCompileError` | a stage failed to compile — carries `.stage`, `.entry_point`, `.source` |
 | `TlangLinkError` | a `[program(...)]` failed to link |
 | `TlangBuildError` | more than one module in the tree failed — `.failures` maps module -> its errors |
-| `TlangError` (base) | `BufferPool`/`TempHandle` misuse (use-after-free, double-free, bad size), `Shader.get_source(...)` on a source that was dropped (`keep_sources=False`) |
+| `TlangError` (base) | `BufferPool`/`TempHandle` misuse (use-after-free, double-free, bad size), `Shader.get_source(...)` on a source that was dropped (`keep_sources=False`), `kernel.debug_log()`/`clear_debug_log()` on a kernel with no debug log |
 
 `e.source` (on `TlangCompileError`) always has the exact GLSL handed to the driver, with
 tlang's `#line` directives intact, so a driver message's line number points back at your
@@ -319,6 +319,17 @@ call made entirely outside any `Kernel`, and never rebinds it again for the life
 correct, idiomatic usage for a resource that (unlike an SSBO) is not swapped to a different buffer
 between kernels or frames. `bind_counter` and its re-assert-at-dispatch discipline still exist and
 still protect a caller who opts in by calling it at all.
+
+## `print(...)` / debug log errors
+
+**`debug_log()`/`clear_debug_log()` on a kernel that has no debug log** -- either the whole build
+has `debug=False` (the default), or this specific kernel's own code never calls `print(...)` at
+all (in which case it never got a log buffer to begin with -- see `references/runtime.md`):
+```
+cs_no_print: Kernel 'cs_no_print' has no debug log -- either the build has debug=False, or this kernel's code never calls print(...)
+```
+`Pipeline.debug_log()`/`clear_debug_log()` raise the identical message shape, naming the pipeline
+instead of the kernel.
 
 ## Missing `[export()]` / misattached `[link]`
 

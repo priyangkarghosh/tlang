@@ -10,6 +10,8 @@ sm = ShaderManager(
     constants={'BLOCK_SIZE': 256},
     strict=True,           # default: raise on any build failure
     keep_sources=False,    # default: drop a successful entry point's generated GLSL
+    debug=False,           # default: print(...) compiles to nothing -- see "print(...)" below
+    debug_log_capacity=4096,   # records the debug log holds before it starts overflowing
 )
 ```
 
@@ -324,6 +326,76 @@ kernel.dispatch(n, barrier_bits=SHADER_STORAGE_BARRIER_BIT)   # explicit value a
 
 `Pipeline.bind_counter`/`bind_counters` mirror the `Kernel` API but bind immediately, exactly like
 `Pipeline.bind_ssbo`/`bind_texture` -- see "`Pipeline` (raster) is the exception" above.
+
+## `print(...)` -- a debug log callable from inside shader code
+
+OpenGL has no `debugPrintfEXT` (that's Vulkan-only). `print(...)` is tlang's replacement: call it
+from any stage, in any build --
+
+```glsl
+print(gid);
+print(gid, depth, correction.x);   // mixed types are fine (see below)
+```
+
+-- and read the decoded values back on the host:
+
+```python
+sm = ShaderManager(ctx, '460 core', 'shaders', debug=True)   # off by default
+...
+kernel.dispatch(n)
+records, overflow = kernel.debug_log()      # -> DebugLogResult(records, overflow)
+for values in records: print(values)        # each is a tuple, e.g. (3, 1.5)
+if overflow: print(f'{overflow} print(...) calls were dropped -- log was full')
+kernel.clear_debug_log()                    # reset before the next dispatch
+```
+
+**`debug=False` (the default) is completely inert.** `print(...)` calls are never rewritten or
+stripped from your source -- tlang has been burned by textual call-stripping before, and doing that
+to `print(...)` specifically would be the same mistake. Instead, tlang always emits real GLSL
+*definitions* for `print` (empty-bodied in release, real in debug) into any artifact whose own
+source calls it; **an artifact that never calls `print` gets no overloads, no log buffer, and no
+binding slot, in either build** -- proven by benchmark, not assumed: unconditionally injecting the
+full overload set into every artifact regardless of use measurably slowed a many-kernel real
+project's build, so both modes gate injection on the same cheap `print(`-in-this-artifact's-own-
+source check. The only build that pays anything for print support is one that actually calls it;
+an empty release body costs nothing further, since the driver is free to eliminate a called-but-
+empty function.
+
+**Supported types and overloads.** `uint`, `int`, `float`, `bool`, up to 8 arguments. GLSL has no
+varargs, so tlang emits concrete overloads: every same-type overload for arities 1-8, PLUS the full
+cross product of all 4 types for arities 2 and 3 (16 + 64 overloads), so a mixed call like
+`print(gid, depth)` (`uint`, `float`) resolves to an EXACT-type overload rather than leaning on
+GLSL's implicit (and lossy, one-directional) int/uint->float conversion. Arities 4-8 are same-type
+only -- a mixed call that long is rare enough that casting arguments to a common type explicitly
+(`print(float(a), float(b), float(c), float(d))`) is the documented answer instead of a few
+thousand more overloads for a shape of call real shaders essentially never make.
+
+**Encoding.** One fixed-size record per call: a header word (argument count + a 2-bit type tag per
+argument) followed by up to 8 value words, each the argument bit-cast to `uint`
+(`floatBitsToUint` for `float`; int/bool convert to `uint` directly -- GLSL guarantees that
+conversion preserves the bit pattern). Fixed-size slots mean a dropped write (see below) can never
+leave a *neighbouring* record torn.
+
+**Bounded, with overflow visible.** The log buffer holds `debug_log_capacity` records (default
+4096); a call past capacity is dropped, not wrapped or corrupted, and counted in `overflow` --
+check it before trusting that `records` is the complete log for a dispatch.
+
+**tlang owns the buffer.** You never declare, bind, size, or free it -- `ShaderManager(debug=True)`
+allocates ONE buffer shared by every kernel/pipeline it builds, and automatically binds it (as an
+ordinary SSBO, no atomic-counter machinery involved) to whichever artifacts actually declare it.
+
+```python
+kernel.debug_log()          # -> DebugLogResult(records, overflow); raises TlangError if this
+                             # kernel has no log (debug=False, or it never calls print)
+kernel.clear_debug_log()    # reset the SHARED log's cursor/overflow to zero
+pipeline.debug_log()        # identical API for a [program(...)]'s vertex/fragment/etc. stages
+sm.debug_log                # the shared DebugLog itself (None if debug=False), for a caller that
+                             # wants to read/clear it without going through one specific kernel
+```
+
+The log is one shared buffer across the whole `ShaderManager` tree: `clear_debug_log()` on any
+kernel clears it for all of them, and `debug_log()` on any kernel that participates shows every
+`print(...)` call from every participating kernel/pipeline since the last clear -- not just its own.
 
 ## BufferPool
 

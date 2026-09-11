@@ -200,3 +200,6 @@ cython_debug/
 *.tlang
 !examples/shaders/*.tlang
 !examples/shaders/*.glsl
+
+# agent worktrees
+.claude/worktrees/

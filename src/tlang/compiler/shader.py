@@ -16,7 +16,9 @@ import time
 from typing import Mapping
 import regex as re
 from moderngl import Buffer, Context, Program
+from tlang.compiler.debug_print import contains_print_call, render_print_module
 from tlang.frontend.function_manager import FunctionDef
+from tlang.runtime.debug_log import DEBUG_BUFFER_HANDLE, DEFAULT_LOG_CAPACITY, DebugLog
 from tlang.runtime.kernel import Kernel
 from tlang.runtime.pipeline import Pipeline
 from tlang.frontend.interface_registry import ExternConst, InterfaceDecl, InterfaceKind
@@ -37,11 +39,19 @@ class Shader:
         self, ctx: Context, name: str, version: str, module: str, processor: ShaderProcessor,
         pref_rank: dict[str, int] | None = None, strict: bool = True,
         dep_plain_funcs: dict[str, str] | None = None, keep_sources: bool = False,
+        debug: bool = False, debug_log: DebugLog | None = None,
     ) -> None:
         self._ctx = ctx
         self._name = name
         self._version = version
         self._strict = strict  # raise TlangCompileError/TlangLinkError instead of logging and continuing
+        # debug: emit real print(...) bodies (writing into debug_log) instead of empty stubs,
+        # but only in an artifact whose own source actually calls print -- see
+        # `tlang.compiler.debug_print.render_print_module`. `debug_log` is the ONE `DebugLog`
+        # shared by every Shader/Kernel/Pipeline `ShaderManager` builds; always non-None when
+        # `debug` is True (ShaderManager's job to guarantee that).
+        self._debug = debug
+        self._debug_log = debug_log
         # False (default): a successfully compiled/linked entry point's generated GLSL is
         # dropped once its artifact is built and its bindings verified -- nothing downstream
         # needs the text once the driver has compiled it. A failed entry point's source is
@@ -135,6 +145,17 @@ class Shader:
         `Pipeline` must never see the emitted name for a [buffer] shorthand block, only the
         handle the author actually wrote."""
         return {self._handle_of.get(emitted, emitted): binding for emitted, binding in canon.items()}
+
+    def _attach_debug_log(self, artifact: Kernel | Pipeline) -> None:
+        """Bind the shared debug-log buffer to `artifact` and wire up `.debug_log()`/
+        `.clear_debug_log()`, but only when `artifact` actually declared the block (i.e. its
+        own source called `print(...)` -- see `render_print_module`). Never runs at all
+        outside a `debug=True` build. `Pipeline.bind_ssbo` binds immediately (no dispatch-time
+        hook to defer to); `Kernel.bind_ssbo` records and is re-asserted on the next dispatch,
+        same as any other required block."""
+        if self._debug_log is None or DEBUG_BUFFER_HANDLE not in artifact.bindings: return
+        artifact.bind_ssbo(DEBUG_BUFFER_HANDLE, self._debug_log.buffer)
+        artifact.debug_source = self._debug_log
 
     @property
     def buffer_source(self) -> Mapping[str, Buffer] | None:
@@ -268,9 +289,23 @@ class Shader:
             # rewritten, constants substituted), not raw `f.body`. Skip helpers already folded
             # into the shared module so each appears exactly once.
             links = [f for f in func.links if not Shader._in_shared_module(f)]
-            src += ''.join(Shader.build_map(f.line_body) for f in links)
+            body_text = ''.join(Shader.build_map(f.line_body) for f in links)
+            body_text += pattern.sub('void main(', Shader.build_map(func.line_body), count=1)
 
-            src += pattern.sub('void main(', Shader.build_map(func.line_body), count=1)
+            # print(...): GLSL, like C, has no forward declaration across a call site -- the
+            # overloads (and, in debug, the log buffer they write into) must appear in `src`
+            # BEFORE `body_text`, not after, or a real call reads as an undefined identifier
+            # despite `print` being defined later in the same unit. Also must land before the
+            # missing-export check below, for the same reason. `used` gates injection in BOTH
+            # modes identically -- an artifact whose own source never calls print(...) gets
+            # nothing at all, release or debug (see render_print_module's docstring: this was
+            # measured, not assumed -- unconditionally injecting every artifact in release cost
+            # real driver-side parse time across a many-kernel project).
+            capacity = self._debug_log.capacity if self._debug_log is not None else DEFAULT_LOG_CAPACITY
+            used = contains_print_call(body_text)
+            if (print_text := render_print_module(debug=self._debug, capacity=capacity, used=used)):
+                src += print_text
+            src += body_text
 
             # T15: before DFE removes anything, check whether reachable code calls a name
             # that exists as a module-scope function (this file, or an [include]d one) but
@@ -325,11 +360,12 @@ class Shader:
                 BindingRegistry.assign_opaque_units(shader, texture_canon, image_canon)
                 active_bindings = BindingRegistry.active_atomic_counter_bindings(shader)
                 counter_canon = {n: pos for n, pos in counter_canon.items() if pos[0] in active_bindings}
-                self._kernels[name] = Kernel(
+                kernel = self._kernels[name] = Kernel(
                     self._ctx, name, shader, bindings=self._to_handles(canon),
                     texture_units=texture_canon, image_units=image_canon,
                     atomic_counters=counter_canon,
                 )
+                self._attach_debug_log(kernel)
 
             except TlangBindingError as e:
                 logger.error(str(e))
@@ -377,11 +413,12 @@ class Shader:
                 active_bindings = BindingRegistry.active_atomic_counter_bindings(program)
                 counter_canon = {n: pos for n, pos in counter_canon.items() if pos[0] in active_bindings}
                 self._programs[prog_name] = program
-                self._pipelines[prog_name] = Pipeline(
+                pipeline = self._pipelines[prog_name] = Pipeline(
                     self._ctx, prog_name, program, bindings=self._to_handles(canon),
                     texture_units=texture_canon, image_units=image_canon,
                     atomic_counters=counter_canon,
                 )
+                self._attach_debug_log(pipeline)
 
             except (TlangLinkError, TlangBindingError) as e:
                 logger.error(str(e))

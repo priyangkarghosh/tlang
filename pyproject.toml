@@ -31,7 +31,10 @@ dependencies = [
     "regex",
     "bitarray",
     "PyOpenGL",
-    "PyOpenGL-accelerate"
+    "PyOpenGL-accelerate",
+    # Decoding the debug log is host-bound, not GPU-bound: 100k records take ~48ms
+    # through struct, which blows a frame budget. numpy vectorises that.
+    "numpy",
 ]
 
 [project.optional-dependencies]

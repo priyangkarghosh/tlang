@@ -23,6 +23,7 @@ from tlang.frontend.function_manager import param_type_signature
 from tlang.frontend.interface_registry import InterfaceDecl, InterfaceTable
 from tlang.compiler.shader import Shader
 from tlang.compiler.shader_processor import ShaderProcessor
+from tlang.runtime.debug_log import DEFAULT_LOG_CAPACITY, DebugLog
 
 
 def _lookup(table: InterfaceTable, name: str) -> InterfaceDecl | None:
@@ -103,15 +104,22 @@ FILE_EXT = '.tlang'
 class ShaderManager:
     def __init__(
         self, ctx: Context, version: str, dir: str, constants: dict | None = None, strict: bool = True,
-        keep_sources: bool = False,
+        keep_sources: bool = False, debug: bool = False, debug_log_capacity: int = DEFAULT_LOG_CAPACITY,
     ) -> None:
         # strict: forwarded to every built `Shader`. True raises TlangCompileError/TlangLinkError
         # on a failed compile/link; False logs and continues, leaving that kernel/program missing.
         # keep_sources: forwarded to every built `Shader`. False (default) drops a successfully
         # compiled/linked entry point's generated GLSL once its artifact exists; a failed entry
         # point's source is always kept. True keeps every entry point's source, always.
+        # debug: turns on `print(...)` inside shader code (see references/runtime.md). False
+        # (default) is completely inert: every `print(...)` overload compiles to an empty body
+        # with no backing buffer anywhere in the tree -- the driver eliminates it for free. True
+        # allocates ONE `DebugLog` GPU buffer (sized for `debug_log_capacity` records, shared by
+        # every kernel/pipeline this manager builds) and gives a real body to `print(...)` in
+        # whichever artifacts actually call it.
         self._ctx = ctx
         self._strict = strict
+        self._debug_log: DebugLog | None = DebugLog(ctx, debug_log_capacity) if debug else None
         constants = constants if constants is not None else {}
 
         t0 = time.perf_counter()
@@ -216,6 +224,7 @@ class ShaderManager:
                 shader = Shader(
                     ctx, name, version, common, process, pref_rank, strict=self._strict,
                     dep_plain_funcs=dep_plain_funcs, keep_sources=keep_sources,
+                    debug=debug, debug_log=self._debug_log,
                 )
             except Exception as e:
                 self._failures[name] = [e]
@@ -279,6 +288,16 @@ class ShaderManager:
     def buffer_source(self, value: Mapping[str, Buffer] | None) -> None:
         self._buffer_source = value
         for shader in self._shaders.values(): shader.buffer_source = value
+
+    @property
+    def debug_log(self) -> DebugLog | None:
+        """The one `DebugLog` shared by every `print(...)`-using kernel/pipeline in the tree,
+        or `None` when this manager was built with `debug=False` (the default). Prefer
+        `kernel.debug_log()`/`pipeline.debug_log()` for a specific artifact; this is the same
+        underlying object, exposed for a caller that wants to read/clear it without going
+        through any one kernel (e.g. a build where every artifact's `print` was pruned by DCE
+        but the caller still wants to assert the log is empty)."""
+        return self._debug_log
 
     def get_shader(self, name: str, *, allow_failed: bool = False) -> Shader | None:
         """Look up a built shader by name, returning `None` if it wasn't built (unlike
