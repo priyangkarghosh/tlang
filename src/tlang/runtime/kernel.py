@@ -424,8 +424,16 @@ class Kernel:
 
         `buffer_name` is still validated immediately: a name this artifact does not declare at
         all is a typo, and raises `TlangBindingError` right here, same as before.
+
+        A call that repeats the exact `(buffer, offset, size)` already recorded for `buffer_name`
+        is a no-op: it does not touch `_ssbo_bindings` or force a re-assert. A caller re-binding
+        the same buffer every dispatch of a loop pays only the validation and the dict lookup.
         """
         self._resolve_ssbo_binding(buffer_name)  # validate now; raises TlangBindingError on typo
+        prev = self._ssbo_bindings.get(buffer_name)
+        if prev is not None and prev[0] is buffer and prev[1] == offset and prev[2] == size:
+            return  # record unchanged -- leave _bound_generation alone, the fast path in
+            # `_assert_ssbo_bindings` still applies on this kernel's next dispatch
         self._ssbo_bindings[buffer_name] = (buffer, offset, size)
         # Recorded set changed -- force a re-assert on this kernel's next dispatch even if no
         # other kernel/pipeline has touched the global table in the meantime.
